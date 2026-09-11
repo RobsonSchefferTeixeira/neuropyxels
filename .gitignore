@@ -1,0 +1,68 @@
+# --- Backup folders ---
+bkp/
+**/bkp/
+*_bkp.py
+*_backup.py
+try_probe_map.py
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+.conda/
+
+# --- VS Code ---
+.vscode/
+*.code-workspace
+
+# --- PyCharm / IntelliJ ---
+.idea/
+*.iml
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Data files (large, don't belong in git) ---
+*.dat
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+*.bin
+
+# --- Analysis outputs ---
+*.csv
+*.png
+*.pdf
+*.svg
+probe_maps/
+
+# --- Logs / temp ---
+*.log
+*.tmp
+*.bak
+~$*
+
+# --- Local settings / secrets ---
+settings.xml
+*.local
+.env
+TODO.txt
