@@ -38,7 +38,7 @@ The main interface combines the Neuropixels probe map, neural traces, channel se
 
 ![Spatial power map](docs/images/spatial_power_map.png)
 
-The spatial power map allows neural power to be visualized across the probe according to recording depth and channel location.
+The spatial power map allows LFP amplitude/power to be visualized across the probe according to recording depth and channel location.
 
 ### Phase-amplitude coupling
 
@@ -48,7 +48,7 @@ The phase-amplitude coupling analysis provides a comodulogram for investigating 
 
 ### Theta epoch detection
 
-![Theta epoch detection](docs/images/theta_epochs_detection.png)
+![Theta epoch detection](docs/images/theta_epoch_detection.png)
 
 Theta epochs can be detected using configurable frequency bands and detection criteria. Detected epochs can be inspected and manually adjusted before exporting the results.
 
@@ -60,7 +60,8 @@ Theta epochs can be detected using configurable frequency bands and detection cr
 
 NeuroPyxels currently requires:
 
-- Python 3.12
+- OS: I tested it on Windows 11 and Linux (Ubuntu 25.04)
+- Python: I tested it on 3.13, but it should work on 3.10 - 3.13
 - NumPy
 - SciPy
 - Matplotlib
@@ -97,7 +98,7 @@ pip install -r requirements.txt
 After activating the environment:
 
 ```bash
-python main_window.py
+python main.py
 ```
 
 The main application window will open and you can load your recording data from the **File** menu.
@@ -188,71 +189,8 @@ Detected epochs can be inspected in the trace view, manually modified, merged, o
 
 ## Export
 
-Detected theta epochs can be exported as a CSV file for further analysis.
+Detected theta epochs and ripples can be exported as a CSV file for further analysis.
 
-The exported data include information such as:
-
-- Channel
-- Start time
-- End time
-- Duration
-- Mean theta/delta ratio
-- Peak theta/delta ratio
-- Theta power
-
----
-
-## Project Structure
-
-The project is organized into separate modules for the graphical interface, signal visualization, detection algorithms, and analysis tools.
-
-```text
-neuropyxels/
-│
-├── docs/
-│   └── images/
-│       ├── main_interface.png
-│       ├── spatial_power_map.png
-│       ├── phase_amplitude_coupling.png
-│       └── theta_epochs_detection.png
-│
-├── main_window.py
-├── trace_view.py
-├── neural_trace_view.py
-├── probe_map.py
-│
-├── ripple_detector.py
-├── ripple_dialog.py
-├── ripple_trace_view.py
-│
-├── theta_epoch_detector.py
-├── theta_epoch_dialog.py
-├── theta_epoch_trace_view.py
-├── theta_epoch_export.py
-│
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Development
-
-Create and activate the development environment:
-
-```bash
-conda activate neuropyxels
-```
-
-After making changes:
-
-```bash
-git add .
-git commit -m "Describe the changes"
-git push
-```
-
----
 
 ## License
 
