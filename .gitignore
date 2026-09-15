@@ -50,7 +50,7 @@ desktop.ini
 
 # --- Analysis outputs ---
 *.csv
-*.png
+# *.png
 *.pdf
 *.svg
 probe_maps/
