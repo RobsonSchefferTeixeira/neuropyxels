@@ -116,7 +116,8 @@ class RippleDetector:
             raise ValueError("envelope_method must be 'hilbert' or 'rms'")
 
     def detect(self, signal: np.ndarray, sample_rate: float,
-               params: RippleParams, channel: int = 0) -> list[RippleEvent]:
+               params: RippleParams, channel: int = 0,
+               exclude_mask: np.ndarray | None = None) -> list[RippleEvent]:
         """
         Parameters
         ----------
@@ -125,6 +126,19 @@ class RippleDetector:
         params : RippleParams
         channel : channel identifier stored on each returned RippleEvent
                   (purely a label, doesn't affect detection)
+        exclude_mask : optional 1D boolean array, same length as signal.
+                  True marks samples to exclude from BOTH (a) the
+                  mean/SD baseline used to set peak/boundary thresholds,
+                  and (b) candidate peak selection -- a candidate whose
+                  peak sample falls in an excluded region is dropped
+                  entirely, same as if it were never detected. This is
+                  the mechanism behind "detect ripples only outside
+                  theta epochs": passing a mask of theta-epoch samples
+                  means high-frequency contamination during theta can't
+                  inflate the threshold used for the rest of the signal,
+                  which a purely post-hoc peak-location filter (compute
+                  threshold from everything, then throw away theta-time
+                  detections) would not fix.
 
         Returns
         -------
@@ -135,13 +149,32 @@ class RippleDetector:
 
         envelope = self.compute_envelope(filtered, sample_rate, params)
 
-        mean_env = np.mean(envelope)
-        sd_env = np.std(envelope)
+        if exclude_mask is not None:
+            exclude_mask = np.asarray(exclude_mask, dtype=bool)
+            if exclude_mask.shape != envelope.shape:
+                raise ValueError(
+                    f"exclude_mask shape {exclude_mask.shape} must match "
+                    f"envelope shape {envelope.shape}"
+                )
+            baseline_samples = envelope[~exclude_mask]
+            if baseline_samples.size == 0:
+                # Everything excluded -- nothing to compute a baseline
+                # from, so nothing can be detected either.
+                return []
+        else:
+            baseline_samples = envelope
+
+        mean_env = np.mean(baseline_samples)
+        sd_env = np.std(baseline_samples)
         peak_threshold = mean_env + params.peak_threshold_sd * sd_env
         boundary_threshold = mean_env + params.boundary_threshold_sd * sd_env
 
         # Candidate peak samples: local points above the peak threshold.
+        # Excluded samples never qualify as a candidate peak, on top of
+        # not contributing to the threshold above.
         above_peak = envelope > peak_threshold
+        if exclude_mask is not None:
+            above_peak = above_peak & ~exclude_mask
         if not np.any(above_peak):
             return []
 

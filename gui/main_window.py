@@ -25,14 +25,14 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QFileDialog, QMessageBox, QStatusBar, QToolBar, QDockWidget,
+    QFileDialog, QMessageBox, QStatusBar, QDockWidget,
     QListWidget, QListWidgetItem, QPushButton, QColorDialog, QFrame,
     QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox,
 )
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QIcon, QPixmap
 
 from gui.probe_map_widget import ProbeMapWidget
-from gui.theta_epoch_trace_view import ThetaEpochTraceViewWidget as TraceViewWidget
+from gui.neural_trace_view import NeuralTraceViewWidget as TraceViewWidget
 from gui.phase_amplitude_dialog import PhaseAmplitudeDialog
 from gui.amplitude_power_dialog import AmplitudePowerDialog
 from gui.ripple_dialog import RippleDialog
@@ -380,6 +380,7 @@ class MainWindow(QMainWindow):
         self._build_probe_map_dock()
         self._build_selected_channels_dock()
         self._build_display_settings_dock()
+        self._build_panels_menu()
         self.setStatusBar(QStatusBar())
         self._update_status("No settings file or data loaded.")
 
@@ -442,15 +443,14 @@ class MainWindow(QMainWindow):
         self.theta_epoch_action.triggered.connect(self._on_open_theta_epoch)
         analysis_menu.addAction(self.theta_epoch_action)
 
-        # Add View menu for spectrogram
+        # View menu for spectrogram toggle (a data-display option, not a
+        # dockable panel, so it stays separate from &Panels below).
         view_menu = menubar.addMenu("&View")
 
         self.spectrogram_action = QAction("Show Spectrogram", self)
         self.spectrogram_action.setCheckable(True)
         self.spectrogram_action.toggled.connect(self._on_toggle_spectrogram)
         view_menu.addAction(self.spectrogram_action)
-
-
 
         # Display menu for color settings
         display_menu = menubar.addMenu("&Display")
@@ -463,24 +463,21 @@ class MainWindow(QMainWindow):
         bg_color_action.triggered.connect(self._on_edit_bg_color)
         display_menu.addAction(bg_color_action)
 
-        toolbar = QToolBar("Main")
-        toolbar.setMovable(False)
-        toolbar.addAction(open_settings_action)
-        toolbar.addAction(open_data_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.phase_amplitude_action)
-        toolbar.addAction(self.power_map_action)
-        toolbar.addAction(self.ripple_detection_action)
-        self.addToolBar(toolbar)
+        # Panels menu: populated in _build_panels_menu(), once the dock
+        # widgets it toggles actually exist. Created here (rather than
+        # deferring menubar.addMenu entirely) so it sits in the same
+        # left-to-right menu order as everything else built in this
+        # method, instead of being appended after Help.
+        self.panels_menu = menubar.addMenu("&Panels")
 
-        self.stream_picker = QComboBox()
-        self.stream_picker.setMinimumWidth(220)
-        self.stream_picker.setEnabled(False)
-        self.stream_picker.currentIndexChanged.connect(self._on_stream_changed)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel(" Probe stream: "))
-        toolbar.addWidget(self.stream_picker)
-
+        # Stream picker now lives inside the Probe Map dock itself (see
+        # _build_probe_map_dock) rather than a toolbar -- the toolbar
+        # that used to hold it, plus Open settings/data and the
+        # Phase-Amplitude/Power-Map/Ripple-Detection shortcut buttons,
+        # is removed entirely. Every one of those actions already has a
+        # menu entry (File, or Analysis further down), so nothing is
+        # lost -- this just stops duplicating them as toolbar buttons,
+        # which ate vertical space above the trace view for no benefit.
 
         # Add Help menu
         help_menu = menubar.addMenu("&Help")
@@ -551,6 +548,44 @@ class MainWindow(QMainWindow):
         )
 
 
+    def _finalize_dock(self, dock: QDockWidget, area: Qt.DockWidgetArea):
+        """
+        Common tail end for every dock built at startup: register it
+        with the main window, default it to FLOATING (a free-standing
+        window) rather than docked, and start HIDDEN rather than shown.
+
+        The person opens panels deliberately via the &Panels menu; a
+        freshly-opened panel floats so it doesn't reflow the whole
+        window layout, and they can drag it into a dock area themselves
+        if they want it anchored. `area` is still passed to
+        addDockWidget so Qt has a sane docking target ready the moment
+        they *do* drag it in, even though the panel doesn't start there.
+        """
+        self.addDockWidget(area, dock)
+        dock.setFloating(True)
+        dock.setVisible(False)
+
+    def _build_panels_menu(self):
+        """Populate &Panels with one checkable action per dock, kept in
+        sync with each dock's actual visibility (including when the
+        person closes a floating panel via its own [x] button, which
+        bypasses the menu action entirely)."""
+        panel_docks = [
+            ("Trace Controls", self.trace_controls_dock),
+            ("Spectrogram Controls", self.spectrogram_controls_dock),
+            ("Probe Map", self.probe_map_dock),
+            ("Selected Channels", self.selected_channels_dock),
+            ("Display Settings", self.display_settings_dock),
+        ]
+        for label, dock in panel_docks:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(dock.isVisible())
+            action.toggled.connect(dock.setVisible)
+            # Dock -> action, for the close-via-[x]-button case.
+            dock.visibilityChanged.connect(action.setChecked)
+            self.panels_menu.addAction(action)
+
     def _build_trace_view(self):
         """Build the trace view and add control panels as docks."""
         self.trace_view = TraceViewWidget(self.engine)
@@ -566,8 +601,8 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.TopDockWidgetArea | 
             Qt.DockWidgetArea.BottomDockWidgetArea
         )
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, controls_dock)
         self.trace_controls_dock = controls_dock
+        self._finalize_dock(controls_dock, Qt.DockWidgetArea.RightDockWidgetArea)
         
         # Add spectrogram control panel as a dockable widget
         spectrogram_dock = QDockWidget("Spectrogram Controls", self)
@@ -579,8 +614,8 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.TopDockWidgetArea | 
             Qt.DockWidgetArea.BottomDockWidgetArea
         )
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, spectrogram_dock)
         self.spectrogram_controls_dock = spectrogram_dock
+        self._finalize_dock(spectrogram_dock, Qt.DockWidgetArea.RightDockWidgetArea)
 
     def _build_probe_map_dock(self):
         dock = QDockWidget("Probe Map", self)
@@ -588,18 +623,44 @@ class MainWindow(QMainWindow):
         dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
-        placeholder = QWidget()
-        layout = QVBoxLayout(placeholder)
-        label = QLabel(
+
+        # Persistent container: a stream-picker row on top (survives for
+        # the dock's whole lifetime) plus a placeholder area below that
+        # _load_probe_map() swaps out for the actual ProbeMapWidget once
+        # a probe stream is selected. Previously the stream picker lived
+        # in the now-removed toolbar; it moves here since it's really a
+        # probe-map concern, but it can't live INSIDE ProbeMapWidget
+        # itself because that widget gets torn down and rebuilt every
+        # time the stream changes (see _load_probe_map) while the list
+        # of available streams needs to persist across that rebuild.
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(4, 4, 4, 4)
+        container_layout.setSpacing(4)
+
+        stream_row = QHBoxLayout()
+        stream_row.addWidget(QLabel("Probe stream:"))
+        self.stream_picker = QComboBox()
+        self.stream_picker.setEnabled(False)
+        self.stream_picker.currentIndexChanged.connect(self._on_stream_changed)
+        stream_row.addWidget(self.stream_picker, stretch=1)
+        container_layout.addLayout(stream_row)
+
+        self._probe_map_placeholder_label = QLabel(
             "No probe loaded.\n\nUse File \u2192 Open settings.xml... to load one."
         )
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #888; font-size: 12px;")
-        layout.addWidget(label)
-        dock.setWidget(placeholder)
+        self._probe_map_placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._probe_map_placeholder_label.setStyleSheet("color: #888; font-size: 12px;")
+        container_layout.addWidget(self._probe_map_placeholder_label, stretch=1)
 
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        # Where ProbeMapWidget gets inserted once a stream is picked --
+        # see _load_probe_map.
+        self._probe_map_container = container
+        self._probe_map_container_layout = container_layout
+
+        dock.setWidget(container)
         self.probe_map_dock = dock
+        self._finalize_dock(dock, Qt.DockWidgetArea.LeftDockWidgetArea)
 
     def _build_selected_channels_dock(self):
         dock = QDockWidget("Selected Channels", self)
@@ -614,8 +675,8 @@ class MainWindow(QMainWindow):
         vlayout.addWidget(self.selected_list)
 
         dock.setWidget(container)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.selected_channels_dock = dock
+        self._finalize_dock(dock, Qt.DockWidgetArea.RightDockWidgetArea)
 
     def _build_display_settings_dock(self):
         """Build the display settings dock with color buttons."""
@@ -628,8 +689,8 @@ class MainWindow(QMainWindow):
         self.trace_style_panel = TraceStylePanel(self.trace_view)
         dock.setWidget(self.trace_style_panel)
         
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.display_settings_dock = dock
+        self._finalize_dock(dock, Qt.DockWidgetArea.RightDockWidgetArea)
 
     # ------------------------------------------------------------------
     # settings.xml loading
@@ -711,12 +772,23 @@ class MainWindow(QMainWindow):
         # Tear down any previous probe map cleanly before building the new one.
         if self.probe_map is not None:
             self.probe_map.channelsSelected.disconnect(self._on_channels_selected)
+            self._probe_map_container_layout.removeWidget(self.probe_map)
             self.probe_map.deleteLater()
             self.probe_map = None
 
+        # Placeholder ("No probe loaded...") is only relevant before the
+        # first probe is ever loaded; once a real ProbeMapWidget is
+        # inserted it's hidden for good, not toggled per stream switch.
+        self._probe_map_placeholder_label.setVisible(False)
+
         self.probe_map = ProbeMapWidget(probe_data)
         self.probe_map.channelsSelected.connect(self._on_channels_selected)
-        self.probe_map_dock.setWidget(self.probe_map)
+        # Insert into the persistent container (below the stream-picker
+        # row), NOT dock.setWidget() -- the dock's widget is that
+        # container itself, set once in _build_probe_map_dock, and
+        # stays that way for the dock's whole lifetime so the stream
+        # picker survives every probe-map rebuild.
+        self._probe_map_container_layout.addWidget(self.probe_map, stretch=1)
         self.selected_list.clear()
         self._update_analysis_actions_enabled()
 

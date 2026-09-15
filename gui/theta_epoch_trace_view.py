@@ -112,10 +112,12 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
     # ------------------------------------------------------------------
 
     def _theta_epoch_time(self, sample: int) -> float:
-        """Convert a relative detection-window sample to recording time."""
-        global_sample = self.theta_detection_sample_offset + int(sample)
-        if self.engine.timestamps_loaded and self.engine.timestamps is not None:
-            return self._sample_to_time(global_sample)
+        """Convert a relative detection-window sample to recording time.
+
+        Always pure sample/sr math -- never engine.timestamps -- so
+        epoch identity and on-screen position are identical whether or
+        not the user has loaded a timestamps.npy file.
+        """
         return self.theta_detection_start_time + int(sample) / float(self.engine.sr)
 
     def _theta_time_to_x(self, time: float) -> float:
@@ -184,11 +186,14 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         return best
 
     def _theta_x_to_sample(self, x: float) -> int:
+        """Convert a screen x to a sample index relative to the
+        detection window, always via plain sample/sr math (see
+        _theta_epoch_time)."""
         plot_left, plot_right, _ = self._get_plot_bounds()
         ratio = (x - plot_left) / max(1.0, plot_right - plot_left)
         time = self.start_time + ratio * self.window_duration
 
-        global_sample = self._time_to_sample(time)
+        global_sample = int(round(time * self.engine.sr))
         return int(global_sample - self.theta_detection_sample_offset)
 
     # ------------------------------------------------------------------
@@ -460,10 +465,8 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
 
             epoch = self.theta_epochs[index]
             sample = self._theta_x_to_sample(event.position().x())
-            if getattr(self.engine, "timestamps_loaded", False) and getattr(self.engine, "timestamps", None) is not None:
-                max_global_sample = len(self.engine.timestamps) - 1
-            else:
-                max_global_sample = max(0, int(round(self.engine.total_duration * self.engine.sr)))
+            # Clamp using sample/sr math only -- see _theta_epoch_time.
+            max_global_sample = max(0, int(round(self.engine.total_duration * self.engine.sr)))
             min_relative = -self.theta_detection_sample_offset
             max_relative = max_global_sample - self.theta_detection_sample_offset
             sample = max(min_relative, min(sample, max_relative))

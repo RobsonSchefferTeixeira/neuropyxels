@@ -36,7 +36,6 @@ class _DetectThread(QThread):
         start_time: float,
         end_time: float,
         params: ThetaEpochParams,
-        timestamps=None,
         filter_settings=None,
         parent=None,
     ):
@@ -47,7 +46,6 @@ class _DetectThread(QThread):
         self.start_time = float(start_time)
         self.end_time = float(end_time)
         self.params = params
-        self.timestamps = None if timestamps is None else np.asarray(timestamps)
         self.filter_settings = dict(filter_settings or {})
         self.detector = ThetaEpochDetector()
         self._cancel_requested = False
@@ -60,15 +58,12 @@ class _DetectThread(QThread):
         return self._cancel_requested
 
     def _time_to_indices(self):
-        if self.timestamps is not None and len(self.timestamps):
-            start_idx = int(np.searchsorted(self.timestamps, self.start_time, side="left"))
-            end_idx = int(np.searchsorted(self.timestamps, self.end_time, side="right"))
-            start_idx = max(0, min(start_idx, len(self.timestamps) - 1))
-            end_idx = max(start_idx + 1, min(end_idx, len(self.timestamps)))
-            actual_start = float(self.timestamps[start_idx])
-            actual_end = float(self.timestamps[min(end_idx - 1, len(self.timestamps) - 1)])
-            return start_idx, end_idx, actual_start, actual_end
-
+        # Always sample-indexed (sample = round(time * sample_rate)),
+        # regardless of whether a timestamps.npy is loaded on the
+        # engine. Theta epoch detection/positioning must be identical
+        # whether or not the user has loaded timestamps -- timestamps
+        # are purely a display concern elsewhere, never load-bearing
+        # for indexing here.
         start_idx = max(0, int(np.floor(self.start_time * self.sample_rate)))
         end_idx = min(self.raw_data.shape[0], int(np.ceil(self.end_time * self.sample_rate)))
         return start_idx, end_idx, start_idx / self.sample_rate, max(start_idx, end_idx - 1) / self.sample_rate
@@ -173,16 +168,25 @@ class ThetaEpochDialog(QDialog):
         if initial_channels:
             self.channel_edit.setText(",".join(str(c) for c in initial_channels))
 
-        self._set_full_available_range()
+        self._set_default_range()
 
     def _get_available_time_range(self):
-        if (
-            getattr(self.engine, "timestamps_loaded", False)
-            and getattr(self.engine, "timestamps", None) is not None
-            and len(self.engine.timestamps)
-        ):
-            return float(self.engine.timestamps[0]), float(self.engine.timestamps[-1])
+        # Sample-indexed only (0 to total_duration via sample_rate),
+        # regardless of whether timestamps.npy is loaded -- see
+        # _DetectThread._time_to_indices for why.
         return 0.0, float(getattr(self.engine, "total_duration", 0.0))
+
+    def _set_default_range(self):
+        """Initial analysis window: 0-10s (clamped to whatever's
+        actually available for short recordings), NOT the full
+        recording -- "Full available range" is an explicit opt-in via
+        its own button, not the dialog's default."""
+        default_end = min(10.0, self._available_max_time) if self._available_max_time > 0 else 10.0
+        self.start_spin.setValue(self._available_min_time)
+        self.end_spin.setValue(default_end)
+        self.range_info_label.setText(
+            f"Available: {self._available_min_time:.3f} \u2013 {self._available_max_time:.3f} s"
+        )
 
     def _set_full_available_range(self):
         self.start_spin.setValue(self._available_min_time)
@@ -203,13 +207,28 @@ class ThetaEpochDialog(QDialog):
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setAutoDefault(False)
+        self.cancel_btn.setDefault(False)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         btn_row.addWidget(self.cancel_btn)
 
         self.export_btn = QPushButton("Export CSV")
+        self.export_btn.setAutoDefault(False)
+        self.export_btn.setDefault(False)
         self.export_btn.clicked.connect(self._on_export_clicked)
         self.export_btn.setEnabled(False)
         btn_row.addWidget(self.export_btn)
+
+        self.load_btn = QPushButton("Load CSV...")
+        self.load_btn.setAutoDefault(False)
+        self.load_btn.setDefault(False)
+        self.load_btn.setToolTip(
+            "Load a previously-exported theta epoch CSV. Loaded epochs "
+            "replace the current set and behave exactly like freshly "
+            "detected ones (draggable, mergeable, deletable)."
+        )
+        self.load_btn.clicked.connect(self._on_load_clicked)
+        btn_row.addWidget(self.load_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -262,6 +281,8 @@ class ThetaEpochDialog(QDialog):
         self.full_range_btn.setToolTip(
             "Set the analysis interval to the minimum and maximum available time."
         )
+        self.full_range_btn.setAutoDefault(False)
+        self.full_range_btn.setDefault(False)
         self.full_range_btn.clicked.connect(self._set_full_available_range)
         grid.addWidget(self.full_range_btn, 1, 4, 1, 2)
 
@@ -297,6 +318,8 @@ class ThetaEpochDialog(QDialog):
 
         self.delete_btn = QPushButton("Delete Selected Epoch")
         self.delete_btn.setEnabled(False)
+        self.delete_btn.setAutoDefault(False)
+        self.delete_btn.setDefault(False)
         self.delete_btn.clicked.connect(self._delete_selected_epoch)
         grid.addWidget(self.delete_btn, 5, 0, 1, 2)
         return grid
@@ -329,10 +352,6 @@ class ThetaEpochDialog(QDialog):
             power_overlap=self.power_overlap_spin.value() / 100.0,
         )
 
-        timestamps = None
-        if getattr(self.engine, "timestamps_loaded", False) and getattr(self.engine, "timestamps", None) is not None:
-            timestamps = np.asarray(self.engine.timestamps)
-
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting...")
         self.cancel_btn.setEnabled(True)
@@ -354,7 +373,7 @@ class ThetaEpochDialog(QDialog):
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
             self.start_spin.value(), self.end_spin.value(), params,
-            timestamps=timestamps, filter_settings=filter_settings, parent=self,
+            filter_settings=filter_settings, parent=self,
         )
         self._detect_thread.progress.connect(self._on_detection_progress)
         self._detect_thread.finished_ok.connect(self._on_detect_finished)
@@ -434,11 +453,9 @@ class ThetaEpochDialog(QDialog):
         super().keyPressEvent(event)
 
     def _sample_to_display_time(self, sample: int) -> float:
-        global_sample = self._sample_offset + int(sample)
-        if getattr(self.engine, "timestamps_loaded", False) and getattr(self.engine, "timestamps", None) is not None:
-            ts = self.engine.timestamps
-            global_sample = max(0, min(global_sample, len(ts) - 1))
-            return float(ts[global_sample])
+        # Always sample/sr math -- never engine.timestamps -- so the
+        # table shows the same values whether or not timestamps.npy is
+        # loaded.
         return self._detection_start_time + int(sample) / float(self.engine.sr)
 
     def _populate_table(self):
@@ -469,6 +486,44 @@ class ThetaEpochDialog(QDialog):
         from core.theta_epoch_export import export_theta_epochs_to_csv
         export_theta_epochs_to_csv(self.epochs, self.engine.sr, self._sample_offset, path_str)
         self.status_label.setText(f"Exported to {path_str}")
+
+    def _on_load_clicked(self):
+        if not self.engine.data_loaded:
+            QMessageBox.warning(self, "No data loaded", "Load continuous.dat first.")
+            return
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Load Theta Epochs", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not path_str:
+            return
+
+        from core.theta_epoch_export import import_theta_epochs_from_csv
+        try:
+            # Loaded CSVs store absolute (recording-global) sample
+            # positions -- see import_theta_epochs_from_csv's docstring.
+            # Interpreting them with sample_offset=0 means "start_sample"/
+            # "end_sample" on the loaded ThetaEpoch objects are themselves
+            # absolute recording-sample indices, matching how a freshly
+            # detected epoch would look if detection had been run from
+            # the very start of the recording (sample_offset=0). This is
+            # the only choice that doesn't depend on guessing what the
+            # dialog's current time-range fields should be.
+            epochs = import_theta_epochs_from_csv(path_str, sample_offset=0)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to load", f"Could not read {path_str}:\n\n{exc}")
+            return
+
+        if not epochs:
+            QMessageBox.information(self, "No epochs found", f"{path_str} contains no theta epochs.")
+            return
+
+        self.epochs = epochs
+        self._sample_offset = 0
+        self._detection_start_time = 0.0
+        self._populate_table()
+        self.export_btn.setEnabled(bool(self.epochs))
+        self.epochsChanged.emit(self.epochs)
+        self.status_label.setText(f"Loaded {len(self.epochs)} theta epoch(s) from {path_str}.")
 
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
