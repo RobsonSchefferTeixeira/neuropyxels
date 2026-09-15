@@ -742,6 +742,18 @@ class MainWindow(QMainWindow):
         self.stream_picker.setCurrentIndex(0)
         self._on_stream_changed(0)
 
+        # Auto-open the Probe Map panel -- it starts closed like every
+        # other panel (see _finalize_dock), but there's no point making
+        # the person go open it by hand immediately after loading a
+        # settings file, since channel selection is the very next thing
+        # they'll want to do. setVisible(True) alone is enough to update
+        # the &Panels menu's checkbox too, via the dock's own
+        # visibilityChanged signal (see _build_panels_menu) -- no need
+        # to touch the QAction directly. Left floating (not docked) by
+        # default, same as every other panel.
+        self.probe_map_dock.setVisible(True)
+        self.probe_map_dock.raise_()
+
     def _on_stream_changed(self, index: int):
         if index < 0 or not self._probes:
             return

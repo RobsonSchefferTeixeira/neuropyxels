@@ -77,6 +77,7 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         self.show_ripple_envelope = True
         self.show_ripple_thresholds = True
         self.show_ripple_events = True
+        self.show_ripple_filtered = False
 
         self._ripple_drag_event: int | None = None
         self._ripple_drag_side: str | None = None
@@ -88,8 +89,18 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         self._ripple_drag_original_start = 0
         self._ripple_drag_original_end = 0
 
-        self._ripple_handle_radius = 7.0
+        # Drag-handle HIT-TEST radius (invisible) at both start and end
+        # of an event -- resizing still works from both boundaries, per
+        # the redesign discussion, just without a visible circle drawn
+        # there anymore (see _draw_ripple_events). Kept generous enough
+        # to stay easy to grab even though nothing marks it visually.
         self._ripple_handle_hit_radius = 12.0
+        # Visible peak-amplitude marker: a single small circle drawn
+        # ABOVE the event box (not overlapping the trace lane), at the
+        # envelope's peak_sample -- replaces the old two-circles-at-
+        # both-ends look, which ate too much of a short ripple's own
+        # channel lane and obscured the trace underneath it.
+        self._ripple_peak_marker_radius = 4.5
 
     # ------------------------------------------------------------------
     # Ripple event API
@@ -117,13 +128,16 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
 
     def set_ripple_overlay_visibility(self, show_envelope: bool | None = None,
                                        show_thresholds: bool | None = None,
-                                       show_events: bool | None = None):
+                                       show_events: bool | None = None,
+                                       show_filtered: bool | None = None):
         if show_envelope is not None:
             self.show_ripple_envelope = show_envelope
         if show_thresholds is not None:
             self.show_ripple_thresholds = show_thresholds
         if show_events is not None:
             self.show_ripple_events = show_events
+        if show_filtered is not None:
+            self.show_ripple_filtered = show_filtered
         self.update()
 
     def set_ripple_merge_gap(self, gap_ms: float, update: bool = True):
@@ -220,12 +234,20 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         return plot_top, plot_bottom, channel_height, y_center
 
     def _ripple_handle_position(self, event: RippleEvent, side: str):
+        """side is 'start', 'end' (drag handles, hit-test only -- no
+        longer drawn, see _draw_ripple_events), or 'peak' (the visible
+        peak-amplitude marker's x position, at event.peak_sample)."""
         geometry = self._ripple_channel_geometry(event.channel)
         if geometry is None:
             return None
 
         _, _, _, y_center = geometry
-        sample = event.start_sample if side == "start" else event.end_sample
+        if side == "start":
+            sample = event.start_sample
+        elif side == "end":
+            sample = event.end_sample
+        else:  # "peak"
+            sample = event.peak_sample
         time = self._ripple_event_time(event, sample)
         return self._ripple_time_to_x(time), y_center
 
@@ -288,64 +310,125 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
 
         painter.end()
 
-    def _ripple_context_stats(self, channel: int, ctx: dict) -> tuple[float, float, float, float] | None:
+    def _ripple_context_stats(self, channel: int, ctx: dict, key: str = "envelope") -> tuple[float, float, float, float] | None:
         """
-        Return (env_min, env_max, mean_env, sd_env) for a channel's
-        envelope, computed ONCE per distinct envelope array and cached
-        on the context dict itself -- these are whole-signal statistics
-        (used only for display scaling / threshold lines) that don't
-        depend on the current pan/zoom window, so recomputing them on
-        every paintEvent (as the original implementation did) is pure
-        waste: a full-recording detection run's envelope can be
-        hundreds of thousands of samples, and every pan/zoom/scroll
-        triggers a repaint.
+        Return (data_min, data_max, mean, sd) for ctx[key] (either
+        'envelope' or 'filtered'), computed ONCE per distinct array and
+        cached on the context dict itself -- these are whole-signal
+        statistics (used only for display scaling / threshold lines)
+        that don't depend on the current pan/zoom window, so
+        recomputing them on every paintEvent (as the original
+        implementation did) is pure waste: a full-recording detection
+        run's envelope/filtered signal can be hundreds of thousands of
+        samples, and every pan/zoom/scroll triggers a repaint.
 
         Cache invalidation is automatic: set_ripple_render_context()
         always passes a FRESH context dict (see RippleDialog, which
         rebuilds it from scratch on every detect/load), so there's no
-        risk of serving stale stats for a changed envelope -- a new
-        envelope array means a new dict means no cached entry yet.
+        risk of serving stale stats for a changed array -- a new array
+        means a new dict means no cached entry yet.
         """
-        cache = ctx.get("_stats_cache")
+        cache_key = f"_stats_cache_{key}"
+        cache = ctx.get(cache_key)
         if cache is not None:
             return cache
 
-        envelope = ctx.get("envelope")
-        if envelope is None:
+        data = ctx.get(key)
+        if data is None:
             return None
-        envelope = np.asarray(envelope, dtype=np.float64)
-        if envelope.size == 0:
-            return None
-
-        finite_env = envelope[np.isfinite(envelope)]
-        if finite_env.size == 0:
+        data = np.asarray(data, dtype=np.float64)
+        if data.size == 0:
             return None
 
-        env_min = float(np.min(finite_env))
-        env_max = float(np.max(finite_env))
-        mean_env = float(np.mean(finite_env))
-        sd_env = float(np.std(finite_env))
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            return None
 
-        stats = (env_min, env_max, mean_env, sd_env)
-        ctx["_stats_cache"] = stats
+        data_min = float(np.min(finite))
+        data_max = float(np.max(finite))
+        mean_val = float(np.mean(finite))
+        sd_val = float(np.std(finite))
+
+        stats = (data_min, data_max, mean_val, sd_val)
+        ctx[cache_key] = stats
         return stats
 
-    def _draw_ripple_render_context(self, painter: QPainter):
-        """Draw envelope + threshold lines per channel (purely visual,
-        not interactive), same look as the old TraceViewWidget overlay.
+    def _draw_ripple_signal_curve(self, painter: QPainter, array: np.ndarray,
+                                   sample_offset: int, sample_rate: float,
+                                   start_time: float, end_time: float,
+                                   plot_left: float, plot_right: float,
+                                   plot_top: float, plot_bottom: float,
+                                   plot_width: float, max_points: int,
+                                   to_y, color: QColor, width: float = 1.0):
+        """
+        Shared windowed/downsampled path-drawing routine used by both
+        the envelope curve and the filtered-signal curve -- resolves
+        the visible sample range directly (no full-length times/mask
+        array), downsamples to ~max_points before building the
+        QPainterPath, same performance approach documented on
+        _draw_ripple_render_context. `to_y` maps a data value to a
+        pixel y-coordinate (already scaled/centered by the caller).
+        """
+        n_total = len(array)
+        first_idx = int(np.ceil((start_time - sample_offset / sample_rate) * sample_rate))
+        last_idx = int(np.floor((end_time - sample_offset / sample_rate) * sample_rate))
+        first_idx = max(0, first_idx)
+        last_idx = min(n_total - 1, last_idx)
+        if first_idx > last_idx:
+            return
 
-        Performance note: only the samples inside the CURRENT visible
-        time window are ever touched here -- the envelope's sample
-        range is resolved directly from start_time/end_time first (same
-        idea as TraceViewWidget._get_data_for_display's
-        get_time_window_sample_range), then sliced, rather than building
-        a full-length times/mask array over the entire envelope and
-        filtering it down. The envelope slice is additionally
-        downsampled to roughly one point per horizontal pixel before
-        building the QPainterPath, mirroring _draw_traces's own
-        max_points downsampling -- drawing tens of thousands of
-        envelope samples per channel, every repaint, is what made the
-        view "really slow" after detecting ripples on a long recording.
+        data_slice = np.asarray(array[first_idx:last_idx + 1], dtype=np.float64)
+        n_visible = len(data_slice)
+
+        if n_visible > max_points:
+            step = int(np.ceil(n_visible / max_points))
+            data_slice = data_slice[::step]
+            sample_indices = np.arange(first_idx, last_idx + 1, step, dtype=np.float64)
+        else:
+            sample_indices = np.arange(first_idx, last_idx + 1, dtype=np.float64)
+
+        times_plot = (sample_offset + sample_indices) / sample_rate
+        x = plot_left + ((times_plot - start_time) / (end_time - start_time)) * plot_width
+        y = to_y(data_slice)
+        y = np.clip(y, plot_top, plot_bottom)
+        finite = np.isfinite(data_slice) & np.isfinite(y)
+        if not np.any(finite):
+            return
+
+        path = QPainterPath()
+        started = False
+        # Still a Python loop, but now bounded to at most ~max_points
+        # iterations (roughly one per horizontal pixel) instead of
+        # every raw sample in the visible window.
+        for xi, yi, ok in zip(x, y, finite):
+            if not ok:
+                started = False
+                continue
+            if not started:
+                path.moveTo(float(xi), float(yi))
+                started = True
+            else:
+                path.lineTo(float(xi), float(yi))
+
+        painter.save()
+        painter.setPen(QPen(color, width))
+        painter.drawPath(path)
+        painter.restore()
+
+    def _draw_ripple_render_context(self, painter: QPainter):
+        """Draw envelope + filtered-signal + threshold lines per
+        channel (purely visual, not interactive), same look as the old
+        TraceViewWidget overlay.
+
+        Performance note: see _draw_ripple_signal_curve -- only the
+        samples inside the CURRENT visible time window are ever
+        touched, downsampled to roughly one point per horizontal pixel,
+        mirroring _draw_traces's own max_points downsampling. Drawing
+        tens of thousands of raw samples per channel, every repaint, is
+        what made the view "really slow" after detecting ripples on a
+        long recording -- this applies equally to the newer filtered-
+        signal overlay, so it reuses the exact same fixed code path
+        rather than a fresh naive implementation.
         """
         rect = self.rect()
         if hasattr(self, "scrollbar"):
@@ -383,82 +466,65 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             envelope = ctx.get("envelope")
             sample_offset = int(ctx.get("sample_offset", 0))
             sample_rate = float(ctx.get("sample_rate", self.engine.sr))
-            if envelope is None or sample_rate <= 0:
+            if sample_rate <= 0:
                 continue
 
-            stats = self._ripple_context_stats(channel, ctx)
-            if stats is None:
-                continue
-            env_min, env_max, mean_env, sd_env = stats
-            env_range = env_max - env_min
-            if env_range <= 0:
-                env_range = 1.0
-            env_scale = (channel_height * 0.30) / env_range
+            env_stats = self._ripple_context_stats(channel, ctx, key="envelope")
 
-            def env_to_y(v, y_center=y_center, env_min=env_min, env_max=env_max, env_scale=env_scale):
-                return y_center - (v - (env_min + env_max) / 2.0) * env_scale
+            if self.show_ripple_envelope and envelope is not None and env_stats is not None:
+                env_min, env_max, mean_env, sd_env = env_stats
+                env_range = env_max - env_min
+                if env_range <= 0:
+                    env_range = 1.0
+                env_scale = (channel_height * 0.30) / env_range
 
-            if self.show_ripple_envelope:
-                # Resolve the visible sample range directly instead of
-                # building a times[] array over the whole envelope.
-                n_total = len(envelope)
-                first_idx = int(np.ceil((start_time - sample_offset / sample_rate) * sample_rate))
-                last_idx = int(np.floor((end_time - sample_offset / sample_rate) * sample_rate))
-                first_idx = max(0, first_idx)
-                last_idx = min(n_total - 1, last_idx)
+                def env_to_y(v, y_center=y_center, env_min=env_min, env_max=env_max, env_scale=env_scale):
+                    return y_center - (v - (env_min + env_max) / 2.0) * env_scale
 
-                if first_idx <= last_idx:
-                    env_slice = np.asarray(envelope[first_idx:last_idx + 1], dtype=np.float64)
-                    n_visible = len(env_slice)
+                self._draw_ripple_signal_curve(
+                    painter, np.asarray(envelope, dtype=np.float64), sample_offset, sample_rate,
+                    start_time, end_time, plot_left, plot_right, plot_top, plot_bottom,
+                    plot_width, max_points, env_to_y, QColor("#ffcc00"), width=1.0,
+                )
 
-                    if n_visible > max_points:
-                        step = int(np.ceil(n_visible / max_points))
-                        env_slice = env_slice[::step]
-                        sample_indices = np.arange(first_idx, last_idx + 1, step, dtype=np.float64)
-                    else:
-                        sample_indices = np.arange(first_idx, last_idx + 1, dtype=np.float64)
-
-                    times_plot = (sample_offset + sample_indices) / sample_rate
-                    x = plot_left + ((times_plot - start_time) / (end_time - start_time)) * plot_width
-                    y = env_to_y(env_slice)
-                    y = np.clip(y, plot_top, plot_bottom)
-                    finite = np.isfinite(env_slice) & np.isfinite(y)
-
-                    if np.any(finite):
-                        path = QPainterPath()
-                        started = False
-                        # Still a Python loop, but now bounded to at
-                        # most ~max_points iterations (roughly one per
-                        # horizontal pixel) instead of every raw
-                        # envelope sample in the visible window.
-                        for xi, yi, ok in zip(x, y, finite):
-                            if not ok:
-                                started = False
-                                continue
-                            if not started:
-                                path.moveTo(float(xi), float(yi))
-                                started = True
-                            else:
-                                path.lineTo(float(xi), float(yi))
-
+                if self.show_ripple_thresholds:
+                    peak_sd = ctx.get("peak_threshold_sd")
+                    boundary_sd = ctx.get("boundary_threshold_sd")
+                    if peak_sd is not None or boundary_sd is not None:
                         painter.save()
-                        painter.setPen(QPen(QColor("#ffcc00"), 1.0))
-                        painter.drawPath(path)
+                        painter.setPen(QPen(QColor("#ff6666"), 1.0, Qt.PenStyle.DashLine))
+                        for sd in (peak_sd, boundary_sd):
+                            if sd is None:
+                                continue
+                            y = env_to_y(mean_env + float(sd) * sd_env)
+                            if plot_top <= y <= plot_bottom:
+                                painter.drawLine(int(plot_left), int(y), int(plot_right), int(y))
                         painter.restore()
 
-            if self.show_ripple_thresholds:
-                peak_sd = ctx.get("peak_threshold_sd")
-                boundary_sd = ctx.get("boundary_threshold_sd")
-                if peak_sd is not None or boundary_sd is not None:
-                    painter.save()
-                    painter.setPen(QPen(QColor("#ff6666"), 1.0, Qt.PenStyle.DashLine))
-                    for sd in (peak_sd, boundary_sd):
-                        if sd is None:
-                            continue
-                        y = env_to_y(mean_env + float(sd) * sd_env)
-                        if plot_top <= y <= plot_bottom:
-                            painter.drawLine(int(plot_left), int(y), int(plot_right), int(y))
-                    painter.restore()
+            filtered = ctx.get("filtered")
+            filt_stats = self._ripple_context_stats(channel, ctx, key="filtered")
+
+            if self.show_ripple_filtered and filtered is not None and filt_stats is not None:
+                filt_min, filt_max, _mean_filt, _sd_filt = filt_stats
+                # Centered on 0 (a bandpassed signal oscillates around
+                # 0, unlike the envelope which is always positive) --
+                # scale by the larger of |min|/|max| rather than the
+                # (min+max)/2 recentering used for envelope, so a
+                # filtered trace with an asymmetric artifact doesn't
+                # visually shift off-center for no physiological reason.
+                filt_extent = max(abs(filt_min), abs(filt_max))
+                if filt_extent <= 0:
+                    filt_extent = 1.0
+                filt_scale = (channel_height * 0.30) / filt_extent
+
+                def filt_to_y(v, y_center=y_center, filt_scale=filt_scale):
+                    return y_center - v * filt_scale
+
+                self._draw_ripple_signal_curve(
+                    painter, np.asarray(filtered, dtype=np.float64), sample_offset, sample_rate,
+                    start_time, end_time, plot_left, plot_right, plot_top, plot_bottom,
+                    plot_width, max_points, filt_to_y, QColor("#7fd4ff"), width=1.0,
+                )
 
     def _draw_ripple_events(self, painter: QPainter):
         if not self.show_ripple_events:
@@ -466,6 +532,20 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
 
         _, _, plot_bottom = self._get_plot_bounds()
         plot_left, plot_right, _ = self._get_plot_bounds()
+
+        # Geometry: ripples are short-duration events, and the old
+        # design (a box spanning 90% of the channel lane's height, with
+        # a circle at both ends) visually dominated the lane and
+        # obscured the trace underneath for a short event. The new
+        # design confines everything to a thin strip near the TOP of
+        # the lane, well clear of where _draw_traces actually draws the
+        # trace itself (trace occupies roughly y_center +/- 0.40 *
+        # channel_height) -- the box marks duration only, faint and
+        # thin; the single peak-amplitude circle sits just above that
+        # strip's top edge, fully clear of the box and the trace.
+        box_top_frac = 0.62     # distance above y_center, as a fraction of channel_height
+        box_bottom_frac = 0.48  # distance above y_center where the box's bottom edge sits
+        marker_gap = 3.0        # px gap between the box's top edge and the peak marker
 
         for i, event in enumerate(self.ripple_events):
             geometry = self._ripple_channel_geometry(event.channel)
@@ -494,54 +574,73 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             )
             selected = i == self._ripple_selected_event
 
+            # Discrete and transparent: much lower fill alpha and a
+            # thinner border than the old design, since the box is now
+            # purely a duration indicator sitting clear of the trace,
+            # not something that needs to visually compete with it.
             if merge_candidate:
-                fill = QColor(255, 70, 70, 55)
-                border = QColor(255, 60, 60, 235)
+                fill = QColor(255, 70, 70, 35)
+                border = QColor(255, 60, 60, 200)
             elif selected:
-                fill = QColor(70, 255, 70, 55)
-                border = QColor(60, 255, 60, 235)
+                fill = QColor(70, 255, 70, 35)
+                border = QColor(60, 255, 60, 200)
             else:
-                fill = QColor(255, 80, 80, 45)
-                border = QColor(255, 100, 100, 200)
+                fill = QColor(255, 80, 80, 22)
+                border = QColor(255, 100, 100, 150)
+
+            box_top = y_center - channel_height * box_top_frac
+            box_bottom = y_center - channel_height * box_bottom_frac
 
             painter.setBrush(QBrush(fill))
-            painter.setPen(QPen(border, 1.5))
+            painter.setPen(QPen(border, 1.0))
             painter.drawRect(
                 QRectF(
                     left,
-                    y_center - channel_height * 0.45,
+                    box_top,
                     max(1.0, right - left),
-                    channel_height * 0.9,
+                    box_bottom - box_top,
                 )
             )
             if selected and not merge_candidate:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(255, 255, 255, 220), 2.0))
+                painter.setPen(QPen(QColor(255, 255, 255, 200), 1.5))
                 painter.drawRect(
                     QRectF(
                         left,
-                        y_center - channel_height * 0.45,
+                        box_top,
                         max(1.0, right - left),
-                        channel_height * 0.9,
+                        box_bottom - box_top,
                     )
                 )
 
-            for side in ("start", "end"):
-                point = self._ripple_handle_position(event, side)
-                if point is None:
-                    continue
+            # Single peak-amplitude marker, above the box (and therefore
+            # well above the trace itself), at the envelope's
+            # peak_sample -- replaces the old two-circles-at-both-ends
+            # look. Start/end drag handles below still work identically
+            # (see _ripple_handle_at / mousePressEvent); they're simply
+            # no longer drawn, since duration is already shown by the
+            # box itself and two visible circles per short event was
+            # the main source of visual clutter being addressed here.
+            peak_point = self._ripple_handle_position(event, "peak")
+            if peak_point is not None:
+                px, _py = peak_point
+                # Re-derive the marker's y purely from the box geometry
+                # (not the handle's own y, which mirrors channel
+                # y_center) so it always sits a fixed gap above the box
+                # regardless of channel height.
+                marker_y = box_top - marker_gap - self._ripple_peak_marker_radius
 
                 if merge_candidate:
-                    handle_color = QColor(255, 60, 60)
+                    marker_color = QColor(255, 60, 60)
                 elif selected:
-                    handle_color = QColor(60, 255, 60)
+                    marker_color = QColor(60, 255, 60)
                 else:
-                    handle_color = QColor(255, 100, 100)
+                    marker_color = QColor(255, 140, 60)  # distinct from the box's red, easier to spot at a glance
 
-                painter.setBrush(QBrush(handle_color))
-                painter.setPen(QPen(QColor(20, 20, 20), 1.2))
-                r = self._ripple_handle_radius
-                painter.drawEllipse(QRectF(point[0] - r, point[1] - r, 2 * r, 2 * r))
+                painter.setBrush(QBrush(marker_color))
+                painter.setPen(QPen(QColor(20, 20, 20), 1.0))
+                r = self._ripple_peak_marker_radius
+                painter.drawEllipse(QRectF(px - r, marker_y - r, 2 * r, 2 * r))
 
     # ------------------------------------------------------------------
     # Merge logic
