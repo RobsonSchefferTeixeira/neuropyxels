@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QFileDialog, QMessageBox, QStatusBar, QDockWidget,
     QListWidget, QListWidgetItem, QPushButton, QColorDialog, QFrame,
-    QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox,
+    QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox, QDialog,
 )
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QIcon, QPixmap
 
@@ -39,7 +39,8 @@ from gui.ripple_dialog import RippleDialog
 from core.probe_extractor import extract_probes_from_settings
 from core.trace_engine import TraceEngine
 from gui.theta_epoch_dialog import ThetaEpochDialog
-
+from core.probe_definition import ProbeDefinition
+from gui.probe_definition_dialog import ProbeDefinitionDialog
 
 class ColorButton(QPushButton):
     """
@@ -361,6 +362,14 @@ class MainWindow(QMainWindow):
         open_data_action = QAction("Open &Data (continuous.dat)...", self)
         open_data_action.triggered.connect(self._on_open_data)
         file_menu.addAction(open_data_action)
+
+        open_definition_action = QAction("New Probe &Definition...", self)
+        open_definition_action.setToolTip(
+            "Build a probe description by hand (or import one), then use "
+            "it with a raw continuous.dat that has no settings.xml."
+        )
+        open_definition_action.triggered.connect(self._on_open_probe_definition)
+        file_menu.addAction(open_definition_action)
 
         open_timestamps_action = QAction("Open Timestamps (timestamps.npy)...", self)
         open_timestamps_action.triggered.connect(self._on_open_timestamps)
@@ -801,6 +810,106 @@ class MainWindow(QMainWindow):
             f"Loaded {path.name}  —  {new_engine.total_duration:.1f}s, "
             f"{new_engine.n_channels} channels @ {new_engine.sr:.0f} Hz"
         )
+
+        def _on_open_probe_definition(self):
+            """Open the definition editor, then use the resulting definition
+            with a dat the user picks immediately after."""
+            dialog = ProbeDefinitionDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.definition is None:
+                return
+
+            defn = dialog.definition
+
+            path_str, _ = QFileDialog.getOpenFileName(
+                self, f"Open continuous.dat for '{defn.name}'", "",
+                "DAT files (*.dat);;All files (*)"
+            )
+            if not path_str:
+                return
+
+            self.load_data_file_with_definition(defn, Path(path_str))
+
+        def load_data_file_with_definition(self, defn: ProbeDefinition, path: Path):
+            """Load a raw continuous.dat against a hand-authored (or
+            imported) probe definition, bypassing the settings.xml machinery
+            entirely.
+
+            The definition is wrapped into the exact dict shape that
+            extract_probes_from_settings produces, then the rest of the app
+            runs unchanged.
+            """
+            try:
+                probe_data = defn.to_probe_data_dict()
+            except ValueError as exc:
+                QMessageBox.critical(self, "Invalid definition", str(exc))
+                return
+
+            # Register the definition as a single-stream probe set, exactly
+            # as if it had come from a settings.xml. This makes it
+            # selectable in the stream picker and drives every downstream
+            # consumer without special-casing.
+            stream_key = f"{defn.name}-custom"
+            self._probes = {"record_path": "", "probes": {stream_key: probe_data}}
+            self._settings_path = None
+
+            self.stream_picker.blockSignals(True)
+            self.stream_picker.clear()
+            self.stream_picker.addItem(stream_key)
+            self.stream_picker.setEnabled(True)
+            self.stream_picker.blockSignals(False)
+
+            self._current_probe_key = stream_key
+            self._load_probe_map(probe_data)
+
+            # Now load the dat itself against the definition.
+            new_engine = TraceEngine(
+                n_channels=int(defn.n_channels),
+                sample_rate=float(defn.sample_rate),
+                dtype=np.dtype(defn.dtype),
+            )
+            try:
+                new_engine.load_data_file(path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Failed to load data",
+                    f"Could not load {path.name} against definition '{defn.name}':\n\n{exc}"
+                )
+                return
+
+            # Close any open analysis dialogs (they were tied to the old data).
+            for dialog in list(self._open_pac_dialogs):
+                dialog.close()
+            for dialog in list(self._open_power_dialogs):
+                dialog.close()
+            for dialog in list(self._open_ripple_dialogs):
+                dialog.close()
+
+            self.engine = new_engine
+            self.trace_view.set_data_source(self.engine)
+            self.trace_view.clear_theta_epochs()
+
+            # Register the FULL probe geometry immediately so CSD, depth
+            # sorting, and everything else is ready the moment the user
+            # picks channels on the (freshly built) probe map. No selection
+            # is carried over -- this is a new probe the user has never
+            # selected channels on.
+            depths = dict(zip(probe_data["coordinates"]["channels"], probe_data["coordinates"]["y"]))
+            xcoords = dict(zip(probe_data["coordinates"]["channels"], probe_data["coordinates"]["x"]))
+            shank_ids = probe_data.get("shanks", {}).get("ids") or [0] * len(probe_data["coordinates"]["channels"])
+            shank_map = dict(zip(probe_data["coordinates"]["channels"], shank_ids))
+            self.trace_view.set_full_probe_geometry(depths, shank_map, xcoords)
+
+            self._update_analysis_actions_enabled()
+            if hasattr(self, 'trace_style_panel'):
+                self.trace_style_panel.update_channels()
+
+            self._update_status(
+                f"Loaded {path.name} against custom definition '{defn.name}'  —  "
+                f"{new_engine.total_duration:.1f}s, {new_engine.n_channels} channels "
+                f"@ {new_engine.sr:.0f} Hz ({defn.dtype})"
+            )
+
+
 
     def _on_open_timestamps(self):
         """Open a timestamps.npy file."""
