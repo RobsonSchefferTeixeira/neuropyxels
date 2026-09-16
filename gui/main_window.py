@@ -751,8 +751,11 @@ class MainWindow(QMainWindow):
         # visibilityChanged signal (see _build_panels_menu) -- no need
         # to touch the QAction directly. Left floating (not docked) by
         # default, same as every other panel.
+
         self.probe_map_dock.setVisible(True)
+        self.probe_map_dock.resize(520, 900)
         self.probe_map_dock.raise_()
+
 
     def _on_stream_changed(self, index: int):
         if index < 0 or not self._probes:

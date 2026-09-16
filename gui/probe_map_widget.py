@@ -112,6 +112,8 @@ class ProbeMapWidget(QWidget):
 
         self._min_pitch_um = self._min_electrode_pitch_um()
         self.base_font_size = 9  # Default label size
+        
+        self.setMinimumSize(400, 600)
 
         self._build_ui()
         self._build_scatter()
@@ -428,6 +430,21 @@ class ProbeMapWidget(QWidget):
                 0 if self.state[idx] == 2 else self.state[idx]
             )
         self._update_colors()
+
+    def set_selected_channels(self, channel_list):
+        """Select exactly the given channels (replacing any current
+        selection), leaving excluded channels untouched. Used to seed
+        this widget with an externally-provided starting selection --
+        e.g. RippleTriggeredAverageDialog opens a scoped ProbeMapWidget
+        instance pre-populated with whatever channels were already
+        active in the main trace view."""
+        wanted = set(int(c) for c in channel_list)
+        for ch, idx in self._chan_to_idx.items():
+            if self.state[idx] == 2:  # leave excluded channels alone
+                continue
+            self.state[idx] = 1 if ch in wanted else 0
+        self._update_colors()
+        self._emit_selection()
 
     def get_selected_channels(self) -> list[int]:
         selected_channels = self.channels[self.state == 1]
