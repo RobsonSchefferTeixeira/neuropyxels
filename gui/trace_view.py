@@ -5,6 +5,43 @@ Main trace visualization widget. Displays neural data from a TraceEngine
 as scrolling lines. Supports channel selection from the probe map,
 time-window navigation, customizable colors, depth-based sorting, and
 signal filtering.
+
+Display model
+-------------
+Two independent levels of control:
+
+1. GLOBAL (the Trace Controls panel, unchanged): filter/notch/detrend
+   settings that apply to every channel by default.
+
+2. PER-CHANNEL (new): each channel can OPT OUT of the global pipeline
+   and instead draw an explicit combination of {raw, filtered, csd}.
+
+   - A channel with NO explicit configuration follows the global
+     pipeline exactly as before: raw, or globally-filtered if a global
+     filter is enabled.
+   - Once the user picks any signal(s) for a channel, that channel
+     shows ONLY those signals, overlaid. The global filter no longer
+     applies to it.
+
+   The three signals are alternatives, not pipeline stages:
+     raw       -- the raw trace from the engine
+     filtered  -- the raw trace run through the current global filter
+     csd       -- the 3-point Laplacian of the raw trace and its two
+                  nearest same-shank neighbors
+
+   Each mode has its own default color:
+     raw       -- the channel's own color (default_trace_color or a
+                  per-channel override)
+     filtered  -- light cyan (#4cc9f0), clearly "processed"
+     csd       -- orange (#ff9f1c), a different physical quantity
+
+UI
+--
+- Left-click on a channel's per-row button (the small ⋮ at the right
+  edge of the label strip) opens that channel's display-mode menu.
+- A header button at the top of the label strip opens a bulk menu
+  (apply-to-all, reset-all).
+- The left label strip has improved contrast and legibility.
 """
 
 from __future__ import annotations
@@ -31,14 +68,42 @@ from scipy.signal import spectrogram, butter, sosfiltfilt, resample_poly
 from matplotlib import colormaps
 
 
+# Default colors for the three per-channel display signals. The 'raw'
+# mode uses each channel's own color (default_trace_color or a
+# per-channel override); only 'filtered' and 'csd' get fixed colors
+# here, so they read as distinct regardless of the channel's base
+# color.
+FILTERED_COLOR = QColor("#4cc9f0")
+CSD_COLOR = QColor("#ff9f1c")
+
+# Label-strip visuals.
+LABEL_STRIP_BG = QColor(0, 0, 0, 150)
+LABEL_TEXT_COLOR = QColor("#e8e8e8")
+LABEL_FONT_POINT_SIZE = 9
+LABEL_STRIP_WIDTH = 92
+
+# Small "menu button" drawn next to each channel's name/depth.
+ROW_BUTTON_WIDTH = 20
+ROW_BUTTON_HEIGHT = 16
+ROW_BUTTON_BG = QColor("#2d2d2d")
+ROW_BUTTON_BG_HOVER = QColor("#3d5d80")
+ROW_BUTTON_BORDER = QColor("#4a4a4a")
+ROW_BUTTON_BORDER_HOVER = QColor("#5a9fff")
+ROW_BUTTON_GLYPH = QColor("#e8e8e8")
+
+# Maximum allowed depth gap between a channel and a CSD neighbor.
+# Comfortably above the densest Neuropixels pitch (~15 µm), well below
+# any accidental cross-shank grouping.
+MAX_CSD_NEIGHBOR_GAP_UM = 60.0
+
+
 class TraceControlPanel(QWidget):
     """
     Control panel for trace view settings.
     Can be used as a dockable widget or embedded in the trace view.
     """
-    
-    # Signals emitted when controls change
-    timeChanged = pyqtSignal(float, float)  # start_time, end_time
+
+    timeChanged = pyqtSignal(float, float)
     durationChanged = pyqtSignal(float)
     gainChanged = pyqtSignal(float)
     autoScaleChanged = pyqtSignal(bool)
@@ -51,60 +116,55 @@ class TraceControlPanel(QWidget):
     useTimestampsChanged = pyqtSignal(bool)
     goToStartRequested = pyqtSignal()
     goToEndRequested = pyqtSignal()
-    stepTimeRequested = pyqtSignal(int)  # direction: -1 or +1
+    stepTimeRequested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Trace Controls")
         self.setMinimumWidth(350)
-        
         self._build_ui()
-    
+
     def _build_ui(self):
-        """Build the control panel UI."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
-        
-        # Channel info label
+
         self.channel_info_label = QLabel("No channels")
         self.channel_info_label.setStyleSheet("color: #888; font-size: 10px; font-weight: bold;")
         self.channel_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.channel_info_label)
-        
-        # ---- Navigation section ----
+
+        # ---- Navigation ----
         nav_group = QGroupBox("Navigation")
         nav_layout = QVBoxLayout(nav_group)
         nav_layout.setSpacing(2)
-        
-        # Navigation buttons row
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(2)
-        
+
         self.start_btn = QPushButton("⏮")
         self.start_btn.setToolTip("Go to start")
         self.start_btn.clicked.connect(self.goToStartRequested.emit)
         btn_row.addWidget(self.start_btn)
-        
+
         self.step_back_btn = QPushButton("◀")
         self.step_back_btn.setToolTip("Step back")
         self.step_back_btn.clicked.connect(lambda: self.stepTimeRequested.emit(-1))
         btn_row.addWidget(self.step_back_btn)
-        
+
         self.step_fwd_btn = QPushButton("▶")
         self.step_fwd_btn.setToolTip("Step forward")
         self.step_fwd_btn.clicked.connect(lambda: self.stepTimeRequested.emit(1))
         btn_row.addWidget(self.step_fwd_btn)
-        
+
         self.end_btn = QPushButton("⏭")
         self.end_btn.setToolTip("Go to end")
         self.end_btn.clicked.connect(self.goToEndRequested.emit)
         btn_row.addWidget(self.end_btn)
-        
+
         btn_row.addStretch()
         nav_layout.addLayout(btn_row)
-        
-        # Time display
+
         time_row = QHBoxLayout()
         time_row.setSpacing(2)
         time_row.addWidget(QLabel("Time:"))
@@ -117,8 +177,7 @@ class TraceControlPanel(QWidget):
         time_row.addWidget(self.end_label)
         time_row.addStretch()
         nav_layout.addLayout(time_row)
-        
-        # Duration
+
         dur_row = QHBoxLayout()
         dur_row.setSpacing(2)
         dur_row.addWidget(QLabel("Duration:"))
@@ -130,20 +189,20 @@ class TraceControlPanel(QWidget):
         dur_row.addWidget(self.duration_spin)
         dur_row.addStretch()
         nav_layout.addLayout(dur_row)
-        
+
         layout.addWidget(nav_group)
-        
-        # ---- Playback section ----
+
+        # ---- Playback ----
         playback_group = QGroupBox("Playback")
         playback_layout = QVBoxLayout(playback_group)
         playback_layout.setSpacing(2)
-        
+
         play_row = QHBoxLayout()
         play_row.setSpacing(2)
         self.animation_btn = QPushButton("▶ Play")
         self.animation_btn.clicked.connect(self._on_animation_clicked)
         play_row.addWidget(self.animation_btn)
-        
+
         play_row.addWidget(QLabel("Speed:"))
         self.animation_speed_spin = QSpinBox()
         self.animation_speed_spin.setRange(10, 1000)
@@ -153,14 +212,14 @@ class TraceControlPanel(QWidget):
         play_row.addWidget(self.animation_speed_spin)
         play_row.addStretch()
         playback_layout.addLayout(play_row)
-        
+
         layout.addWidget(playback_group)
-        
-        # ---- Gain and Scaling section ----
+
+        # ---- Gain & Scaling ----
         gain_group = QGroupBox("Gain & Scaling")
         gain_layout = QVBoxLayout(gain_group)
         gain_layout.setSpacing(2)
-        
+
         gain_row = QHBoxLayout()
         gain_row.setSpacing(2)
         gain_row.addWidget(QLabel("Gain:"))
@@ -172,16 +231,16 @@ class TraceControlPanel(QWidget):
         gain_row.addWidget(self.gain_spin)
         gain_row.addStretch()
         gain_layout.addLayout(gain_row)
-        
+
         self.auto_scale_checkbox = QCheckBox("Auto-scale each channel")
         self.auto_scale_checkbox.setChecked(False)
         self.auto_scale_checkbox.setToolTip("When enabled, each channel is scaled to fill its vertical space")
         self.auto_scale_checkbox.toggled.connect(self._on_auto_scale_toggled)
         gain_layout.addWidget(self.auto_scale_checkbox)
-        
+
         layout.addWidget(gain_group)
-        
-        # ---- Filter section ----
+
+        # ---- Filters ----
         filter_group = QGroupBox("Filters")
         filter_layout = QVBoxLayout(filter_group)
         filter_layout.setSpacing(2)
@@ -192,9 +251,8 @@ class TraceControlPanel(QWidget):
         self.filter_checkbox.toggled.connect(self._on_filter_toggled)
         bp_row.addWidget(self.filter_checkbox)
 
-        # Low frequency - allow 0 for high-pass only
         self.low_freq_spin = QDoubleSpinBox()
-        self.low_freq_spin.setRange(0.0, 15000.0)  # Allow 0
+        self.low_freq_spin.setRange(0.0, 15000.0)
         self.low_freq_spin.setValue(1.0)
         self.low_freq_spin.setSuffix(" Hz")
         self.low_freq_spin.setEnabled(False)
@@ -203,7 +261,7 @@ class TraceControlPanel(QWidget):
         bp_row.addWidget(self.low_freq_spin)
 
         self.high_freq_spin = QDoubleSpinBox()
-        self.high_freq_spin.setRange(0.0, 15000.0)  # Allow 0
+        self.high_freq_spin.setRange(0.0, 15000.0)
         self.high_freq_spin.setValue(300.0)
         self.high_freq_spin.setSuffix(" Hz")
         self.high_freq_spin.setEnabled(False)
@@ -234,78 +292,56 @@ class TraceControlPanel(QWidget):
         filter_layout.addWidget(self.detrend_checkbox)
 
         layout.addWidget(filter_group)
-        
-        # ---- Display section ----
+
+        # ---- Display ----
         display_group = QGroupBox("Display")
         display_layout = QVBoxLayout(display_group)
         display_layout.setSpacing(2)
-        
+
         self.depth_scale_checkbox = QCheckBox("Show depth scale")
         self.depth_scale_checkbox.setChecked(True)
         self.depth_scale_checkbox.toggled.connect(self._on_depth_scale_toggled)
         display_layout.addWidget(self.depth_scale_checkbox)
-        
-        # Add clear cursors button
+
         self.clear_cursors_btn = QPushButton("🗑 Clear All Cursors")
         self.clear_cursors_btn.clicked.connect(self._on_clear_cursors)
         display_layout.addWidget(self.clear_cursors_btn)
-        
+
         layout.addWidget(display_group)
 
-        
-        # NOTE on scope: this checkbox controls ONLY how time is *displayed*
-        # (axis tick labels / start-end readout) -- see _update_time_labels()
-        # and _draw_time_axis(), the only two places self._use_timestamps is
-        # read. It does NOT affect which samples are fetched, where the
-        # trace is drawn, or where the vertical cursor line sits: those all
-        # unconditionally use engine.timestamps_loaded (absolute recording
-        # timestamps once a timestamps.npy is loaded, elapsed seconds
-        # otherwise) regardless of this checkbox's state. That split is
-        # intentional -- it lets you view/scroll using simple elapsed-time
-        # labels even when timestamps are loaded, without changing how data
-        # is actually indexed underneath. Do not "fix" this by making
-        # playback/indexing depend on this checkbox too; if you want that,
-        # it needs to become a real second mode, not a label toggle.
+        # NOTE on scope: this checkbox controls ONLY how time is *displayed*.
         self.use_timestamps_checkbox = QCheckBox("Show real timestamp values on axis")
         self.use_timestamps_checkbox.setToolTip(
             "Display axis labels using the loaded timestamps.npy values "
             "instead of elapsed seconds. Does not change which samples "
-            "are shown or where cursors are placed -- those always use "
-            "real timestamps once a timestamps.npy file is loaded."
+            "are shown or where cursors are placed."
         )
         self.use_timestamps_checkbox.setChecked(False)
-        self.use_timestamps_checkbox.setEnabled(False)  # Disabled until timestamps are loaded
+        self.use_timestamps_checkbox.setEnabled(False)
         self.use_timestamps_checkbox.toggled.connect(self._on_use_timestamps_toggled)
         display_layout.addWidget(self.use_timestamps_checkbox)
 
-
-        # ---- Zoom section ----
+        # ---- Zoom ----
         zoom_group = QGroupBox("Zoom")
         zoom_layout = QHBoxLayout(zoom_group)
         zoom_layout.setSpacing(2)
-        
+
         zoom_out_btn = QPushButton("−")
         zoom_out_btn.clicked.connect(lambda: self._on_zoom_changed(0.5))
         zoom_layout.addWidget(zoom_out_btn)
-        
+
         self.zoom_label = QLabel("100%")
         self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         zoom_layout.addWidget(self.zoom_label)
-        
+
         zoom_in_btn = QPushButton("+")
         zoom_in_btn.clicked.connect(lambda: self._on_zoom_changed(2.0))
         zoom_layout.addWidget(zoom_in_btn)
-        
+
         zoom_layout.addStretch()
         layout.addWidget(zoom_group)
-        
-        # Add stretch at bottom
-        # layout.addStretch()
 
-
-    # ------------------------------------------------------------------
-    # Signal emitters
-    # ------------------------------------------------------------------
+    # ---- Signal emitters ----
 
     def _on_use_timestamps_toggled(self, checked: bool):
         self.useTimestampsChanged.emit(checked)
@@ -316,41 +352,38 @@ class TraceControlPanel(QWidget):
             self.use_timestamps_checkbox.setChecked(False)
 
     def _on_clear_cursors(self):
-        """Emit signal to clear cursors."""
         self.clearCursorsRequested.emit()
 
     def _on_duration_changed(self, value: float):
         self.durationChanged.emit(value)
-    
+
     def _on_gain_changed(self, value: float):
         self.gainChanged.emit(value)
-    
+
     def _on_auto_scale_toggled(self, checked: bool):
         self.autoScaleChanged.emit(checked)
-    
+
     def _on_animation_clicked(self):
         self.animationToggled.emit(True)
-    
+
     def _on_animation_speed_changed(self, value: int):
         self.animationSpeedChanged.emit(value)
-    
+
     def _on_filter_toggled(self, checked: bool):
-        """Handle bandpass filter toggle - enable/disable spinboxes."""
         self.low_freq_spin.setEnabled(checked)
         self.high_freq_spin.setEnabled(checked)
         self._emit_filter_settings()
-    
+
     def _on_notch_toggled(self, checked: bool):
-        """Handle notch filter toggle - enable/disable spinbox."""
         self.notch_freq_spin.setEnabled(checked)
         self._emit_filter_settings()
-    
+
     def _on_detrend_toggled(self, checked: bool):
         self._emit_filter_settings()
-    
+
     def _on_filter_params_changed(self):
         self._emit_filter_settings()
-    
+
     def _emit_filter_settings(self):
         settings = {
             'bandpass_enabled': self.filter_checkbox.isChecked(),
@@ -361,36 +394,34 @@ class TraceControlPanel(QWidget):
             'detrend': self.detrend_checkbox.isChecked(),
         }
         self.filterChanged.emit(settings)
-    
+
     def _on_depth_scale_toggled(self, checked: bool):
         self.depthScaleChanged.emit(checked)
-    
+
     def _on_zoom_changed(self, factor: float):
         self.zoomChanged.emit(factor)
-    
-    # ------------------------------------------------------------------
-    # Public methods to update control state
-    # ------------------------------------------------------------------
-    
+
+    # ---- Public setters ----
+
     def set_time_display(self, start_time: float, end_time: float):
         self.start_label.setText(f"{start_time:.2f}s")
         self.end_label.setText(f"{end_time:.2f}s")
-    
+
     def set_duration(self, duration: float):
         self.duration_spin.blockSignals(True)
         self.duration_spin.setValue(duration)
         self.duration_spin.blockSignals(False)
-    
+
     def set_gain(self, gain: float):
         self.gain_spin.blockSignals(True)
         self.gain_spin.setValue(gain)
         self.gain_spin.blockSignals(False)
-    
+
     def set_auto_scale(self, enabled: bool):
         self.auto_scale_checkbox.blockSignals(True)
         self.auto_scale_checkbox.setChecked(enabled)
         self.auto_scale_checkbox.blockSignals(False)
-    
+
     def set_animation_playing(self, playing: bool):
         self.animation_btn.setText("⏸ Pause" if playing else "▶ Play")
 
@@ -398,7 +429,7 @@ class TraceControlPanel(QWidget):
 class TraceViewWidget(QWidget):
     """
     Scrollable trace display for neural data.
-    
+
     The trace view itself contains only the plot area. The control panel
     is a separate widget that can be embedded or docked separately.
     """
@@ -408,74 +439,79 @@ class TraceViewWidget(QWidget):
     def __init__(self, engine: TraceEngine, parent: QWidget | None = None):
         super().__init__(parent)
         self.engine = engine
-        
-        # View state
+
         self.setMinimumSize(600, 400)
-        
-        # Time window state - will be updated when data/timestamps are loaded
+        self.setMouseTracking(True)
+
         self.start_time = 0.0
         self.window_duration = 10.0
         self._zoom_level = 1.0
         self._channel_offset = 0.0
         self.spectrogram_auto_db = True
 
-
-        # Track last good view for double-click reset
         self._last_view = {
             'start_time': 0.0,
             'window_duration': 10.0,
             'zoom_level': 1.0,
-            'channel_offset': 0.0
+            'channel_offset': 0.0,
         }
-        
-        # Vertical time cursors - store as sample indices
-        self._time_cursors: list[int] = []  # List of sample indices
+
+        self._time_cursors: list[int] = []
         self._selected_cursor: int | None = None
         self._dragging_cursor: bool = False
         self._drag_cursor_start_x = 0.0
 
-
-        # Drag state
         self._dragging = False
-        self._drag_start_pos = None  # QPointF
+        self._drag_start_pos = None
         self._drag_start_time = 0.0
         self._drag_start_offset = 0.0
 
-        # Channel visibility and sorting
         self.channels: list[int] = []
-        self.channel_depths: dict[int, float] = {}
         self._sorted_channels: list[int] = []
-        
-        self._overscroll_tolerance = 0.2  # 20% of window duration
 
-        # Axis-label display mode only -- does NOT affect sample fetching,
-        # trace drawing, or cursor placement (those always follow
-        # engine.timestamps_loaded). See the checkbox definition in
-        # TraceControlPanel._build_ui() for the full explanation.
+        # ---- Display-selection geometry ----
+        # Depth/shank/x for the channels the user has SELECTED for
+        # display. Used for label-strip sorting and lane positioning.
+        # NOT used for CSD -- see full_probe_* below.
+        self.channel_depths: dict[int, float] = {}
+        self.channel_shanks: dict[int, int] = {}
+        self.channel_xcoords: dict[int, float] = {}
+
+        # ---- FULL probe geometry ----
+        # Depth/shank/x for EVERY channel on the loaded probe, not just
+        # the ones currently selected for display. CSD neighbor lookup
+        # uses ONLY these maps, so a channel's Laplacian always uses
+        # its physically-adjacent same-shank neighbors -- even if those
+        # neighbors aren't currently being drawn. A CSD computed from
+        # only the displayed subset would silently use whatever
+        # channels happened to be selected as "neighbors", which is
+        # almost never what the user means.
+        self.full_probe_depths: dict[int, float] = {}
+        self.full_probe_shanks: dict[int, int] = {}
+        self.full_probe_xcoords: dict[int, float] = {}
+
+        self._overscroll_tolerance = 0.2
+
         self._use_timestamps = False
 
-
-        # Color settings
         self.default_trace_color = QColor("#ffffff")
         self.background_color = QColor("#1e1e1e")
         self.grid_color = QColor("#555555")
         self.show_grid = True
         self.trace_width = 1.0
-        
-        self._time_cursors: list[float] = []  # List of time positions for vertical lines
 
-        # Per-channel colors
+        self._time_cursors: list[float] = []
+
         self.channel_colors: dict[int, QColor] = {}
-        
-        # Gain and scaling settings
+
+        # Per-row button hitboxes, refreshed every paint.
+        self._row_button_rects: dict[int, QRectF] = {}
+        self._hovered_row_button_channel: int | None = None
+
         self.global_gain = 1.0
-        # Default OFF: fixed-scale mode (relative amplitudes preserved
-        # across channels) is the standard starting view; matches
-        # TraceControlPanel.auto_scale_checkbox's default below -- keep
-        # both in sync if this ever changes.
         self.auto_scale = False
-        
-        # Filter settings (using core.filters)
+
+        # GLOBAL filter settings (Trace Controls panel).
         self.filter_enabled = False
         self.filter_low_freq = 4.0
         self.filter_high_freq = 30.0
@@ -484,151 +520,92 @@ class TraceViewWidget(QWidget):
         self.notch_freq = 50.0
         self.notch_q = 30.0
         self.detrend_enabled = False
-        
-        # Cache for filtered data
+
         self._filtered_cache = {}
-        
-        # Animation settings
+
+        # PER-CHANNEL display overrides.
+        self.channel_display_modes: dict[int, dict[str, bool]] = {}
+
+        # CSD neighbor table (per-probe, lazily built).
+        self._csd_neighbors: dict[int, tuple] = {}
+        self._csd_neighbor_table_valid = False
+
         self.animation_enabled = False
         self.animation_speed = 100
         self._animation_timer = QTimer(self)
         self._animation_timer.timeout.connect(self._on_animation_tick)
         self._is_animating = False
-        
-        # Zoom state
-        self._zoom_level = 1.0
-        
-        # Display options
+
         self.show_channel_labels = True
         self.show_time_axis = True
         self.show_depth_scale = False
-        
-        # Cache for data
+
         self._cached_data = None
         self._cache_start = None
         self._cache_end = None
         self._cache_start_idx = None
         self._cache_end_idx = None
 
-        # Ripple overlay rendering/interaction now lives entirely in
-        # gui/ripple_trace_view.py's RippleTraceViewWidget (mirroring
-        # theta epochs' ThetaEpochTraceViewWidget). The base
-        # TraceViewWidget has no ripple-specific state.
-
-        # ------------------------------------------------------------------
-        # Spectrogram
-        # ------------------------------------------------------------------
+        # ---- Spectrogram ----
         self.show_spectrogram = False
         self.spectrogram_channel = None
-
-        # Computed spectrogram data
         self.spectrogram_data = None
         self.spectrogram_freqs = None
         self.spectrogram_times = None
-
-        # Frequency-masked slice actually rendered (built by
-        # _update_spectrogram_frequency_view from spectrogram_data/
-        # spectrogram_freqs + the min/max freq range below). Must exist
-        # before any first call to _render_spectrogram_image() -- e.g. a
-        # dB/colormap control changed before a full compute cycle has
-        # run -- or that method would raise AttributeError instead of
-        # cleanly no-op'ing like it does for spectrogram_data.
         self._spectrogram_display_data = None
         self._spectrogram_display_freqs = None
-
-        # Display frequency range
         self.spectrogram_min_freq = 0.0
         self.spectrogram_max_freq = 40.0
-
-        # Color scale in dB
         self.spectrogram_vmin = -100.0
         self.spectrogram_vmax = -40.0
         self.spectrogram_cmap = "viridis"
-
-        # Spectrogram processing parameters
-        #
-        # Raw Neuropixels data:
-        #       30 kHz
-        #          ↓
-        #       low-pass 40 Hz
-        #          ↓
-        #       resample to 100 Hz
-        #          ↓
-        #       spectrogram
-        #
-        # At 100 Hz with nperseg=100:
-        #       frequency resolution = 1 Hz
-        #
-        # noverlap=90 (90% overlap) rather than 50%: quintuples the
-        # number of time columns per window (e.g. ~19 -> ~91 for a
-        # typical 10s view) for a small compute cost increase, since
-        # each STFT frame is still only 100 samples. This is the main
-        # lever for how "smooth" the spectrogram looks along the time
-        # axis -- more real columns to draw/interpolate between, rather
-        # than a handful of wide blocks stretched across the view.
         self.spectrogram_sr = 100.0
         self.spectrogram_lowpass = 40.0
         self.spectrogram_filter_order = 4
         self.spectrogram_nperseg = 100
         self.spectrogram_noverlap = 90
-
-        # Pre-rendered Qt image
         self._spectrogram_image = None
-
-        # Cache key for the calculated PSD
         self._spectrogram_cache_key = None
 
-        # Prevent expensive recomputation during continuous navigation.
-        # The calculation is scheduled only after navigation settles.
         self._spectrogram_update_timer = QTimer(self)
         self._spectrogram_update_timer.setSingleShot(True)
         self._spectrogram_update_timer.setInterval(150)
-        self._spectrogram_update_timer.timeout.connect(
-            self._compute_spectrogram
-        )
+        self._spectrogram_update_timer.timeout.connect(self._compute_spectrogram)
 
         self.spectrogram_control = SpectrogramControlPanel()
         self._connect_spectrogram_controls()
 
-
-
-        # Create control panel
         self.control_panel = TraceControlPanel()
         self._connect_control_panel()
-        
-        # Flag
+
         self._data_loaded = False
-        
-        # Setup UI
+
         self._setup_ui()
-        
-        # Initialize from engine if data is already loaded
+
         if engine.data_loaded:
             self._setup_from_engine()
 
+    # ------------------------------------------------------------------
+    # UI scaffolding
+    # ------------------------------------------------------------------
+
     def _setup_ui(self):
-        """Create the UI layout - plot area with scrollbar at bottom."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        
-        # Create a stretchable plot area
+
         plot_container = QWidget()
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         plot_layout.setSpacing(0)
-        
-        # The plot container takes up all available space
+
         layout.addWidget(plot_container, stretch=1)
-        
-        # Add scrollbar at the bottom (not stretched)
+
         self._build_scrollbar(layout)
-        
-        # Set focus policy
+
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _connect_control_panel(self):
-        """Connect control panel signals to this widget's methods."""
         self.control_panel.timeChanged.connect(self._on_control_time_changed)
         self.control_panel.durationChanged.connect(self._on_control_duration_changed)
         self.control_panel.gainChanged.connect(self._on_control_gain_changed)
@@ -638,81 +615,56 @@ class TraceViewWidget(QWidget):
         self.control_panel.filterChanged.connect(self._on_control_filter_changed)
         self.control_panel.zoomChanged.connect(self._on_control_zoom_changed)
         self.control_panel.depthScaleChanged.connect(self._on_control_depth_scale_changed)
-        self.control_panel.clearCursorsRequested.connect(self._clear_time_cursors)  # ADD THIS
+        self.control_panel.clearCursorsRequested.connect(self._clear_time_cursors)
         self.control_panel.useTimestampsChanged.connect(self._on_use_timestamps_changed)
         self.control_panel.goToStartRequested.connect(self._go_to_start)
         self.control_panel.goToEndRequested.connect(self._go_to_end)
         self.control_panel.stepTimeRequested.connect(self._step_time)
 
-
     def _build_scrollbar(self, layout: QVBoxLayout):
-        """Build the horizontal scrollbar and add it to the bottom."""
         self.scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self.scrollbar.setRange(0, 1000)
         self.scrollbar.setFixedHeight(15)
         self.scrollbar.setStyleSheet("""
-            QScrollBar:horizontal {
-                background: #2d2d2d;
-                height: 15px;
-                margin: 0px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #4a9eff;
-                min-width: 20px;
-                border-radius: 7px;
-                margin: 2px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background: #5aaeff;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-                background: #1e1e1e;
-            }
+            QScrollBar:horizontal { background: #2d2d2d; height: 15px; margin: 0px; }
+            QScrollBar::handle:horizontal { background: #4a9eff; min-width: 20px; border-radius: 7px; margin: 2px; }
+            QScrollBar::handle:horizontal:hover { background: #5aaeff; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: #1e1e1e; }
         """)
         self.scrollbar.valueChanged.connect(self._on_scrollbar_changed)
         layout.addWidget(self.scrollbar)
-        
-        # Make sure the scrollbar is at the bottom
         layout.setAlignment(self.scrollbar, Qt.AlignmentFlag.AlignBottom)
 
     def _setup_from_engine(self):
-        """Initialize view state from the engine."""
         if self.engine.data_loaded:
             self._data_loaded = True
-            
-            # Get valid time range
+
             if self.engine.timestamps_loaded and self.engine.timestamps is not None:
                 time_start, time_end = self.engine.get_time_range()
-                self.start_time = time_start  # Start at first timestamp
+                self.start_time = time_start
                 self.window_duration = min(10.0, time_end - time_start)
             else:
                 self.start_time = 0.0
-                self.window_duration = min(
-                    self.engine.total_duration,
-                    max(self.window_duration, 1.0)
-                )
-            
+                self.window_duration = min(self.engine.total_duration, max(self.window_duration, 1.0))
+
             self._update_scrollbar_range()
             self._update_time_labels()
             self.update()
+
     # ------------------------------------------------------------------
-    # Control panel signal handlers
+    # Control panel handlers
     # ------------------------------------------------------------------
 
     def _on_use_timestamps_changed(self, enabled: bool):
-        """Handle timestamps usage toggle."""
         self._use_timestamps = enabled
         self._invalidate_cache()
         self._update_time_labels()
         self.update()
-            
+
     def _on_control_time_changed(self, start_time: float, duration: float):
         if not self._data_loaded:
             return
-        
         if start_time < 0:
             max_start = max(0.0, self.engine.total_duration - self.window_duration)
             self.start_time = max_start
@@ -720,7 +672,6 @@ class TraceViewWidget(QWidget):
             self.window_duration = max(0.1, duration)
         else:
             self.start_time = max(0.0, start_time)
-        
         self._update_time_labels()
         self._invalidate_cache()
         self.update()
@@ -766,273 +717,121 @@ class TraceViewWidget(QWidget):
         self.show_depth_scale = enabled
         self.update()
 
-    
     # ------------------------------------------------------------------
-    # spectrogram methods
+    # Spectrogram
     # ------------------------------------------------------------------
+
     def _schedule_spectrogram_update(self):
-        """
-        Schedule a spectrogram recalculation.
-
-        Repeated navigation events restart the timer, so the expensive
-        calculation happens only after navigation has settled.
-        """
-        if not self.show_spectrogram:
+        if not self.show_spectrogram or self.spectrogram_channel is None:
             return
-
-        if self.spectrogram_channel is None:
-            return
-
         self._spectrogram_update_timer.start()
-        
 
     def _get_spectrogram_height(self):
-        """Return the height reserved for the spectrogram."""
         if not self.show_spectrogram:
             return 0
-
         return max(120, int(self.height() * 0.25))
 
-                
     def _on_spectrogram_min_db_changed(self, value: float):
         self.spectrogram_vmin = value
-
         if self.show_spectrogram and self.spectrogram_data is not None:
             self._render_spectrogram_image()
-
         self.update()
-
 
     def _on_spectrogram_max_db_changed(self, value: float):
         self.spectrogram_vmax = value
-
         if self.show_spectrogram and self.spectrogram_data is not None:
             self._render_spectrogram_image()
-
         self.update()
-
 
     def _on_spectrogram_auto_db_changed(self, enabled: bool):
         self.spectrogram_auto_db = enabled
-
         if self.show_spectrogram and self.spectrogram_data is not None:
             self._render_spectrogram_image()
-
         self.update()
 
-            
     def _connect_spectrogram_controls(self):
-        """Connect spectrogram control-panel signals."""
-
-        self.spectrogram_control.enabledChanged.connect(
-            self._on_spectrogram_enabled_changed
-        )
-
-        self.spectrogram_control.channelChanged.connect(
-            self._on_spectrogram_channel_changed
-        )
-
-        self.spectrogram_control.minFreqChanged.connect(
-            self._on_spectrogram_min_freq_changed
-        )
-
-        self.spectrogram_control.maxFreqChanged.connect(
-            self._on_spectrogram_max_freq_changed
-        )
-
-        self.spectrogram_control.minDbChanged.connect(
-            self._on_spectrogram_min_db_changed
-        )
-
-        self.spectrogram_control.maxDbChanged.connect(
-            self._on_spectrogram_max_db_changed
-        )
-
-        self.spectrogram_control.cmapChanged.connect(
-            self._on_spectrogram_cmap_changed
-        )
-
-
-        self.spectrogram_control.minDbChanged.connect(
-        self._on_spectrogram_min_db_changed
-        )
-
-        self.spectrogram_control.maxDbChanged.connect(
-            self._on_spectrogram_max_db_changed
-        )
-
-        self.spectrogram_control.autoDbChanged.connect(
-            self._on_spectrogram_auto_db_changed
-        )
+        self.spectrogram_control.enabledChanged.connect(self._on_spectrogram_enabled_changed)
+        self.spectrogram_control.channelChanged.connect(self._on_spectrogram_channel_changed)
+        self.spectrogram_control.minFreqChanged.connect(self._on_spectrogram_min_freq_changed)
+        self.spectrogram_control.maxFreqChanged.connect(self._on_spectrogram_max_freq_changed)
+        self.spectrogram_control.minDbChanged.connect(self._on_spectrogram_min_db_changed)
+        self.spectrogram_control.maxDbChanged.connect(self._on_spectrogram_max_db_changed)
+        self.spectrogram_control.cmapChanged.connect(self._on_spectrogram_cmap_changed)
+        self.spectrogram_control.autoDbChanged.connect(self._on_spectrogram_auto_db_changed)
 
     def _on_spectrogram_enabled_changed(self, enabled: bool):
-        """Handle spectrogram checkbox."""
-
         self.show_spectrogram = bool(enabled)
-
         if not self.show_spectrogram:
-
             self._spectrogram_update_timer.stop()
             self._spectrogram_image = None
-
         else:
-
-            if self.spectrogram_channel is None:
-
-                if self.channels:
-                    self.spectrogram_channel = self.channels[0]
-                    self.spectrogram_control.set_channel(
-                        self.spectrogram_channel
-                    )
-
+            if self.spectrogram_channel is None and self.channels:
+                self.spectrogram_channel = self.channels[0]
+                self.spectrogram_control.set_channel(self.spectrogram_channel)
             if self.spectrogram_channel is not None:
-
                 self._spectrogram_cache_key = None
-
-                # Immediate computation on enable.
                 self._compute_spectrogram()
-
         self.update()
-        
 
     def _on_spectrogram_channel_changed(self, channel: int):
-        """Change the channel used for the spectrogram."""
-
         self.spectrogram_channel = int(channel)
-
-        # Force recalculation for the new channel.
         self._spectrogram_cache_key = None
-
         if self.show_spectrogram:
             self._schedule_spectrogram_update()
-
         self.update()
 
     def _on_spectrogram_min_freq_changed(self, value: float):
-        """Change lower frequency limit."""
-
         value = max(0.0, float(value))
-
         if value >= self.spectrogram_max_freq:
             value = max(0.0, self.spectrogram_max_freq - 1.0)
-
         self.spectrogram_min_freq = value
-
-        # Frequency limits only affect which rows are displayed.
-        # The expensive PSD calculation does not need to be repeated.
         if self.spectrogram_data is not None:
             self._update_spectrogram_frequency_view()
-
         self.update()
-
 
     def _on_spectrogram_max_freq_changed(self, value: float):
-        """Change upper frequency limit."""
-
-        value = min(
-            self.spectrogram_sr / 2.0,
-            float(value)
-        )
-
+        value = min(self.spectrogram_sr / 2.0, float(value))
         if value <= self.spectrogram_min_freq:
             value = self.spectrogram_min_freq + 1.0
-
         self.spectrogram_max_freq = value
-
         if self.spectrogram_data is not None:
             self._update_spectrogram_frequency_view()
-
         self.update()
-
 
     def _on_spectrogram_cmap_changed(self, name: str):
-        """Change spectrogram colormap."""
-
         self.spectrogram_cmap = str(name)
-
         if self.spectrogram_data is not None:
             self._render_spectrogram_image()
-
         self.update()
 
-
-
-
-
     def _compute_spectrogram(self):
-        """Compute the spectrogram from downsampled low-frequency data."""
-
         if not self.show_spectrogram:
             return
-
         if not self.engine.data_loaded:
             print("Spectrogram: engine has no data")
             return
-
         if self.spectrogram_channel is None:
             print("Spectrogram: no channel selected")
             return
 
         start_time = float(self.start_time)
-        end_time = (
-            start_time
-            + float(self.window_duration)
-        )
-
+        end_time = start_time + float(self.window_duration)
         if end_time <= start_time:
             print("Spectrogram: invalid time range")
             return
 
-        print(
-            f"Spectrogram: CH{self.spectrogram_channel} "
-            f"{start_time:.3f}–{end_time:.3f} s"
-        )
+        print(f"Spectrogram: CH{self.spectrogram_channel} {start_time:.3f}–{end_time:.3f} s")
 
-        # ----------------------------------------------------------
-        # Cache check
-        # ----------------------------------------------------------
-        # Recomputing the PSD (filter + resample + scipy.signal.spectrogram)
-        # on every navigation tick is the expensive part of this pipeline;
-        # a cache key was already threaded through several call sites
-        # (reset to None whenever something that invalidates the result
-        # changes) but was never actually compared against anything, so
-        # it did nothing. This is the missing other half: skip
-        # recomputation entirely when nothing the PSD depends on has
-        # changed since the last call.
-        cache_key = (
-            self.spectrogram_channel,
-            round(start_time, 6),
-            round(end_time, 6),
-            self.spectrogram_sr,
-            self.spectrogram_lowpass,
-            self.spectrogram_filter_order,
-            self.spectrogram_nperseg,
-            self.spectrogram_noverlap,
-        )
-        if (self._spectrogram_cache_key == cache_key
-                and self.spectrogram_data is not None):
+        cache_key = (self.spectrogram_channel, round(start_time, 6), round(end_time, 6),
+                     self.spectrogram_sr, self.spectrogram_lowpass, self.spectrogram_filter_order,
+                     self.spectrogram_nperseg, self.spectrogram_noverlap)
+        if self._spectrogram_cache_key == cache_key and self.spectrogram_data is not None:
             return
 
         try:
-
-            # ----------------------------------------------------------
-            # Get raw data
-            # ----------------------------------------------------------
-
-            data = self.engine.get_channel_data(
-                self.spectrogram_channel,
-                start_time,
-                end_time,
-            )
-
-            data = np.asarray(
-                data,
-                dtype=np.float64,
-            )
-
-            print(
-                f"Spectrogram: raw samples = {len(data)}"
-            )
+            data = self.engine.get_channel_data(self.spectrogram_channel, start_time, end_time)
+            data = np.asarray(data, dtype=np.float64)
+            print(f"Spectrogram: raw samples = {len(data)}")
 
             if data.size < 10:
                 print("Spectrogram: not enough samples")
@@ -1041,483 +840,160 @@ class TraceViewWidget(QWidget):
                 self._spectrogram_cache_key = None
                 return
 
-            # ----------------------------------------------------------
-            # Replace invalid samples
-            # ----------------------------------------------------------
-
             finite = np.isfinite(data)
-
             if not np.all(finite):
-
                 if not np.any(finite):
                     print("Spectrogram: all samples invalid")
                     return
+                replacement = np.median(data[finite])
+                data = np.nan_to_num(data, nan=replacement, posinf=replacement, neginf=replacement)
 
-                replacement = np.median(
-                    data[finite]
-                )
+            raw_sr = float(self.engine.sr)
+            target_sr = float(self.spectrogram_sr)
+            print(f"Spectrogram: {raw_sr:g} Hz -> {target_sr:g} Hz")
 
-                data = np.nan_to_num(
-                    data,
-                    nan=replacement,
-                    posinf=replacement,
-                    neginf=replacement,
-                )
-
-            # ----------------------------------------------------------
-            # Raw sampling rate
-            # ----------------------------------------------------------
-
-            raw_sr = float(
-                self.engine.sr
-            )
-
-            target_sr = float(
-                self.spectrogram_sr
-            )
-
-            print(
-                f"Spectrogram: {raw_sr:g} Hz -> "
-                f"{target_sr:g} Hz"
-            )
-
-            # ----------------------------------------------------------
-            # Low-pass before downsampling
-            # ----------------------------------------------------------
-
-            cutoff = min(
-                float(self.spectrogram_lowpass),
-                target_sr * 0.45,
-                raw_sr * 0.45,
-            )
-
-            sos = butter(
-                int(self.spectrogram_filter_order),
-                cutoff,
-                btype="lowpass",
-                fs=raw_sr,
-                output="sos",
-            )
-
+            cutoff = min(float(self.spectrogram_lowpass), target_sr * 0.45, raw_sr * 0.45)
+            sos = butter(int(self.spectrogram_filter_order), cutoff, btype="lowpass", fs=raw_sr, output="sos")
             try:
-
-                data = sosfiltfilt(
-                    sos,
-                    data,
-                )
-
+                data = sosfiltfilt(sos, data)
             except ValueError:
+                print("Spectrogram: filtering skipped because the segment is too short")
 
-                print(
-                    "Spectrogram: filtering skipped "
-                    "because the segment is too short"
-                )
-
-            # ----------------------------------------------------------
-            # Downsample
-            # ----------------------------------------------------------
-
-            if not np.isclose(
-                raw_sr,
-                target_sr,
-            ):
-
+            if not np.isclose(raw_sr, target_sr):
                 from math import gcd
-
-                raw_sr_int = int(
-                    round(raw_sr)
-                )
-
-                target_sr_int = int(
-                    round(target_sr)
-                )
-
-                divisor = gcd(
-                    raw_sr_int,
-                    target_sr_int,
-                )
-
+                raw_sr_int = int(round(raw_sr))
+                target_sr_int = int(round(target_sr))
+                divisor = gcd(raw_sr_int, target_sr_int)
                 up = target_sr_int // divisor
                 down = raw_sr_int // divisor
+                data = resample_poly(data, up, down)
 
-                data = resample_poly(
-                    data,
-                    up,
-                    down,
-                )
+            print(f"Spectrogram: downsampled samples = {len(data)}")
 
-            print(
-                f"Spectrogram: downsampled samples = "
-                f"{len(data)}"
-            )
-
-            # ----------------------------------------------------------
-            # Spectrogram
-            # ----------------------------------------------------------
-
-            nperseg = int(
-                self.spectrogram_nperseg
-            )
-
-            noverlap = int(
-                self.spectrogram_noverlap
-            )
-
+            nperseg = int(self.spectrogram_nperseg)
+            noverlap = int(self.spectrogram_noverlap)
             if len(data) < nperseg:
-
                 nperseg = len(data)
-
-                noverlap = min(
-                    noverlap,
-                    nperseg - 1,
-                )
+                noverlap = min(noverlap, nperseg - 1)
 
             if nperseg < 8:
-                print(
-                    "Spectrogram: segment too short"
-                )
+                print("Spectrogram: segment too short")
                 return
 
-            f, t, Sxx = spectrogram(
-                data,
-                fs=target_sr,
-                window="hann",
-                nperseg=nperseg,
-                noverlap=noverlap,
-                detrend="constant",
-                scaling="density",
-                mode="psd",
-            )
-
-            print(
-                f"Spectrogram: PSD shape = {Sxx.shape}"
-            )
-
-            # ----------------------------------------------------------
-            # Store
-            # ----------------------------------------------------------
+            f, t, Sxx = spectrogram(data, fs=target_sr, window="hann", nperseg=nperseg,
+                                    noverlap=noverlap, detrend="constant", scaling="density", mode="psd")
+            print(f"Spectrogram: PSD shape = {Sxx.shape}")
 
             self.spectrogram_freqs = f
-
-            self.spectrogram_times = (
-                t + start_time
-            )
-
+            self.spectrogram_times = t + start_time
             self.spectrogram_data = Sxx
             self._spectrogram_cache_key = cache_key
 
-            # ----------------------------------------------------------
-            # Frequency selection
-            # ----------------------------------------------------------
-
             self._update_spectrogram_frequency_view()
 
-            print(
-                f"Spectrogram: image = "
-                f"{self._spectrogram_image is not None}"
-            )
-
+            print(f"Spectrogram: image = {self._spectrogram_image is not None}")
             if self._spectrogram_image is not None:
-                print(
-                    f"Spectrogram: image size = "
-                    f"{self._spectrogram_image.width()} x "
-                    f"{self._spectrogram_image.height()}"
-                )
-
+                print(f"Spectrogram: image size = {self._spectrogram_image.width()} x {self._spectrogram_image.height()}")
             self.update()
 
         except Exception as exc:
-
-            print(
-                f"Spectrogram calculation failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
+            print(f"Spectrogram calculation failed: {type(exc).__name__}: {exc}")
             self.spectrogram_data = None
             self.spectrogram_freqs = None
             self.spectrogram_times = None
             self._spectrogram_image = None
             self._spectrogram_cache_key = None
-
             self.update()
-            
-
 
     def _get_spectrogram_rect(self):
-        """Return the dedicated spectrogram rectangle."""
-
         if not self.show_spectrogram:
             return None
-
         rect = self.rect()
-
         if hasattr(self, "scrollbar"):
-            rect.setBottom(
-                rect.bottom() - self.scrollbar.height()
-            )
+            rect.setBottom(rect.bottom() - self.scrollbar.height())
 
-        label_width = 80
-        depth_scale_width = 30
+        plot_left = rect.left() + LABEL_STRIP_WIDTH
+        plot_right = rect.right() - 30
 
-        plot_left = rect.left() + label_width
-        plot_right = rect.right() - depth_scale_width
-
-        # The spectrogram occupies the band between the trace area and the
-        # time-axis labels. Use _get_plot_bounds to get the same plot_bottom
-        # that the traces use, so the two stay consistent.
         _, _, traces_bottom = self._get_plot_bounds()
-
         spectrogram_height = self._get_spectrogram_height()
 
-        # The spectrogram starts just below the trace area and ends where
-        # the time axis labels begin (i.e. above the scrollbar with a small
-        # margin for the labels).
         spectrogram_top = traces_bottom + 4
-        spectrogram_bottom = (
-            rect.bottom() - 25  # time axis label area
-        )
+        spectrogram_bottom = rect.bottom() - 25
 
         actual_height = spectrogram_bottom - spectrogram_top
-
         if actual_height < 20:
             return None
 
-        return QRectF(
-            float(plot_left),
-            float(spectrogram_top),
-            float(plot_right - plot_left),
-            float(actual_height),
-        )
+        return QRectF(float(plot_left), float(spectrogram_top), float(plot_right - plot_left), float(actual_height))
 
     def _update_spectrogram_frequency_view(self):
-        """Select the requested frequency range."""
-
-        if self.spectrogram_data is None:
+        if self.spectrogram_data is None or self.spectrogram_freqs is None:
             self._spectrogram_image = None
             return
 
-        if self.spectrogram_freqs is None:
-            self._spectrogram_image = None
-            return
+        freqs = np.asarray(self.spectrogram_freqs)
+        data = np.asarray(self.spectrogram_data)
 
-        freqs = np.asarray(
-            self.spectrogram_freqs
-        )
-
-        data = np.asarray(
-            self.spectrogram_data
-        )
-
-        mask = (
-            (freqs >= self.spectrogram_min_freq)
-            & (freqs <= self.spectrogram_max_freq)
-        )
-
+        mask = (freqs >= self.spectrogram_min_freq) & (freqs <= self.spectrogram_max_freq)
         if not np.any(mask):
-            print(
-                "Spectrogram: frequency mask is empty"
-            )
+            print("Spectrogram: frequency mask is empty")
             self._spectrogram_image = None
             return
 
-        self._spectrogram_display_freqs = (
-            freqs[mask]
-        )
+        self._spectrogram_display_freqs = freqs[mask]
+        self._spectrogram_display_data = data[mask, :]
 
-        self._spectrogram_display_data = (
-            data[mask, :]
-        )
-
-        print(
-            "Spectrogram display:",
-            self._spectrogram_display_data.shape
-        )
-
+        print("Spectrogram display:", self._spectrogram_display_data.shape)
         self._render_spectrogram_image()
-        
+
     def _render_spectrogram_image(self):
         if self._spectrogram_display_data is None:
             self._spectrogram_image = None
             return
 
-        # IMPORTANT: use the frequency-masked slice
-        # (_spectrogram_display_data / _spectrogram_display_freqs, built
-        # by _update_spectrogram_frequency_view from spectrogram_min_freq/
-        # spectrogram_max_freq), NOT the full self.spectrogram_data. Using
-        # the full array here made the min/max frequency controls appear
-        # to do nothing: the mask was computed correctly but this method
-        # ignored it and always rendered the whole PSD.
-        Sxx_db = 10.0 * np.log10(
-            np.maximum(self._spectrogram_display_data, np.finfo(float).tiny)
-        )
+        Sxx_db = 10.0 * np.log10(np.maximum(self._spectrogram_display_data, np.finfo(float).tiny))
 
         if self.spectrogram_auto_db:
-            # Ignore extreme outliers when determining the automatic scale
             vmin = np.percentile(Sxx_db, 5)
             vmax = np.percentile(Sxx_db, 99)
-
             if vmax <= vmin:
                 vmax = vmin + 1.0
-
             self.spectrogram_vmin = vmin
             self.spectrogram_vmax = vmax
-
-            # Keep the GUI controls synchronized
             self.spectrogram_control.min_db_spin.blockSignals(True)
             self.spectrogram_control.max_db_spin.blockSignals(True)
-
             self.spectrogram_control.min_db_spin.setValue(vmin)
             self.spectrogram_control.max_db_spin.setValue(vmax)
-
             self.spectrogram_control.min_db_spin.blockSignals(False)
             self.spectrogram_control.max_db_spin.blockSignals(False)
-
         else:
             vmin = self.spectrogram_vmin
             vmax = self.spectrogram_vmax
-
             if vmax <= vmin:
                 vmax = vmin + 1.0
 
-        normalized = np.clip(
-            (Sxx_db - vmin) / (vmax - vmin),
-            0.0,
-            1.0
-        )
-
-        # scipy.signal.spectrogram returns Sxx with row 0 = lowest
-        # frequency, rows increasing with frequency. QImage row 0 is the
-        # TOP of the image (raster convention, y increases downward). The
-        # axis labels drawn in _draw_spectrogram put spectrogram_max_freq
-        # at the top and spectrogram_min_freq at the bottom -- so without
-        # flipping, the lowest frequency (row 0) was being drawn at the
-        # top of the image while the label at that same position claimed
-        # it was the MAXIMUM frequency. That's why a low frequency like
-        # 7 Hz theta appeared near the top of a "0-40 Hz" axis instead of
-        # near the bottom where it belongs. flipud() puts the highest
-        # frequency row first (top of image) and lowest last (bottom of
-        # image), matching the labels.
+        normalized = np.clip((Sxx_db - vmin) / (vmax - vmin), 0.0, 1.0)
         normalized = np.flipud(normalized)
 
         cmap = colormaps.get_cmap(self.spectrogram_cmap)
-
         rgba = cmap(normalized)
         rgb = (rgba[..., :3] * 255).astype(np.uint8)
         rgb = np.ascontiguousarray(rgb)
 
         height, width, _ = rgb.shape
-
-        self._spectrogram_image = QImage(
-            rgb.data,
-            width,
-            height,
-            width * 3,
-            QImage.Format.Format_RGB888
-        ).copy()
-        
-    def _draw_spectrogram(self, painter: QPainter):
-        """Draw the spectrogram."""
-
-        if not self.show_spectrogram:
-            return
-
-        spectrogram_rect = self._get_spectrogram_rect()
-
-        if spectrogram_rect is None:
-            return
-
-        painter.save()
-
-        # Background
-        painter.fillRect(
-            spectrogram_rect,
-            self.background_color,
-        )
-
-        # --------------------------------------------------------------
-        # Image
-        # --------------------------------------------------------------
-
-        if self._spectrogram_image is not None:
-
-            # SmoothPixmapTransform makes drawImage interpolate (bilinear)
-            # when scaling up instead of nearest-neighbor, which is what
-            # was producing hard, blocky pixel edges -- the underlying
-            # image is intentionally low-resolution (short time windows
-            # per PSD frame, see spectrogram_nperseg/noverlap) and gets
-            # stretched to fill spectrogram_rect, so without this the
-            # individual PSD "blocks" are visible as sharp rectangles.
-            # Scoped to just this draw call via save/restore so it
-            # doesn't change how anything else in the widget renders.
-            painter.setRenderHint(
-                QPainter.RenderHint.SmoothPixmapTransform, True
-            )
-
-            painter.drawImage(
-                spectrogram_rect,
-                self._spectrogram_image,
-            )
-
-        else:
-
-            # This should be visible if computation failed.
-            painter.setPen(
-                self.default_trace_color
-            )
-
-            painter.drawText(
-                spectrogram_rect,
-                Qt.AlignmentFlag.AlignCenter,
-                "Spectrogram: no data",
-            )
-
-        painter.restore()
-
-        # --------------------------------------------------------------
-        # Border -- subtle (grid color, thin) rather than the heavy
-        # trace-colored 2px border previously here, which visually
-        # competed with the spectrogram content itself.
-        # --------------------------------------------------------------
-
-        painter.save()
-
-        painter.setPen(
-            QPen(
-                self.grid_color,
-                1.0,
-            )
-        )
-
-        painter.drawRect(
-            spectrogram_rect
-        )
-
-        # --------------------------------------------------------------
-        # Labels -- small translucent background "pill" behind each
-        # label so text stays legible over busy/bright parts of the
-        # spectrogram image instead of just floating on top of it.
-        # --------------------------------------------------------------
-
-        painter.setRenderHint(
-            QPainter.RenderHint.Antialiasing, True
-        )
-
-        painter.setFont(
-            QFont(
-                "Arial",
-                8,
-            )
-        )
+        self._spectrogram_image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
 
     def _draw_spectrogram(self, painter: QPainter):
-        """Draw the spectrogram."""
         if not self.show_spectrogram:
             return
         spectrogram_rect = self._get_spectrogram_rect()
         if spectrogram_rect is None:
             return
+
         painter.save()
         painter.fillRect(spectrogram_rect, self.background_color)
+
         if self._spectrogram_image is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.drawImage(spectrogram_rect, self._spectrogram_image)
@@ -1525,14 +1001,17 @@ class TraceViewWidget(QWidget):
             painter.setPen(self.default_trace_color)
             painter.drawText(spectrogram_rect, Qt.AlignmentFlag.AlignCenter, "Spectrogram: no data")
         painter.restore()
+
         painter.save()
         painter.setPen(QPen(self.grid_color, 1.0))
         painter.drawRect(spectrogram_rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setFont(QFont("Arial", 8))
+
         fmin = float(self.spectrogram_min_freq)
         fmax = float(self.spectrogram_max_freq)
         tick_values = []
+
         if fmax > fmin:
             import math
             target_count = 5
@@ -1553,14 +1032,17 @@ class TraceViewWidget(QWidget):
             tick_values.append(fmax)
         else:
             tick_values = [fmin]
+
         painter.setPen(QPen(QColor(255, 255, 255, 25), 1))
         for freq in tick_values:
             y_ratio = (freq - fmin) / (fmax - fmin) if fmax > fmin else 0.5
             y_pixel = spectrogram_rect.bottom() - y_ratio * spectrogram_rect.height()
             painter.drawLine(int(spectrogram_rect.left()), int(y_pixel), int(spectrogram_rect.right()), int(y_pixel))
+
         metrics = painter.fontMetrics()
         text_height = metrics.height()
         pad_x, pad_y = 4, 2
+
         for freq in tick_values:
             text = f"{freq:g} Hz"
             text_width = metrics.horizontalAdvance(text)
@@ -1577,6 +1059,7 @@ class TraceViewWidget(QWidget):
             painter.drawRoundedRect(box, 3, 3)
             painter.setPen(self.default_trace_color)
             painter.drawText(int(label_x), int(y_pixel), text)
+
         if self.spectrogram_channel is not None:
             text = f"CH{self.spectrogram_channel}"
             text_width = metrics.horizontalAdvance(text)
@@ -1588,90 +1071,60 @@ class TraceViewWidget(QWidget):
             painter.drawRoundedRect(box, 3, 3)
             painter.setPen(self.default_trace_color)
             painter.drawText(int(label_x), int(y_pixel), text)
+
         painter.restore()
 
     def set_spectrogram_enabled(self, enabled: bool):
-        """Set spectrogram visibility."""
-
         enabled = bool(enabled)
-
         if self.show_spectrogram == enabled:
             self.spectrogram_control.set_enabled(enabled)
             return
-
         self.show_spectrogram = enabled
         self.spectrogram_control.set_enabled(enabled)
-
         if enabled:
-            # If nothing has been picked yet for the spectrogram, default
-            # to the first currently-selected trace channel rather than
-            # silently doing nothing -- previously, enabling the
-            # spectrogram before ever choosing a channel for it produced
-            # no visible result and no feedback.
             if self.spectrogram_channel is None and self.channels:
                 self.spectrogram_channel = self.channels[0]
                 self.spectrogram_control.set_channel(self.spectrogram_channel)
-
             if self.spectrogram_channel is not None:
                 self._schedule_spectrogram_update()
         else:
             self._spectrogram_update_timer.stop()
             self._spectrogram_image = None
-
         self.update()
 
-        
-
     def set_spectrogram_channel(self, channel: int):
-        """Set the channel used for the spectrogram."""
-
         if channel is None:
             return
-
         channel = int(channel)
-
         if self.spectrogram_channel == channel:
             self.spectrogram_control.set_channel(channel)
             return
-
         self.spectrogram_channel = channel
         self.spectrogram_control.set_channel(channel)
-
         self._spectrogram_cache_key = None
-
         if self.show_spectrogram:
             self._schedule_spectrogram_update()
-
         self.update()
-        
 
-        
     # ------------------------------------------------------------------
-    # Navigation methods
+    # Navigation
     # ------------------------------------------------------------------
 
     def _get_min_start_time(self) -> float:
-        """Get the minimum allowed start time."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
             return self.engine.timestamp_start
-        else:
-            return 0.0
+        return 0.0
 
     def _get_max_start_time(self) -> float:
-        """Get the maximum allowed start time."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
             return self.engine.timestamp_end - self.window_duration
-        else:
-            return max(0.0, self.engine.total_duration - self.window_duration)
+        return max(0.0, self.engine.total_duration - self.window_duration)
 
     def _get_total_duration(self) -> float:
-        """Get the total duration of the data."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
             return self.engine.timestamp_duration
-        else:
-            return self.engine.total_duration
+        return self.engine.total_duration
 
-    
     def _go_to_start(self):
         if not self._data_loaded:
             return
@@ -1681,7 +1134,6 @@ class TraceViewWidget(QWidget):
         self.update()
         self.control_panel.set_time_display(self.start_time, self.start_time + self.window_duration)
 
-            
     def _go_to_end(self):
         if not self._data_loaded:
             return
@@ -1690,7 +1142,6 @@ class TraceViewWidget(QWidget):
         self._invalidate_cache()
         self.update()
         self.control_panel.set_time_display(self.start_time, self.start_time + self.window_duration)
-        
 
     def _step_time(self, direction: int):
         if not self._data_loaded:
@@ -1705,78 +1156,90 @@ class TraceViewWidget(QWidget):
         self.control_panel.set_time_display(self.start_time, self.start_time + self.window_duration)
 
     def _update_time_labels(self):
-        """Update the start/end time labels."""
         if self._data_loaded:
             if self._use_timestamps and self.engine.timestamps_loaded:
-                # Map to actual timestamp values
                 start_idx = int(np.searchsorted(self.engine.timestamps, self.start_time, side='left'))
                 end_idx = int(np.searchsorted(self.engine.timestamps, self.start_time + self.window_duration, side='right'))
-                
                 start_idx = max(0, min(start_idx, len(self.engine.timestamps) - 1))
                 end_idx = max(0, min(end_idx, len(self.engine.timestamps) - 1))
-                
-                actual_start = self.engine.timestamps[start_idx]
-                actual_end = self.engine.timestamps[end_idx]
-                
-                self.control_panel.set_time_display(actual_start, actual_end)
+                self.control_panel.set_time_display(self.engine.timestamps[start_idx], self.engine.timestamps[end_idx])
                 return
-            
             end_time = min(self.start_time + self.window_duration, self.engine.total_duration)
             self.control_panel.set_time_display(self.start_time, end_time)
 
     def _reset_view(self):
-        """Reset to default view."""
         if not self._data_loaded:
             return
-        
         self.start_time = self._get_min_start_time()
         self.window_duration = min(10.0, self._get_total_duration())
         self._zoom_level = 1.0
         self._channel_offset = 0.0
-        
         self.control_panel.zoom_label.setText("100%")
         self.control_panel.duration_spin.blockSignals(True)
         self.control_panel.duration_spin.setValue(self.window_duration)
         self.control_panel.duration_spin.blockSignals(False)
-        
         self._update_time_labels()
         self._invalidate_cache()
         self.update()
 
-    
-
     def _scroll_up(self):
-        """Scroll up through channels (move to previous channel group)."""
         if not self._data_loaded or not self.channels:
             return
-        
-        # Keep the same time window but shift channels if needed
-        # This could be used to scroll through channels if there are more than fit
-        pass
 
     def _scroll_down(self):
-        """Scroll down through channels."""
         if not self._data_loaded or not self.channels:
             return
-        pass
 
-        
     # ------------------------------------------------------------------
-    # Depth sorting methods
+    # Channels / depths / shanks / x-coords
     # ------------------------------------------------------------------
 
     def set_channel_depths(self, depths: dict[int, float]):
         self.channel_depths = depths
         self._sort_channels_by_depth()
+        self._csd_neighbor_table_valid = False
         self._invalidate_cache()
         self.update()
 
+    def set_channel_shanks(self, shank_map: dict[int, int]):
+        """Set the shank id for each channel. Needed for CSD neighbor
+        lookup -- CSD is always within a shank, never across."""
+        self.channel_shanks = dict(shank_map)
+        self._csd_neighbor_table_valid = False
+        self._invalidate_cache()
+
+    def set_channel_xcoords(self, x_map: dict[int, float]):
+        """Set the x-coordinate for each channel. Used by CSD neighbor
+        selection to break ties among same-depth candidates: on some
+        probes two electrodes can sit at the same y on the same shank
+        (different x). The Laplacian only needs ONE channel per depth
+        level, so we pick the one laterally closest to the center."""
+        self.channel_xcoords = dict(x_map)
+        self._csd_neighbor_table_valid = False
+        self._invalidate_cache()
+
+    def set_full_probe_geometry(self,
+                                 depths: dict[int, float],
+                                 shanks: dict[int, int],
+                                 xcoords: dict[int, float]):
+        """Set the FULL probe geometry (every channel on the probe, not
+        just the ones currently selected for display). CSD neighbor
+        lookup uses ONLY this geometry, so the Laplacian always uses
+        each channel's physically-adjacent same-shank neighbors -- even
+        if those neighbors aren't currently being drawn."""
+        self.full_probe_depths = dict(depths)
+        self.full_probe_shanks = dict(shanks)
+        self.full_probe_xcoords = dict(xcoords)
+        self._csd_neighbor_table_valid = False
+        self._invalidate_cache()
+
+    def _xcoord_of(self, channel: int) -> float | None:
+        """Return the x-coordinate for a channel, or None if unknown."""
+        return self.channel_xcoords.get(channel)
+
     def _sort_channels_by_depth(self):
         if self.channel_depths:
-            self._sorted_channels = sorted(
-                self.channels,
-                key=lambda ch: self.channel_depths.get(ch, 0.0)
-            )
+            self._sorted_channels = sorted(self.channels, key=lambda ch: self.channel_depths.get(ch, 0.0))
         else:
             self._sorted_channels = list(self.channels)
 
@@ -1784,84 +1247,380 @@ class TraceViewWidget(QWidget):
         return self._sorted_channels if self._sorted_channels else list(self.channels)
 
     # ------------------------------------------------------------------
+    # Per-channel display modes
+    # ------------------------------------------------------------------
+
+    def _has_channel_override(self, channel: int) -> bool:
+        return channel in self.channel_display_modes
+
+    def _modes_for(self, channel: int) -> dict[str, bool]:
+        return self.channel_display_modes.get(channel, {'raw': True, 'filtered': False, 'csd': False})
+
+    def _ensure_csd_neighbor_table(self):
+        """Build the channel -> (above, below, dist_above, dist_below)
+        table once per probe, from the FULL probe geometry.
+
+        Rules that matter for correctness:
+          - Neighbors are looked up in full_probe_*, NOT in
+            channel_depths. channel_depths only contains the channels
+            the user has SELECTED for display; using it would make a
+            channel's "neighbor" be whatever displayed channel happens
+            to be next in y, which is almost never the physically
+            adjacent electrode.
+          - Neighbors are ALWAYS within the same shank. Never across.
+          - A neighbor must be at a STRICTLY DIFFERENT depth (y). Two
+            electrodes at the same y on the same shank (different x)
+            are LATERAL neighbors and must NOT be used as the above
+            or below term of a depth Laplacian.
+          - Among the strictly-different-depth candidates, "above" is
+            the next distinct y level above; "below" is the next
+            distinct y level below.
+          - When a depth level contains multiple channels (same-y
+            siblings), the one laterally closest in x to the center
+            channel is chosen, minimizing lateral offset in the
+            estimator.
+          - A neighbor must be within MAX_CSD_NEIGHBOR_GAP_UM; beyond
+            that the Laplacian is meaningless and the neighbor is
+            dropped.
+          - The topmost and bottommost channel of each shank (after
+            skipping same-y siblings) get (None, below) and
+            (above, None) respectively, and can't produce a CSD.
+        """
+        if self._csd_neighbor_table_valid:
+            return
+
+        self._csd_neighbors = {}
+
+        depths = self.full_probe_depths
+        shanks = self.full_probe_shanks
+        xcoords = self.full_probe_xcoords
+
+        if not depths:
+            self._csd_neighbor_table_valid = True
+            return
+
+        # The shank map MUST cover every channel that has depth info.
+        missing_shanks = [ch for ch in depths if ch not in shanks]
+        if missing_shanks:
+            if not getattr(self, '_csd_warned_shank_map', False):
+                print(
+                    f"[CSD] full_probe_shanks is missing {len(missing_shanks)} "
+                    f"channel(s) that have depth info -- refusing to build "
+                    f"a neighbor table from incomplete geometry. "
+                    f"First few missing: {missing_shanks[:5]}. "
+                    f"Call set_full_probe_geometry() with the FULL probe map."
+                )
+                self._csd_warned_shank_map = True
+            self._csd_neighbor_table_valid = True
+            return
+
+        # Group channels by shank.
+        by_shank: dict[int, list[tuple[int, float]]] = {}
+        for ch, y in depths.items():
+            s = int(shanks.get(ch, 0))
+            by_shank.setdefault(s, []).append((ch, float(y)))
+
+        for shank, items in by_shank.items():
+            # Sort by depth ascending (y increases toward the brain
+            # surface in this codebase).
+            items.sort(key=lambda cv: cv[1])
+
+            # Distinct y-values on this shank, sorted ascending. We
+            # index into this list -- not into `items` -- so same-y
+            # siblings collapse to a single depth level.
+            distinct_y = sorted(set(y for _, y in items))
+
+            # Channels grouped by depth level.
+            chans_at_y: dict[float, list[int]] = {}
+            for ch, y in items:
+                chans_at_y.setdefault(y, []).append(ch)
+
+            for ch, y in items:
+                above_ch = above_dist = None
+                below_ch = below_dist = None
+
+                try:
+                    y_idx = distinct_y.index(y)
+                except ValueError:
+                    self._csd_neighbors[ch] = (None, None, None, None)
+                    continue
+
+                # ---- above: next distinct depth level up ----
+                if y_idx + 1 < len(distinct_y):
+                    cand_y = distinct_y[y_idx + 1]
+                    gap = cand_y - y
+                    if 0 < gap <= MAX_CSD_NEIGHBOR_GAP_UM:
+                        candidates = chans_at_y[cand_y]
+                        if len(candidates) == 1:
+                            above_ch = candidates[0]
+                        else:
+                            center_x = xcoords.get(ch)
+                            if center_x is None:
+                                above_ch = candidates[0]
+                            else:
+                                above_ch = min(
+                                    candidates,
+                                    key=lambda c: abs((xcoords.get(c, center_x)) - center_x),
+                                )
+                        above_dist = gap
+
+                # ---- below: next distinct depth level down ----
+                if y_idx - 1 >= 0:
+                    cand_y = distinct_y[y_idx - 1]
+                    gap = y - cand_y
+                    if 0 < gap <= MAX_CSD_NEIGHBOR_GAP_UM:
+                        candidates = chans_at_y[cand_y]
+                        if len(candidates) == 1:
+                            below_ch = candidates[0]
+                        else:
+                            center_x = xcoords.get(ch)
+                            if center_x is None:
+                                below_ch = candidates[0]
+                            else:
+                                below_ch = min(
+                                    candidates,
+                                    key=lambda c: abs((xcoords.get(c, center_x)) - center_x),
+                                )
+                        below_dist = gap
+
+                self._csd_neighbors[ch] = (above_ch, below_ch, above_dist, below_dist)
+
+        self._csd_neighbor_table_valid = True
+
+    def _compute_csd_for_channel(self, channel: int, basis: np.ndarray) -> np.ndarray | None:
+        """3-point Laplacian CSD for `channel`, computed from RAW
+        traces of the channel and its two nearest same-shank
+        neighbors. `basis` is the raw trace of `channel` itself, so we
+        don't re-fetch it. Never uses the global filter -- CSD is one
+        of the three alternative signals.
+
+        Every failure path prints a one-line diagnostic (once per
+        unique reason) rather than silently returning None -- the
+        most common reason CSD "doesn't plot" is that
+        set_channel_shanks() was never called on this view, so the
+        neighbor table can't be built correctly.
+        """
+        self._ensure_csd_neighbor_table()
+
+        pair = self._csd_neighbors.get(channel)
+        if pair is None:
+            if not getattr(self, '_csd_warned_no_table', False):
+                print(
+                    f"[CSD] No neighbor-table entry for channel {channel}. "
+                    f"channel_depths has {len(self.channel_depths)} entries, "
+                    f"channel_shanks has {len(self.channel_shanks)} entries. "
+                    f"Both must cover the FULL probe (not just selected channels), "
+                    f"and set_channel_shanks() must have been called -- "
+                    f"see MainWindow._on_channels_selected."
+                )
+                self._csd_warned_no_table = True
+            return None
+
+        above_ch, below_ch, above_dist, below_dist = pair
+        if above_ch is None or below_ch is None:
+            # Edge channel, or a channel whose neighbor gap exceeded
+            # the sanity threshold. A 3-point Laplacian is undefined
+            # without both terms, so CSD simply cannot be computed
+            # here. This is normal and expected for the topmost and
+            # bottommost channel of every shank, and for any channel
+            # bordering a gap in the probe.
+            return None
+
+        end_time = self.start_time + self.window_duration
+        try:
+            above_raw = self.engine.get_channel_data(above_ch, self.start_time, end_time)
+            below_raw = self.engine.get_channel_data(below_ch, self.start_time, end_time)
+        except Exception as e:
+            print(f"[CSD] CH{channel}: neighbor fetch failed: {e}")
+            return None
+
+        n = len(basis)
+        if len(above_raw) != n or len(below_raw) != n:
+            print(
+                f"[CSD] CH{channel}: length mismatch basis={n} "
+                f"above={len(above_raw)} below={len(below_raw)}"
+            )
+            return None
+
+        spacing_um = (above_dist + below_dist) / 2.0
+        if spacing_um <= 0:
+            print(f"[CSD] CH{channel}: non-positive spacing ({spacing_um})")
+            return None
+
+        csd = (above_raw.astype(np.float64)
+               - 2.0 * basis.astype(np.float64)
+               + below_raw.astype(np.float64)) / (spacing_um ** 2)
+        return csd
+
+    def _show_channel_mode_menu(self, channel: int, global_pos):
+        """Popup menu for one channel: pick which of {raw, filtered,
+        csd} to draw. Checking any of them overrides the global
+        pipeline for this channel."""
+        is_override = self._has_channel_override(channel)
+        modes = self.channel_display_modes.get(channel, {'raw': False, 'filtered': False, 'csd': False})
+
+        # Determine whether this channel can actually compute a CSD.
+        self._ensure_csd_neighbor_table()
+        csd_pair = self._csd_neighbors.get(channel)
+        csd_available = (
+            csd_pair is not None
+            and csd_pair[0] is not None
+            and csd_pair[1] is not None
+        )
+
+        menu = QMenu(self)
+        header = menu.addAction(f"CH{channel} — per-channel display")
+        header.setEnabled(False)
+        menu.addSeparator()
+
+        act_raw = menu.addAction("Raw")
+        act_raw.setCheckable(True)
+        act_raw.setChecked(modes['raw'])
+
+        act_filt = menu.addAction("Filtered (current Trace Controls filter)")
+        act_filt.setCheckable(True)
+        act_filt.setChecked(modes['filtered'])
+
+        act_csd = menu.addAction("CSD (Laplacian with nearest neighbors)")
+        act_csd.setCheckable(True)
+        act_csd.setChecked(modes['csd'])
+        if not csd_available:
+            act_csd.setEnabled(False)
+            if csd_pair is None:
+                reason = "no depth/shank info available for this channel"
+            elif csd_pair[0] is None and csd_pair[1] is None:
+                reason = "no same-shank neighbors above or below"
+            elif csd_pair[0] is None:
+                reason = "no same-shank neighbor above (edge of shank)"
+            else:
+                reason = "no same-shank neighbor below (edge of shank)"
+            act_csd.setToolTip(
+                f"CSD is not available for CH{channel}: {reason}. "
+                "A 3-point Laplacian requires both an above and below "
+                "neighbor at a different depth on the same shank."
+            )
+
+        menu.addSeparator()
+        act_copy = menu.addAction("Apply this to all selected channels")
+        act_reset = menu.addAction("Reset this channel to global default")
+
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+
+        if chosen is act_copy:
+            for ch in self.channels:
+                self.channel_display_modes[ch] = dict(modes)
+            self._invalidate_cache()
+            self.update()
+            return
+
+        if chosen is act_reset:
+            self.channel_display_modes.pop(channel, None)
+            self._invalidate_cache()
+            self.update()
+            return
+
+        new_modes = {
+            'raw': act_raw.isChecked(),
+            'filtered': act_filt.isChecked(),
+            'csd': act_csd.isChecked(),
+        }
+        if not any(new_modes.values()):
+            self.channel_display_modes.pop(channel, None)
+        else:
+            self.channel_display_modes[channel] = new_modes
+
+        self._invalidate_cache()
+        self.update()
+
+    def _show_bulk_mode_menu(self, global_pos):
+        """Top-of-strip button: bulk actions for per-channel modes."""
+        n_override = len(self.channel_display_modes)
+        menu = QMenu(self)
+        header = menu.addAction(
+            f"Per-channel display — {n_override} channel(s) overridden"
+        )
+        header.setEnabled(False)
+        menu.addSeparator()
+
+        act_all_raw = menu.addAction("All channels → Raw")
+        act_all_filtered = menu.addAction("All channels → Filtered")
+        act_all_csd = menu.addAction("All channels → CSD")
+        act_all_raw_filt = menu.addAction("All channels → Raw + Filtered")
+        menu.addSeparator()
+        act_reset_all = menu.addAction("Reset ALL channels to global default")
+
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+
+        if chosen is act_reset_all:
+            self.channel_display_modes.clear()
+        elif chosen is act_all_raw:
+            for ch in self.channels:
+                self.channel_display_modes[ch] = {'raw': True, 'filtered': False, 'csd': False}
+        elif chosen is act_all_filtered:
+            for ch in self.channels:
+                self.channel_display_modes[ch] = {'raw': False, 'filtered': True, 'csd': False}
+        elif chosen is act_all_csd:
+            for ch in self.channels:
+                self.channel_display_modes[ch] = {'raw': False, 'filtered': False, 'csd': True}
+        elif chosen is act_all_raw_filt:
+            for ch in self.channels:
+                self.channel_display_modes[ch] = {'raw': True, 'filtered': True, 'csd': False}
+
+        self._invalidate_cache()
+        self.update()
+
+    # ------------------------------------------------------------------
     # Filter methods
     # ------------------------------------------------------------------
 
     def _apply_filters(self, data: np.ndarray) -> np.ndarray:
-        """Apply all enabled filters using core/filters functions."""
+        """Apply all enabled global filters."""
         if not self.filter_enabled and not self.notch_enabled and not self.detrend_enabled:
             return data
-        
+
         filtered_data = data.copy()
-        
-        # Detrend
+
         if self.detrend_enabled:
             from scipy.signal import detrend as scipy_detrend
             filtered_data = scipy_detrend(filtered_data, axis=0)
-        
-        # Bandpass/High-pass/Low-pass filter
+
         if self.filter_enabled:
             nyquist = self.engine.sr / 2
-            low_freq = self.filter_low_freq
-            high_freq = self.filter_high_freq
-            
-            # Validate frequencies
-            low_freq = max(0.0, min(low_freq, nyquist - 1))
-            high_freq = max(0.0, min(high_freq, nyquist - 1))
-            
+            low_freq = max(0.0, min(self.filter_low_freq, nyquist - 1))
+            high_freq = max(0.0, min(self.filter_high_freq, nyquist - 1))
             if low_freq > 0 and high_freq > 0:
-                # Bandpass filter
                 if low_freq >= high_freq:
-                    # Invalid range, swap or fix
                     low_freq, high_freq = min(low_freq, high_freq), max(low_freq, high_freq)
-                
-                filtered_data = bandpass_filter(
-                    filtered_data, self.engine.sr,
-                    low_freq, high_freq,
-                    order=self.filter_order
-                )
+                filtered_data = bandpass_filter(filtered_data, self.engine.sr, low_freq, high_freq, order=self.filter_order)
             elif high_freq > 0:
-                # Low-pass filter (low_freq = 0)
-                filtered_data = bandpass_filter(
-                    filtered_data, self.engine.sr,
-                    0.0, high_freq,  # low=0 means low-pass
-                    order=self.filter_order
-                )
+                filtered_data = bandpass_filter(filtered_data, self.engine.sr, 0.0, high_freq, order=self.filter_order)
             elif low_freq > 0:
-                # High-pass filter (high_freq = 0)
-                filtered_data = bandpass_filter(
-                    filtered_data, self.engine.sr,
-                    low_freq, 0.0,  # high=0 means high-pass
-                    order=self.filter_order
-                )
+                filtered_data = bandpass_filter(filtered_data, self.engine.sr, low_freq, 0.0, order=self.filter_order)
             else:
-                # Both are 0 - no filtering needed, just return original
                 return filtered_data
-        
-        # Notch filter
+
         if self.notch_enabled:
-            filtered_data = notch_filter(
-                filtered_data, self.engine.sr,
-                self.notch_freq, quality_factor=self.notch_q
-            )
-        
+            filtered_data = notch_filter(filtered_data, self.engine.sr, self.notch_freq, quality_factor=self.notch_q)
+
         return filtered_data
 
     # ------------------------------------------------------------------
-    # Public API for color and style customization
+    # Public color / style API
     # ------------------------------------------------------------------
 
     def set_trace_color(self, color: str | QColor, channel: int | None = None):
         qcolor = QColor(color) if isinstance(color, str) else color
         if not qcolor.isValid():
             return
-        
         if channel is None:
             self.default_trace_color = qcolor
             self.channel_colors.clear()
         else:
             self.channel_colors[channel] = qcolor
-        
         self.update()
 
     def get_trace_color(self, channel: int | None = None) -> str:
@@ -1910,13 +1669,12 @@ class TraceViewWidget(QWidget):
         self.control_panel.animation_speed_spin.setValue(self.animation_speed)
 
     # ------------------------------------------------------------------
-    # Animation methods
+    # Animation
     # ------------------------------------------------------------------
 
     def _on_animation_clicked(self):
         if not self._data_loaded:
             return
-        
         if self._is_animating:
             self._animation_timer.stop()
             self._is_animating = False
@@ -1929,92 +1687,68 @@ class TraceViewWidget(QWidget):
     def _on_animation_tick(self):
         if not self._data_loaded:
             return
-        
         dt = self.animation_speed / 1000.0
         max_start = max(0.0, self.engine.total_duration - self.window_duration)
-        
         self.start_time += dt
         if self.start_time > max_start:
             self.start_time = 0.0
-        
         self._update_scrollbar_position()
         self._update_time_labels()
         self._invalidate_cache()
         self.update()
 
     # ------------------------------------------------------------------
-    # Time navigation methods
+    # Cursor helpers
     # ------------------------------------------------------------------
 
     def _cursor_to_time(self, fraction: float) -> float:
-        """Convert fractional cursor position to time value."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
-            min_time = self.engine.timestamp_start
-            max_time = self.engine.timestamp_end
+            min_time, max_time = self.engine.timestamp_start, self.engine.timestamp_end
         else:
-            min_time = 0.0
-            max_time = self.engine.total_duration
-        
+            min_time, max_time = 0.0, self.engine.total_duration
         total_duration = max_time - min_time
         return min_time + fraction * total_duration
 
     def _time_to_cursor_fraction(self, time: float) -> float:
-        """Convert time value to fractional cursor position."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
-            min_time = self.engine.timestamp_start
-            max_time = self.engine.timestamp_end
+            min_time, max_time = self.engine.timestamp_start, self.engine.timestamp_end
         else:
-            min_time = 0.0
-            max_time = self.engine.total_duration
-        
+            min_time, max_time = 0.0, self.engine.total_duration
         total_duration = max_time - min_time
         if total_duration > 0:
             return (time - min_time) / total_duration
-        else:
-            return 0.0
+        return 0.0
 
-                
     def set_channels(self, channels: list[int]):
-        """Set which channels to display."""
         self.channels = channels
         self._sort_channels_by_depth()
-        
-        # Update control panel channel label
         if hasattr(self, 'control_panel') and hasattr(self.control_panel, 'channel_info_label'):
             self.control_panel.channel_info_label.setText(f"{len(channels)} channels selected")
-        
-        # Update spectrogram control
         if hasattr(self, 'spectrogram_control'):
             self.spectrogram_control.set_channels(channels)
             if channels:
                 self.spectrogram_control.set_channel(channels[0])
-        
         self._invalidate_cache()
         self.update()
 
     def set_data_source(self, engine: TraceEngine):
-        """Change data source."""
         self.engine = engine
         if engine.data_loaded:
             self._data_loaded = True
             self._setup_from_engine()
-            # Enable timestamps checkbox if timestamps are available
             if engine.timestamps_loaded:
                 self.control_panel.set_timestamps_available(True)
         else:
             self._data_loaded = False
             self.control_panel.set_timestamps_available(False)
-        
         self._invalidate_cache()
         self.update()
 
     def _on_scrollbar_changed(self, value: int):
-        """Handle scrollbar movement."""
         if self._data_loaded and self.engine.total_duration > 0:
             min_start = self._get_min_start_time()
             max_start = self._get_max_start_time()
             total_range = max_start - min_start
-            
             if total_range > 0:
                 self.start_time = min_start + (value / self.scrollbar.maximum()) * total_range
                 self._update_time_labels()
@@ -2022,242 +1756,198 @@ class TraceViewWidget(QWidget):
                 self.update()
 
     def _update_scrollbar_position(self):
-        """Update scrollbar to reflect current start_time."""
         if self._data_loaded and hasattr(self, 'scrollbar') and self.engine.total_duration > 0:
             min_start = self._get_min_start_time()
             max_start = self._get_max_start_time()
             total_range = max_start - min_start
-            
             if total_range > 0:
                 pos = int(((self.start_time - min_start) / total_range) * self.scrollbar.maximum())
                 self.scrollbar.blockSignals(True)
                 self.scrollbar.setValue(pos)
                 self.scrollbar.blockSignals(False)
-                
 
     def _update_scrollbar_range(self):
-        """Update scrollbar range."""
         if self._data_loaded and hasattr(self, 'scrollbar'):
             self.scrollbar.setMaximum(1000)
             self._update_scrollbar_position()
 
-
-
     def _zoom_to_cursor(self, factor: float, cursor_pos):
-        """Zoom centered on cursor position."""
         if not self._data_loaded:
             return
-        
         self._last_view = {
             'start_time': self.start_time,
             'window_duration': self.window_duration,
             'zoom_level': self._zoom_level,
-            'channel_offset': self._channel_offset
+            'channel_offset': self._channel_offset,
         }
-        
         plot_left, plot_right, _ = self._get_plot_bounds()
         plot_width = plot_right - plot_left
-        
         x_ratio = (cursor_pos.x() - plot_left) / max(1, plot_width)
         cursor_time = self.start_time + x_ratio * self.window_duration
-        
         new_duration = self.window_duration / factor
         new_duration = max(0.1, min(new_duration, self._get_total_duration()))
-        
         new_start = cursor_time - x_ratio * new_duration
-        
         min_start = self._get_min_start_time()
         max_start = self._get_max_start_time()
         new_start = max(min_start, min(new_start, max_start))
-        
         self.start_time = new_start
         self.window_duration = new_duration
         self._zoom_level *= factor
         self._zoom_level = max(0.1, min(self._zoom_level, 10.0))
-        
         self.control_panel.zoom_label.setText(f"{int(self._zoom_level * 100)}%")
         self.control_panel.duration_spin.blockSignals(True)
         self.control_panel.duration_spin.setValue(self.window_duration)
         self.control_panel.duration_spin.blockSignals(False)
-        
         self._update_time_labels()
         self._invalidate_cache()
         self.update()
 
     def _zoom(self, factor: float):
-        """Zoom in or out centered on view center."""
         if not self._data_loaded:
             return
-        
         self._last_view = {
             'start_time': self.start_time,
             'window_duration': self.window_duration,
             'zoom_level': self._zoom_level,
-            'channel_offset': self._channel_offset
+            'channel_offset': self._channel_offset,
         }
-        
         view_center = self.start_time + self.window_duration / 2
-        
         self._zoom_level *= factor
         self._zoom_level = max(0.1, min(self._zoom_level, 10.0))
         self.control_panel.zoom_label.setText(f"{int(self._zoom_level * 100)}%")
-        
         new_duration = self.window_duration / factor
         new_duration = max(0.1, min(new_duration, self._get_total_duration()))
-        
         new_start = view_center - new_duration / 2
-        
         min_start = self._get_min_start_time()
         max_start = self._get_max_start_time()
         new_start = max(min_start, min(new_start, max_start))
-        
         self.start_time = new_start
         self.window_duration = new_duration
-        
         self.control_panel.duration_spin.blockSignals(True)
         self.control_panel.duration_spin.setValue(self.window_duration)
         self.control_panel.duration_spin.blockSignals(False)
-        
         self._update_time_labels()
         self._invalidate_cache()
         self.update()
 
-
-    
-
-
     def _get_plot_bounds(self):
         """Return the bounds of the neural trace region."""
-
         rect = self.rect()
         if hasattr(self, "scrollbar"):
             rect.setBottom(rect.bottom() - self.scrollbar.height())
 
-        label_width = 80
-        depth_scale_width = 30
-        gap = 8
-
-        plot_left = rect.left() + label_width
-        plot_right = rect.right() - depth_scale_width
+        plot_left = rect.left() + LABEL_STRIP_WIDTH
+        plot_right = rect.right() - 30
 
         time_axis_height = 25
         plot_bottom = rect.bottom() - time_axis_height
 
         if self.show_spectrogram:
-            spectrogram_height = (self._get_spectrogram_height())
-            plot_bottom -= (spectrogram_height + gap)
+            spectrogram_height = self._get_spectrogram_height()
+            plot_bottom -= (spectrogram_height + 8)
 
-        return (plot_left,plot_right,plot_bottom,)
-        
+        return (plot_left, plot_right, plot_bottom)
+
     # ------------------------------------------------------------------
-    # Data methods
+    # Data
     # ------------------------------------------------------------------
 
     def _sample_to_time(self, sample: int) -> float:
-        """Convert a sample index to a time value."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
             sample = max(0, min(sample, len(self.engine.timestamps) - 1))
             return float(self.engine.timestamps[sample])
-        else:
-            return sample / self.engine.sr
+        return sample / self.engine.sr
 
     def _time_to_sample(self, time: float) -> int:
-        """Convert a time value to a sample index."""
         if self.engine.timestamps_loaded and self.engine.timestamps is not None:
             idx = int(np.searchsorted(self.engine.timestamps, time, side='left'))
             return max(0, min(idx, len(self.engine.timestamps) - 1))
-        else:
-            return int(time * self.engine.sr)
+        return int(time * self.engine.sr)
 
-                    
     def _invalidate_cache(self):
-        """
-        Invalidate the trace-data cache.
-
-        Spectrogram calculation is scheduled separately because it is
-        considerably more expensive than retrieving/processing the trace
-        data. During continuous navigation, the timer is restarted and the
-        spectrogram is calculated only after navigation has settled.
-        """
-
         self._cached_data = None
         self._cache_start = None
         self._cache_end = None
         self._cache_start_idx = None
         self._cache_end_idx = None
-
-        # Filtered data cache
         self._filtered_cache.clear()
-
-        # Spectrogram
-        #
-        # Do not calculate it immediately here. This function can be called
-        # many times while dragging, scrolling, zooming, etc.
         self._spectrogram_cache_key = None
-
-        if (
-            self.show_spectrogram
-            and self.spectrogram_channel is not None
-        ):
+        if self.show_spectrogram and self.spectrogram_channel is not None:
             self._schedule_spectrogram_update()
 
-
     def _get_data_for_display(self):
-        """Get data for the current time window."""
+        """Fetch data for the current window, per channel.
+
+        Returns { channel: [ {'mode': str, 'data': ndarray}, ... ] }.
+
+        Two cases per channel:
+          - No per-channel override (default): follow the global
+            pipeline. If a global filter is active, the drawn signal
+            is the filtered version (mode tag 'global' for coloring
+            purposes); otherwise raw (mode tag 'global').
+          - Per-channel override: draw ONLY the signals the user
+            explicitly listed. Global filter is bypassed.
+        """
         if not self._data_loaded or not self.channels:
             return None
-        
-        # Check cache
+
         if self._cached_data is not None and self._cache_start is not None:
-            if (self._cache_start <= self.start_time and 
-                self._cache_end >= self.start_time + self.window_duration):
+            if self._cache_start <= self.start_time and self._cache_end >= self.start_time + self.window_duration:
                 return self._cached_data
-        
-        # Fetch new data - NO CLAMPING, just get whatever exists
+
         end_time = self.start_time + self.window_duration
+        start_idx, end_idx = self.engine.get_time_window_sample_range(self.start_time, end_time)
 
-        # Resolve the sample range ONCE, shared by every channel: all
-        # channels are sliced from the same underlying (samples, n_ch)
-        # array over the same time window, so they share identical
-        # start/end sample indices. Capturing this here is what lets
-        # _draw_traces later recover each plotted sample's TRUE time
-        # (via engine.sample_to_time(start_idx + i)) instead of assuming
-        # samples are spaced uniformly across the pixel width -- an
-        # assumption that only holds when timestamps aren't loaded /
-        # aren't jittery. Without this, the trace is drawn with uniform
-        # spacing while cursors are placed at exact proportional time
-        # positions, and the two silently drift apart as soon as
-        # timestamps introduce any non-uniform sample spacing.
-        start_idx, end_idx = self.engine.get_time_window_sample_range(
-            self.start_time, end_time
-        )
+        global_filter_active = self.filter_enabled or self.notch_enabled or self.detrend_enabled
 
-        data = {}
+        data: dict[int, list[dict]] = {}
+
         for ch in self.channels:
             try:
-                # Get channel data from engine - engine handles out-of-range gracefully
-                channel_data = self.engine.get_channel_data(
-                    ch, self.start_time, end_time
-                )
-                if channel_data is not None and len(channel_data) > 0:
-                    data[ch] = channel_data
+                raw = self.engine.get_channel_data(ch, self.start_time, end_time)
             except Exception as e:
                 print(f"Error getting channel {ch}: {e}")
                 continue
-        
-        # Apply filters if enabled
-        if self.filter_enabled or self.notch_enabled or self.detrend_enabled:
-            filtered_data = {}
-            for ch, ch_data in data.items():
-                filtered_data[ch] = self._apply_filters(ch_data)
-            data = filtered_data
-        
+            if raw is None or len(raw) == 0:
+                continue
+
+            if self._has_channel_override(ch):
+                modes = self.channel_display_modes[ch]
+                traces: list[dict] = []
+
+                if modes.get('raw'):
+                    traces.append({'mode': 'raw', 'data': raw})
+
+                if modes.get('filtered'):
+                    filtered = self._apply_filters(raw) if global_filter_active else raw
+                    traces.append({'mode': 'filtered', 'data': filtered})
+
+                if modes.get('csd'):
+                    csd = self._compute_csd_for_channel(ch, basis=raw)
+                    if csd is not None:
+                        traces.append({'mode': 'csd', 'data': csd})
+                    # If csd is None, that means this channel has no
+                    # valid both-sided neighbor pair. We deliberately
+                    # do NOT fall back to raw -- falling back would
+                    # make the display ambiguous.
+
+                if not traces:
+                    traces.append({'mode': 'raw', 'data': raw})
+
+                data[ch] = traces
+            else:
+                # Global pipeline: exactly the previous behavior.
+                if global_filter_active:
+                    filtered = self._apply_filters(raw)
+                    data[ch] = [{'mode': 'global', 'data': filtered}]
+                else:
+                    data[ch] = [{'mode': 'global', 'data': raw}]
+
         self._cached_data = data
         self._cache_start = self.start_time
         self._cache_end = end_time
         self._cache_start_idx = start_idx
         self._cache_end_idx = end_idx
-
         return data
 
     # ------------------------------------------------------------------
@@ -2265,186 +1955,110 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
 
     def paintEvent(self, event):
-        """Paint the trace view."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # Get plot area - leave space for scrollbar at bottom
+
         rect = self.rect()
         if hasattr(self, 'scrollbar'):
-            scrollbar_height = self.scrollbar.height()
-            rect.setBottom(rect.bottom() - scrollbar_height)
-        
-        # Fill background
+            rect.setBottom(rect.bottom() - self.scrollbar.height())
+
         painter.fillRect(rect, self.background_color)
-        
-        # Check if data is loaded
+
         if not self._data_loaded:
             painter.setPen(QColor("#888888"))
             font = QFont()
             font.setPointSize(14)
             painter.setFont(font)
-            painter.drawText(
-                rect, Qt.AlignmentFlag.AlignCenter, "No data loaded."
-            )
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No data loaded.")
             return
-        
+
         if not self.channels:
             painter.setPen(QColor("#888888"))
             font = QFont()
             font.setPointSize(12)
             painter.setFont(font)
-            painter.drawText(
-                rect, Qt.AlignmentFlag.AlignCenter,
-                "Select channels from the probe map to display traces."
-            )
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Select channels from the probe map to display traces.")
             return
-        
+
         if self.show_grid:
             self._draw_grid(painter, rect)
-        
+
         data = self._get_data_for_display()
-        
-        # Draw traces (even if data is empty, just skip drawing)
-        self._draw_traces(painter, rect, data,)
+
+        self._draw_traces(painter, rect, data)
 
         if self.show_spectrogram:
             self._draw_spectrogram(painter)
-            
-        # Draw vertical time cursors
+
         self._draw_time_cursors(painter, rect)
 
-        # Draw time axis
         if self.show_time_axis:
             self._draw_time_axis(painter, rect)
-        
-        # Draw channel labels
+
         if self.show_channel_labels:
             self._draw_channel_labels(painter, rect, data)
-        
-        # Draw depth scale
+
         if self.show_depth_scale:
             self._draw_depth_scale(painter, rect, data)
 
     def _draw_time_cursors(self, painter: QPainter, rect: QRectF):
-        """Draw vertical time cursors with trash bin for selected cursor."""
         if not self._time_cursors:
             return
-        
+
         plot_left, plot_right, _ = self._get_plot_bounds()
         plot_width = plot_right - plot_left
-        
-        # Store trash bin hitboxes for click detection
+
         self._trash_bin_rects = {}
-        
+
         for i, cursor_fraction in enumerate(self._time_cursors):
-            # Convert fractional position to time
             cursor_time = self._cursor_to_time(cursor_fraction)
-            
-            # Check if cursor is within current view
             if cursor_time < self.start_time or cursor_time > self.start_time + self.window_duration:
                 continue
-            
-            # Calculate x position
+
             x_ratio = (cursor_time - self.start_time) / self.window_duration
             x = plot_left + x_ratio * plot_width
-            
+
             is_selected = (i == self._selected_cursor)
-            
-            # Draw vertical line
             if is_selected:
                 pen = QPen(QColor("#ff6b6b"), 3, Qt.PenStyle.DashLine)
             else:
                 pen = QPen(QColor("#ff6b6b"), 2, Qt.PenStyle.DashLine)
             painter.setPen(pen)
-            
-            painter.drawLine(
-                int(x), int(rect.top()),
-                int(x), int(rect.bottom())
-            )
-            
-            # Draw time label
+            painter.drawLine(int(x), int(rect.top()), int(x), int(rect.bottom()))
+
             painter.setPen(QPen(QColor("#ff6b6b"), 1))
             font = QFont()
             font.setPointSize(8)
             painter.setFont(font)
-            painter.drawText(
-                int(x - 25), int(rect.top() + 5), 50, 15,
-                Qt.AlignmentFlag.AlignCenter,
-                f"{cursor_time:.3f}s"
-            )
-            
-            # Draw trash bin for selected cursor - positioned to the LEFT of the line
+            painter.drawText(int(x - 25), int(rect.top() + 5), 50, 15, Qt.AlignmentFlag.AlignCenter, f"{cursor_time:.3f}s")
+
             if is_selected:
                 self._draw_trash_bin(painter, x - 12, rect.top())
-                # Store trash bin hitbox
-                self._trash_bin_rects[i] = QRectF(
-                    int(x) - 22, int(rect.top()) + 20, 20, 20
-                )
-            
+                self._trash_bin_rects[i] = QRectF(int(x) - 22, int(rect.top()) + 20, 20, 20)
+
             painter.setPen(pen)
-            
+
     def _draw_trash_bin(self, painter: QPainter, x: float, top: float):
-        """Draw a small trash bin icon."""
-        # Trash bin at top of cursor
-        bin_x = int(x) - 16  # Center the bin on the x position
+        bin_x = int(x) - 16
         bin_y = int(top) + 22
-        bin_size = 14  # Slightly smaller
-        
-        # Create colors
+        bin_size = 14
         bin_color = QColor("#ff6b6b")
         bin_fill = QColor("#ff6b6b")
         bin_fill.setAlpha(50)
-        
-        # Draw trash bin body
         painter.setPen(QPen(bin_color, 2))
         painter.setBrush(bin_fill)
-        
-        # Draw rectangle for bin body
-        painter.drawRoundedRect(
-            bin_x, bin_y + 3, bin_size, bin_size - 3, 2, 2
-        )
-        
-        # Draw lid
-        painter.drawLine(
-            bin_x - 1, bin_y + 3,
-            bin_x + bin_size + 1, bin_y + 3
-        )
-        
-        # Draw handle
-        painter.drawLine(
-            bin_x + 3, bin_y + 3,
-            bin_x + 3, bin_y + 1
-        )
-        painter.drawLine(
-            bin_x + 3, bin_y + 1,
-            bin_x + bin_size - 3, bin_y + 1
-        )
-        painter.drawLine(
-            bin_x + bin_size - 3, bin_y + 1,
-            bin_x + bin_size - 3, bin_y + 3
-        )
-        
-        # Draw vertical lines inside bin
+        painter.drawRoundedRect(bin_x, bin_y + 3, bin_size, bin_size - 3, 2, 2)
+        painter.drawLine(bin_x - 1, bin_y + 3, bin_x + bin_size + 1, bin_y + 3)
+        painter.drawLine(bin_x + 3, bin_y + 3, bin_x + 3, bin_y + 1)
+        painter.drawLine(bin_x + 3, bin_y + 1, bin_x + bin_size - 3, bin_y + 1)
+        painter.drawLine(bin_x + bin_size - 3, bin_y + 1, bin_x + bin_size - 3, bin_y + 3)
         painter.setPen(QPen(bin_color, 1))
         painter.drawLine(bin_x + 4, bin_y + 6, bin_x + 4, bin_y + bin_size - 2)
         painter.drawLine(bin_x + bin_size - 4, bin_y + 6, bin_x + bin_size - 4, bin_y + bin_size - 2)
-        
 
     def _compute_time_ticks(self, rect: QRectF):
-        """
-        Compute major and minor time tick positions.
-
-        Returns
-        -------
-        major_ticks : list of (x_pixel, time_value)
-        minor_ticks : list of (x_pixel, time_value)
-        """
-        label_width = 80
-        depth_scale_width = 30
-
-        plot_left = rect.left() + label_width
-        plot_right = rect.right() - depth_scale_width
+        plot_left = rect.left() + LABEL_STRIP_WIDTH
+        plot_right = rect.right() - 30
         plot_width = plot_right - plot_left
 
         if plot_width <= 0 or self.window_duration <= 0:
@@ -2453,12 +2067,9 @@ class TraceViewWidget(QWidget):
         start_time = self.start_time
         end_time = self.start_time + self.window_duration
 
-        # ---- Choose a "nice" major interval ----
-        # Target ~5-8 major ticks across the window.
         target_major_count = 6
         raw_interval = self.window_duration / target_major_count
 
-        # Round to a "nice" value: 1, 2, 5, 10, 20, 50, 100...
         import math
         magnitude = 10 ** math.floor(math.log10(raw_interval))
         for multiplier in (1, 2, 5, 10):
@@ -2466,11 +2077,7 @@ class TraceViewWidget(QWidget):
             if major_interval >= raw_interval:
                 break
 
-        # ---- Choose a "nice" minor interval ----
-        # 5 minor ticks per major tick is standard and uncluttered.
         minor_interval = major_interval / 5.0
-
-        # ---- Snap the first major tick to a multiple of major_interval ----
         first_major = math.ceil(start_time / major_interval) * major_interval
         first_minor = math.ceil(start_time / minor_interval) * minor_interval
 
@@ -2480,82 +2087,56 @@ class TraceViewWidget(QWidget):
         t = first_major
         while t <= end_time + 1e-9:
             x_ratio = (t - start_time) / self.window_duration
-            x = plot_left + x_ratio * plot_width
-            major_ticks.append((x, t))
+            major_ticks.append((plot_left + x_ratio * plot_width, t))
             t += major_interval
 
         t = first_minor
         while t <= end_time + 1e-9:
-            # Skip if this is also a major tick
             is_major = any(abs(t - mt) < minor_interval * 0.01 for _, mt in major_ticks)
             if not is_major:
                 x_ratio = (t - start_time) / self.window_duration
-                x = plot_left + x_ratio * plot_width
-                minor_ticks.append((x, t))
+                minor_ticks.append((plot_left + x_ratio * plot_width, t))
             t += minor_interval
 
         return major_ticks, minor_ticks
 
     def _draw_grid(self, painter: QPainter, rect: QRectF):
-        """Draw the grid aligned with the time ticks."""
         major_ticks, minor_ticks = self._compute_time_ticks(rect)
-
         plot_left, plot_right, plot_bottom = self._get_plot_bounds()
 
-        # ---- Minor grid lines (subtle, no labels) ----
-        minor_pen = QPen(QColor(255, 255, 255, 15), 1, Qt.PenStyle.DotLine)
-        painter.setPen(minor_pen)
+        painter.setPen(QPen(QColor(255, 255, 255, 15), 1, Qt.PenStyle.DotLine))
         for x, _ in minor_ticks:
-            painter.drawLine(
-                int(x), int(rect.top()),
-                int(x), int(plot_bottom)
-            )
+            painter.drawLine(int(x), int(rect.top()), int(x), int(plot_bottom))
 
-        # ---- Major grid lines (more visible) ----
-        major_pen = QPen(QColor(255, 255, 255, 40), 1, Qt.PenStyle.DotLine)
-        painter.setPen(major_pen)
+        painter.setPen(QPen(QColor(255, 255, 255, 40), 1, Qt.PenStyle.DotLine))
         for x, _ in major_ticks:
-            painter.drawLine(
-                int(x), int(rect.top()),
-                int(x), int(plot_bottom)
-            )
+            painter.drawLine(int(x), int(rect.top()), int(x), int(plot_bottom))
 
-        # ---- Horizontal grid lines (5 divisions) ----
         painter.setPen(QPen(self.grid_color, 1, Qt.PenStyle.DotLine))
         num_h_lines = 5
         for i in range(num_h_lines + 1):
             y = rect.top() + ((plot_bottom - rect.top()) * i / num_h_lines)
-            painter.drawLine(
-                int(rect.left()), int(y), int(rect.right()), int(y)
-            )
+            painter.drawLine(int(rect.left()), int(y), int(rect.right()), int(y))
 
-
-    def _draw_traces(
-        self,
-        painter: QPainter,
-        rect: QRectF,
-        data: dict[int, np.ndarray],
-    ):
+    def _draw_traces(self, painter: QPainter, rect: QRectF, data):
         """
         Draw neural traces.
 
-        The trace region ends at plot_bottom, leaving the lower part of
-        the widget available for the spectrogram.
+        `data` is {channel: [{'mode': str, 'data': ndarray}, ...]}.
+
+        Mode colors:
+          'global'   -- channel's own color; this is what an
+                        unconfigured channel always draws.
+          'raw'      -- channel's own color (explicit raw for an
+                        overridden channel).
+          'filtered' -- FILTERED_COLOR (light cyan).
+          'csd'      -- CSD_COLOR (orange).
         """
-
-        if not data:
+        if not data or not self._sorted_channels:
             return
 
-        if not self._sorted_channels:
-            return
-
-        # --------------------------------------------------------------
-        # Plot geometry
-        # --------------------------------------------------------------
         plot_left, plot_right, plot_bottom = self._get_plot_bounds()
-
         plot_top = rect.top()
-
         plot_width = plot_right - plot_left
         plot_height = plot_bottom - plot_top
 
@@ -2563,308 +2144,144 @@ class TraceViewWidget(QWidget):
             return
 
         n_channels = len(self._sorted_channels)
-
         if n_channels <= 0:
             return
-
         channel_height = plot_height / n_channels
 
-        # --------------------------------------------------------------
-        # Time information
-        # --------------------------------------------------------------
-        start_time = float(self.start_time)
-        end_time = start_time + float(self.window_duration)
-
-        if end_time <= start_time:
+        if self.window_duration <= 0:
             return
 
-        # --------------------------------------------------------------
-        # Determine display scale
-        # --------------------------------------------------------------
-        global_min = None
-        global_max = None
-
+        # Shared vertical range per "unit group":
+        #   group 0: global + raw + filtered (all in raw signal units)
+        #   group 1: csd (in µV/µm², orders of magnitude smaller)
+        group_ranges: dict[int, list] = {0: [None, None], 1: [None, None]}
         if not self.auto_scale:
-            # Fixed/global scaling.
-            #
-            # Calculate the range once instead of once per channel.
             for channel in self._sorted_channels:
-
                 if channel not in data:
                     continue
+                for trace in data[channel]:
+                    g = 1 if trace['mode'] == 'csd' else 0
+                    arr = np.asarray(trace['data'], dtype=np.float64)
+                    if arr.size == 0:
+                        continue
+                    finite = np.isfinite(arr)
+                    if not np.any(finite):
+                        continue
+                    arr = arr[finite]
+                    ch_min = float(np.min(arr))
+                    ch_max = float(np.max(arr))
+                    if group_ranges[g][0] is None or ch_min < group_ranges[g][0]:
+                        group_ranges[g][0] = ch_min
+                    if group_ranges[g][1] is None or ch_max > group_ranges[g][1]:
+                        group_ranges[g][1] = ch_max
 
-                channel_data = np.asarray(
-                    data[channel],
-                    dtype=np.float64,
-                )
+        for g in (0, 1):
+            if group_ranges[g][0] is None or group_ranges[g][1] is None:
+                group_ranges[g] = (-1.0, 1.0, 2.0)
+            else:
+                gmin, gmax = group_ranges[g]
+                grange = gmax - gmin
+                if grange <= 0:
+                    grange = 1.0
+                group_ranges[g] = (gmin, gmax, grange)
 
-                if channel_data.size == 0:
-                    continue
+        max_points = max(200, int(plot_width * 2))
 
-                finite = np.isfinite(channel_data)
-
-                if not np.any(finite):
-                    continue
-
-                channel_data = channel_data[finite]
-
-                ch_min = float(np.min(channel_data))
-                ch_max = float(np.max(channel_data))
-
-                if global_min is None or ch_min < global_min:
-                    global_min = ch_min
-
-                if global_max is None or ch_max > global_max:
-                    global_max = ch_max
-
-        if (
-            global_min is None
-            or global_max is None
-        ):
-            global_min = -1.0
-            global_max = 1.0
-
-        global_range = global_max - global_min
-
-        if global_range <= 0:
-            global_range = 1.0
-
-        # --------------------------------------------------------------
-        # Determine number of points to draw
-        # --------------------------------------------------------------
-        #
-        # Drawing every sample from a 30 kHz recording is unnecessary.
-        # Limit the number of points approximately to the number of pixels.
-        #
-        max_points = max(
-            200,
-            int(plot_width * 2),
-        )
-
-        # --------------------------------------------------------------
-        # Draw each channel
-        # --------------------------------------------------------------
-        for idx, channel in enumerate(
-            self._sorted_channels
-        ):
-
+        for idx, channel in enumerate(self._sorted_channels):
             if channel not in data:
                 continue
 
-            channel_data = np.asarray(
-                data[channel],
-                dtype=np.float64,
-            )
-
-            if channel_data.size == 0:
+            y_center = plot_bottom - (idx + 0.5) * channel_height + self._channel_offset * channel_height
+            if y_center + channel_height < plot_top or y_center - channel_height > plot_bottom:
                 continue
 
-            # ----------------------------------------------------------
-            # Channel geometry
-            # ----------------------------------------------------------
-            y_center = (
-                plot_bottom
-                - (idx + 0.5) * channel_height
-                + self._channel_offset * channel_height
-            )
-
-            # Keep traces inside the trace area.
-            if (
-                y_center + channel_height < plot_top
-                or y_center - channel_height > plot_bottom
-            ):
-                continue
-
-            # ----------------------------------------------------------
-            # Downsample only for drawing
-            # ----------------------------------------------------------
-            n_samples = len(channel_data)
-
-            if n_samples > max_points:
-
-                step = int(
-                    np.ceil(
-                        n_samples / max_points
-                    )
-                )
-
-                draw_data = channel_data[::step]
-
-            else:
-                draw_data = channel_data
-
-            if draw_data.size == 0:
-                continue
-
-            # ----------------------------------------------------------
-            # Handle NaNs
-            # ----------------------------------------------------------
-            finite = np.isfinite(draw_data)
-
-            if not np.any(finite):
-                continue
-
-            # ----------------------------------------------------------
-            # Vertical scaling
-            # ----------------------------------------------------------
-            if self.auto_scale:
-
-                finite_values = draw_data[finite]
-
-                data_min = float(
-                    np.min(finite_values)
-                )
-
-                data_max = float(
-                    np.max(finite_values)
-                )
-
-                data_range = data_max - data_min
-
-                if data_range <= 0:
-                    data_range = 1.0
-
-                # Leave a small margin around each trace. global_gain is
-                # a straightforward multiplier on top of the auto-fit
-                # scale -- previously computed but never applied here,
-                # so the Gain spinbox had no visible effect.
-                scale = (
-                    channel_height * 0.40
-                ) / data_range * self.global_gain
-
-                y_values = (
-                    y_center
-                    - (
-                        draw_data
-                        - (data_min + data_max) / 2.0
-                    ) * scale
-                )
-
-            else:
-
-                # Global scaling. Same global_gain multiplier as above.
-                scale = (
-                    channel_height * 0.40
-                ) / global_range * self.global_gain
-
-                y_values = (
-                    y_center
-                    - (
-                        draw_data
-                        - (global_min + global_max) / 2.0
-                    ) * scale
-                )
-
-            # ----------------------------------------------------------
-            # X coordinates
-            # ----------------------------------------------------------
-            #
-            # The cached trace data corresponds to the current time
-            # interval. Use sample positions rather than assuming that
-            # every sample has exactly the same timestamp.
-            # ----------------------------------------------------------
-            n_draw = len(draw_data)
-
-            if n_draw == 1:
-                x_values = np.array(
-                    [plot_left],
-                    dtype=np.float64,
-                )
-
-            else:
-                x_values = np.linspace(
-                    plot_left,
-                    plot_right,
-                    n_draw,
-                )
-
-            # ----------------------------------------------------------
-            # Create painter path
-            # ----------------------------------------------------------
-            path = QPainterPath()
-
-            started = False
-
-            for x, y, valid in zip(
-                x_values,
-                y_values,
-                np.isfinite(draw_data),
-            ):
-
-                if not valid or not np.isfinite(y):
-                    started = False
+            for trace in data[channel]:
+                arr = np.asarray(trace['data'], dtype=np.float64)
+                if arr.size == 0:
                     continue
 
-                # Keep the trace inside the trace region.
-                y = float(
-                    np.clip(
-                        y,
-                        plot_top,
-                        plot_bottom,
-                    )
-                )
+                mode = trace['mode']
 
-                if not started:
-                    path.moveTo(
-                        float(x),
-                        y,
-                    )
-                    started = True
+                if mode in ('global', 'raw'):
+                    color = self.channel_colors.get(channel, self.default_trace_color)
+                    width = self.trace_width
+                elif mode == 'filtered':
+                    color = QColor(FILTERED_COLOR)
+                    width = self.trace_width + 0.2
+                else:  # csd
+                    color = QColor(CSD_COLOR)
+                    width = self.trace_width
 
+                n_samples = len(arr)
+                if n_samples > max_points:
+                    step = int(np.ceil(n_samples / max_points))
+                    draw_data = arr[::step]
                 else:
-                    path.lineTo(
-                        float(x),
-                        y,
-                    )
+                    draw_data = arr
+                if draw_data.size == 0:
+                    continue
 
-            # ----------------------------------------------------------
-            # Channel color
-            # ----------------------------------------------------------
-            color = self.channel_colors.get(
-                channel,
-                self.default_trace_color,
-            )
+                finite = np.isfinite(draw_data)
+                if not np.any(finite):
+                    continue
 
-            pen = QPen(
-                color,
-                self.trace_width,
-            )
+                if self.auto_scale:
+                    finite_values = draw_data[finite]
+                    data_min = float(np.min(finite_values))
+                    data_max = float(np.max(finite_values))
+                    data_range = data_max - data_min
+                    if data_range <= 0:
+                        data_range = 1.0
+                    scale = (channel_height * 0.40) / data_range * self.global_gain
+                    y_values = y_center - (draw_data - (data_min + data_max) / 2.0) * scale
+                else:
+                    g = 1 if mode == 'csd' else 0
+                    g_min, g_max, g_range = group_ranges[g]
+                    scale = (channel_height * 0.40) / g_range * self.global_gain
+                    y_values = y_center - (draw_data - (g_min + g_max) / 2.0) * scale
 
-            painter.setPen(pen)
-            painter.drawPath(path)
+                n_draw = len(draw_data)
+                if n_draw == 1:
+                    x_values = np.array([plot_left], dtype=np.float64)
+                else:
+                    x_values = np.linspace(plot_left, plot_right, n_draw)
 
-            
+                path = QPainterPath()
+                started = False
+                for x, y, valid in zip(x_values, y_values, np.isfinite(draw_data)):
+                    if not valid or not np.isfinite(y):
+                        started = False
+                        continue
+                    y = float(np.clip(y, plot_top, plot_bottom))
+                    if not started:
+                        path.moveTo(float(x), y)
+                        started = True
+                    else:
+                        path.lineTo(float(x), y)
+
+                painter.setPen(QPen(color, width))
+                painter.drawPath(path)
+
     def _draw_time_axis(self, painter: QPainter, rect: QRectF):
-        """Draw time axis labels and tick marks, aligned with the grid."""
         painter.setPen(QColor("#888888"))
         font = QFont()
         font.setPointSize(8)
         painter.setFont(font)
 
         plot_left, plot_right, plot_bottom = self._get_plot_bounds()
-
         major_ticks, minor_ticks = self._compute_time_ticks(rect)
 
-        # ---- Minor tick marks (short, at the bottom of the plot area) ----
         tick_len_minor = 4
         tick_len_major = 8
 
         painter.setPen(QPen(QColor("#777777"), 1))
         for x, _ in minor_ticks:
-            painter.drawLine(
-                int(x), int(plot_bottom),
-                int(x), int(plot_bottom + tick_len_minor)
-            )
+            painter.drawLine(int(x), int(plot_bottom), int(x), int(plot_bottom + tick_len_minor))
 
-        # ---- Major tick marks (longer) ----
         painter.setPen(QPen(QColor("#aaaaaa"), 1))
         for x, _ in major_ticks:
-            painter.drawLine(
-                int(x), int(plot_bottom),
-                int(x), int(plot_bottom + tick_len_major)
-            )
+            painter.drawLine(int(x), int(plot_bottom), int(x), int(plot_bottom + tick_len_major))
 
-        # ---- Major tick labels ----
         painter.setPen(QColor("#aaaaaa"))
         font = QFont()
         font.setPointSize(8)
@@ -2874,168 +2291,196 @@ class TraceViewWidget(QWidget):
             if self._use_timestamps and self.engine.timestamps_loaded:
                 idx = int(np.searchsorted(self.engine.timestamps, t, side='left'))
                 idx = max(0, min(idx, len(self.engine.timestamps) - 1))
-                actual_time = self.engine.timestamps[idx]
-                label = f"{actual_time:.3f}s"
+                label = f"{self.engine.timestamps[idx]:.3f}s"
             else:
                 label = f"{t:.2f}s"
-
-            # Center the label on the tick
             text_width = 60
-            text_x = int(x - text_width / 2)
-            # Keep labels inside the widget
-            text_x = max(text_x, 2)
+            text_x = max(int(x - text_width / 2), 2)
+            painter.drawText(text_x, int(plot_bottom + tick_len_major + 2), text_width, 14, Qt.AlignmentFlag.AlignCenter, label)
 
-            painter.drawText(
-                text_x, int(plot_bottom + tick_len_major + 2),
-                text_width, 14,
-                Qt.AlignmentFlag.AlignCenter,
-                label
-            )
+    def _label_strip_header_height(self) -> int:
+        return 22
 
-
-    def _draw_channel_labels(self, painter: QPainter, rect: QRectF, data: dict):
-        """Draw channel labels on the left side."""
-        display_channels = self.get_display_order()
-        display_channels = [ch for ch in display_channels if ch in data]
-        
-        if not display_channels:
-            display_channels = self.get_display_order()
-        
-        n_channels = len(display_channels)
-        
-        # Get plot bounds to reserve spectrogram space
-        _, _, plot_bottom = self._get_plot_bounds()
-        
-        channel_height = (plot_bottom - rect.top()) / max(1, n_channels)
-        
-        label_width = 80
-        label_bg = QColor(0, 0, 0, 100)
-        painter.fillRect(
-            int(rect.left()), int(rect.top()),
-            label_width, int(plot_bottom - rect.top()),
-            label_bg
+    def _label_strip_header_rect(self, rect: QRectF) -> QRectF:
+        return QRectF(
+            float(rect.left() + 4),
+            float(rect.top() + 2),
+            float(LABEL_STRIP_WIDTH - 8),
+            float(self._label_strip_header_height() - 4),
         )
-        
-        painter.setPen(QColor("#aaaaaa"))
+
+    def _draw_channel_labels(self, painter: QPainter, rect: QRectF, data):
+        """Draw channel labels + the per-channel-modes header button,
+        with a small visible button on each row that opens that
+        channel's display-mode menu."""
+        # Strip background.
+        _, _, plot_bottom_full = self._get_plot_bounds()
+        strip_rect = QRectF(
+            float(rect.left()), float(rect.top()),
+            float(LABEL_STRIP_WIDTH), float(plot_bottom_full - rect.top()),
+        )
+        painter.fillRect(strip_rect, LABEL_STRIP_BG)
+
+        # ---- Header button (bulk per-channel menu) ----
+        header = self._label_strip_header_rect(rect)
+        n_override = len(self.channel_display_modes)
+        if n_override > 0:
+            header_bg = QColor("#3a5f8a")
+            header_border = QColor("#5a9fff")
+        else:
+            header_bg = QColor("#2d2d2d")
+            header_border = QColor("#4a4a4a")
+
+        painter.setBrush(QBrush(header_bg))
+        painter.setPen(QPen(header_border, 1.0))
+        painter.drawRoundedRect(header, 3, 3)
+
+        painter.setPen(QColor("#e8e8e8"))
         font = QFont()
         font.setPointSize(8)
+        font.setBold(True)
         painter.setFont(font)
-        
+        header_text = "Channel display ▾"
+        if n_override > 0:
+            header_text = f"Channel display ({n_override}) ▾"
+        painter.drawText(header, Qt.AlignmentFlag.AlignCenter, header_text)
+
+        self._label_strip_header_hitbox = header
+
+        # ---- Channel rows ----
+        display_channels = self.get_display_order()
+        display_channels = [ch for ch in display_channels if ch in data] or self.get_display_order()
+        n_channels = len(display_channels)
+
+        _, _, plot_bottom = self._get_plot_bounds()
+        plot_top = rect.top() + self._label_strip_header_height()
+        channel_height = (plot_bottom - plot_top) / max(1, n_channels)
+
+        name_font = QFont()
+        name_font.setPointSize(LABEL_FONT_POINT_SIZE)
+        name_font.setBold(True)
+
+        depth_font = QFont()
+        depth_font.setPointSize(LABEL_FONT_POINT_SIZE - 1)
+        depth_font.setBold(False)
+
+        # Reset row-button hitboxes; they get repopulated as we draw.
+        self._row_button_rects = {}
+
         for idx, ch in enumerate(display_channels):
             y_center = plot_bottom - (idx + 0.5) * channel_height + self._channel_offset * channel_height
-            
-            # Channel number
-            painter.drawText(
-                int(rect.left()) + 5, int(y_center - 8), 35, 16,
-                Qt.AlignmentFlag.AlignLeft,
-                f"CH{ch}"
-            )
-            
-            # Depth if available
+
+            if y_center + channel_height < plot_top or y_center - channel_height > plot_bottom:
+                continue
+
+            has_override = self._has_channel_override(ch)
+
+            # ---- Channel number ----
+            painter.setFont(name_font)
+            painter.setPen(LABEL_TEXT_COLOR if not has_override else QColor("#ffd23f"))
+            painter.drawText(int(rect.left()) + 6, int(y_center - 9), 40, 14, Qt.AlignmentFlag.AlignLeft, f"CH{ch}")
+
+            # ---- Depth ----
             if ch in self.channel_depths:
                 depth = self.channel_depths[ch]
-                painter.drawText(
-                    int(rect.left()) + 40, int(y_center - 8), 35, 16,
-                    Qt.AlignmentFlag.AlignLeft,
-                    f"{depth:.0f}"
+                painter.setFont(depth_font)
+                painter.setPen(QColor("#b8b8b8"))
+                painter.drawText(int(rect.left()) + 44, int(y_center + 2), 40, 12, Qt.AlignmentFlag.AlignLeft, f"{depth:.0f} µm")
+
+            # ---- Mode indicator dot(s) ----
+            dot_x = int(rect.left()) + LABEL_STRIP_WIDTH - ROW_BUTTON_WIDTH - 20
+            dot_y = int(y_center) - 3
+
+            if has_override:
+                modes = self.channel_display_modes[ch]
+                seg_x = dot_x
+                seg_w = 4
+                seg_h = 6
+                painter.setPen(Qt.PenStyle.NoPen)
+                if modes.get('raw'):
+                    painter.setBrush(QBrush(self.channel_colors.get(ch, self.default_trace_color)))
+                    painter.drawRect(seg_x, dot_y, seg_w, seg_h)
+                    seg_x += seg_w
+                if modes.get('filtered'):
+                    painter.setBrush(QBrush(FILTERED_COLOR))
+                    painter.drawRect(seg_x, dot_y, seg_w, seg_h)
+                    seg_x += seg_w
+                if modes.get('csd'):
+                    painter.setBrush(QBrush(CSD_COLOR))
+                    painter.drawRect(seg_x, dot_y, seg_w, seg_h)
+            else:
+                color = self.channel_colors.get(ch, self.default_trace_color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(color))
+                painter.drawRect(dot_x, dot_y, 6, 6)
+
+            # ---- Per-row button ----
+            button_rect = QRectF(
+                float(rect.left() + LABEL_STRIP_WIDTH - ROW_BUTTON_WIDTH - 4),
+                float(y_center - ROW_BUTTON_HEIGHT / 2.0),
+                float(ROW_BUTTON_WIDTH),
+                float(ROW_BUTTON_HEIGHT),
+            )
+            self._row_button_rects[ch] = button_rect
+
+            hovered = (ch == self._hovered_row_button_channel)
+            btn_bg = ROW_BUTTON_BG_HOVER if hovered else ROW_BUTTON_BG
+            btn_border = ROW_BUTTON_BORDER_HOVER if hovered else ROW_BUTTON_BORDER
+
+            painter.setBrush(QBrush(btn_bg))
+            painter.setPen(QPen(btn_border, 1.0))
+            painter.drawRoundedRect(button_rect, 3, 3)
+
+            # Three-dot glyph, centered.
+            painter.setPen(QPen(ROW_BUTTON_GLYPH, 1.5))
+            glyph_cx = button_rect.center().x()
+            glyph_cy = button_rect.center().y()
+            dot_r = 1.6
+            for dx in (-4.0, 0.0, 4.0):
+                painter.drawEllipse(
+                    QRectF(glyph_cx + dx - dot_r, glyph_cy - dot_r, 2 * dot_r, 2 * dot_r)
                 )
-            
-            # Color indicator
-            color = self.channel_colors.get(ch, self.default_trace_color)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(color))
-            painter.drawRect(int(rect.left()) + 70, int(y_center - 3), 6, 6)
-            painter.setPen(QColor("#aaaaaa"))
-            
-    '''
-    def _draw_depth_scale(self, painter: QPainter, rect: QRectF, data: dict):
-        """Draw depth scale on the right side."""
-        painter.setPen(QColor("#888888"))
-        font = QFont()
-        font.setPointSize(7)
-        painter.setFont(font)
-        
-        # Reserve space for spectrogram at bottom
-        scale_bottom = rect.bottom()
-        if self.show_spectrogram:
-            scale_bottom = rect.bottom() - int(rect.height() * 0.25) - 25
-        
-        # Draw depth labels
-        depth_scale_width = 30
-        right_x = int(rect.right() - depth_scale_width - 50)
-        
-        painter.drawText(
-            right_x, int(rect.top()) + 10, 25, 15,
-            Qt.AlignmentFlag.AlignRight,
-            "Depth"
-        )
-        
-        painter.drawText(
-            right_x, int(rect.top()) + 25, 25, 15,
-            Qt.AlignmentFlag.AlignRight,
-            "↑"
-        )
-        
-        painter.drawText(
-            right_x, int(scale_bottom) - 10, 25, 15,
-            Qt.AlignmentFlag.AlignRight,
-            "↓"
-        )
-    '''
+
     # ------------------------------------------------------------------
     # Event handling
     # ------------------------------------------------------------------
 
     def wheelEvent(self, event):
-        """Handle mouse wheel for scrolling and zooming."""
         if not self._data_loaded:
             return
-        
         delta = event.angleDelta().y()
-        
+
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            # Ctrl+wheel for zoom - ZOOM TO CURSOR
             if delta > 0:
                 self._zoom_to_cursor(1.2, event.position())
             else:
-                self._zoom_to_cursor(1/1.2, event.position())
+                self._zoom_to_cursor(1 / 1.2, event.position())
         elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            # Shift+wheel for faster scrolling (5x)
             time_delta = (delta / 120.0) * 0.5 * self.window_duration
             min_start = self._get_min_start_time()
             max_start = self._get_max_start_time()
-            self.start_time = min(
-                max(min_start, self.start_time - time_delta), max_start
-            )
+            self.start_time = min(max(min_start, self.start_time - time_delta), max_start)
             self._update_time_labels()
             self._invalidate_cache()
             self.update()
         else:
-            # Regular wheel for time scroll
             time_delta = (delta / 120.0) * 0.1 * self.window_duration
             min_start = self._get_min_start_time()
             max_start = self._get_max_start_time()
-            self.start_time = min(
-                max(min_start, self.start_time - time_delta), max_start
-            )
+            self.start_time = min(max(min_start, self.start_time - time_delta), max_start)
             self._update_time_labels()
             self._invalidate_cache()
             self.update()
-        
         event.accept()
 
-        
-
     def keyPressEvent(self, event):
-        """Handle keyboard events."""
         if not self._data_loaded:
             super().keyPressEvent(event)
             return
-        
-        if event.key() == Qt.Key.Key_Plus or event.key() == Qt.Key.Key_Equal:
+        if event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
             self._zoom(1.2)
         elif event.key() == Qt.Key.Key_Minus:
-            self._zoom(1/1.2)
+            self._zoom(1 / 1.2)
         elif event.key() == Qt.Key.Key_Left:
             self._step_time(-1)
         elif event.key() == Qt.Key.Key_Right:
@@ -3054,78 +2499,76 @@ class TraceViewWidget(QWidget):
             self._scroll_up()
         elif event.key() == Qt.Key.Key_Down:
             self._scroll_down()
-        
         super().keyPressEvent(event)
 
-
     def contextMenuEvent(self, event):
-        """Handle right-click context menu."""
         if not self._data_loaded:
             return
-        
         plot_left, plot_right, _ = self._get_plot_bounds()
         plot_width = plot_right - plot_left
-        
-        # Check if right-clicked on a cursor
         for i, cursor_fraction in enumerate(self._time_cursors):
             cursor_time = self._cursor_to_time(cursor_fraction)
             x_ratio = (cursor_time - self.start_time) / self.window_duration
             cursor_x = plot_left + x_ratio * plot_width
-            
             if abs(event.pos().x() - cursor_x) < 10:
                 self._selected_cursor = i
                 self.update()
-                
                 menu = QMenu(self)
-                
                 remove_action = menu.addAction("Remove Cursor")
                 remove_action.triggered.connect(lambda: self._remove_cursor(i))
-                
                 menu.exec(event.globalPos())
                 return
-        
-        # Right-clicked on empty area
         menu = QMenu(self)
-        
         clear_cursors_action = menu.addAction("Clear All Time Cursors")
         clear_cursors_action.triggered.connect(self._clear_time_cursors)
-        
         menu.exec(event.globalPos())
 
     def _remove_cursor(self, index: int):
-        """Remove a specific cursor."""
         if 0 <= index < len(self._time_cursors):
             self._time_cursors.pop(index)
             self._selected_cursor = None
             self.update()
 
     def _clear_time_cursors(self):
-        """Clear all vertical time cursors."""
         self._time_cursors.clear()
         self._selected_cursor = None
         self.update()
-        
+
     def mousePressEvent(self, event):
-        """Handle mouse press for panning, adding cursors, and selecting cursors."""
         if event.button() == Qt.MouseButton.LeftButton:
-            # Check if we clicked on a trash bin
+            # ---- Left label strip ----
+            if event.position().x() < self.rect().left() + LABEL_STRIP_WIDTH:
+                # Header button first.
+                header_hitbox = getattr(self, '_label_strip_header_hitbox', None)
+                if header_hitbox is not None and header_hitbox.contains(event.position()):
+                    self._show_bulk_mode_menu(event.globalPosition().toPoint())
+                    event.accept()
+                    return
+
+                # Per-row buttons: only the visible button opens the
+                # channel menu now, not the entire row.
+                for ch, r in self._row_button_rects.items():
+                    if r.contains(event.position()):
+                        self._show_channel_mode_menu(ch, event.globalPosition().toPoint())
+                        event.accept()
+                        return
+
+            # ---- Trash bin ----
             if hasattr(self, '_trash_bin_rects'):
                 for cursor_idx, trash_rect in self._trash_bin_rects.items():
                     if trash_rect.contains(event.position()):
                         self._remove_cursor(cursor_idx)
                         event.accept()
                         return
-            
-            # Check if we clicked on a cursor
+
+            # ---- Cursor drag ----
             if self._data_loaded and self._time_cursors:
                 plot_left, plot_right, _ = self._get_plot_bounds()
                 plot_width = plot_right - plot_left
-                
                 for i, cursor_fraction in enumerate(self._time_cursors):
                     cursor_time = self._cursor_to_time(cursor_fraction)
                     x_ratio = (cursor_time - self.start_time) / self.window_duration
                     cursor_x = plot_left + x_ratio * plot_width
-                    
                     if abs(event.position().x() - cursor_x) < 10:
                         self._selected_cursor = i
                         self._dragging_cursor = True
@@ -3133,353 +2576,194 @@ class TraceViewWidget(QWidget):
                         self.update()
                         event.accept()
                         return
-            
-            # Otherwise, start panning
+
+            # ---- Pan ----
             self._dragging = True
             self._drag_start_pos = event.position()
             self._drag_start_time = self.start_time
             self._drag_start_offset = self._channel_offset
             event.accept()
-            
+
         elif event.button() == Qt.MouseButton.RightButton:
             if self._data_loaded:
                 plot_left, plot_right, _ = self._get_plot_bounds()
                 plot_width = plot_right - plot_left
-                
-                # First check if we're right-clicking on an existing cursor
                 for i, cursor_fraction in enumerate(self._time_cursors):
                     cursor_time = self._cursor_to_time(cursor_fraction)
                     x_ratio = (cursor_time - self.start_time) / self.window_duration
                     cursor_x = plot_left + x_ratio * plot_width
-                    
                     if abs(event.position().x() - cursor_x) < 10:
                         self._selected_cursor = i
                         self.update()
                         event.accept()
                         return
-                
-                # If not on a cursor, add a new one
                 x_ratio = (event.position().x() - plot_left) / max(1, plot_width)
                 cursor_time = self.start_time + x_ratio * self.window_duration
-                
-                # Convert to fractional position
                 cursor_fraction = self._time_to_cursor_fraction(cursor_time)
-                
                 self._time_cursors.append(cursor_fraction)
                 self._time_cursors.sort()
                 self._selected_cursor = len(self._time_cursors) - 1
                 self.update()
-                
                 event.accept()
-                
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move for panning and dragging cursors."""
+        # ---- Hover state for the per-row buttons ----
+        new_hover: int | None = None
+        pos = event.position()
+        for ch, r in self._row_button_rects.items():
+            if r.contains(pos):
+                new_hover = ch
+                break
+        if new_hover != self._hovered_row_button_channel:
+            self._hovered_row_button_channel = new_hover
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor if new_hover is not None
+                else Qt.CursorShape.ArrowCursor
+            )
+            self.update()
+
         if self._dragging_cursor and self._selected_cursor is not None:
-            # Dragging a cursor
             plot_left, plot_right, _ = self._get_plot_bounds()
             plot_width = plot_right - plot_left
-            
             delta_x = event.position().x() - self._drag_cursor_start_x
             time_delta_per_pixel = self.window_duration / max(1, plot_width)
-            
-            # Get current cursor time
             current_fraction = self._time_cursors[self._selected_cursor]
             current_time = self._cursor_to_time(current_fraction)
-            
-            # Calculate new time
             new_time = current_time + delta_x * time_delta_per_pixel
-            
-            # Clamp to valid range
             min_time = self._get_min_start_time()
             max_time = self._get_max_start_time() + self.window_duration
             new_time = max(min_time, min(new_time, max_time))
-            
-            # Convert back to fractional position
-            new_fraction = self._time_to_cursor_fraction(new_time)
-            
-            self._time_cursors[self._selected_cursor] = new_fraction
+            self._time_cursors[self._selected_cursor] = self._time_to_cursor_fraction(new_time)
             self._drag_cursor_start_x = event.position().x()
-            
             self.update()
             event.accept()
             return
-        
+
         if hasattr(self, '_dragging') and self._dragging and self._drag_start_pos is not None:
             current_pos = event.position()
-            
             delta_x = current_pos.x() - self._drag_start_pos.x()
             delta_y = current_pos.y() - self._drag_start_pos.y()
-            
             time_delta_per_pixel = self.window_duration / max(1, self.width())
             time_delta = -delta_x * time_delta_per_pixel
-            
-            # Clamp to valid range
             min_start = self._get_min_start_time()
             max_start = self._get_max_start_time()
-            self.start_time = min(
-                max(min_start, self._drag_start_time + time_delta), max_start
-            )
-            
+            self.start_time = min(max(min_start, self._drag_start_time + time_delta), max_start)
             channel_height = self.height() / max(1, len(self.channels))
             channel_delta = delta_y / max(1, channel_height)
             self._channel_offset = self._drag_start_offset + channel_delta
-            
             self._update_time_labels()
             self._invalidate_cache()
             self.update()
-            
             event.accept()
 
     def mouseReleaseEvent(self, event):
-        """Handle mouse release."""
         if self._dragging_cursor:
             self._dragging_cursor = False
             event.accept()
             return
-        
         if hasattr(self, '_dragging') and self._dragging:
             self._dragging = False
             self._drag_start_pos = None
-            
-            # Save the current view as "last good view" - NO SNAPPING
             self._last_view = {
                 'start_time': self.start_time,
                 'window_duration': self.window_duration,
                 'zoom_level': self._zoom_level,
-                'channel_offset': self._channel_offset
+                'channel_offset': self._channel_offset,
             }
-            
             event.accept()
-            
 
     def mouseDoubleClickEvent(self, event):
-        """Handle double-click to reset view."""
         if not self._data_loaded:
             return
-        
-        # Get cursor position
         cursor_pos = event.position()
-        
-        # Calculate time at cursor position
         plot_left, plot_right, _ = self._get_plot_bounds()
         plot_width = plot_right - plot_left
-        
         x_ratio = (cursor_pos.x() - plot_left) / max(1, plot_width)
         cursor_time = self.start_time + x_ratio * self.window_duration
-        
-        # Reset to 10 seconds centered on cursor
         new_duration = min(10.0, self._get_total_duration())
         new_start = cursor_time - new_duration / 2
-        
         min_start = self._get_min_start_time()
         max_start = self._get_max_start_time()
         new_start = max(min_start, min(new_start, max_start))
-        
-        # Reset channels to correct y-position
         self._channel_offset = 0.0
         self._zoom_level = 1.0
-        
         self.start_time = new_start
         self.window_duration = new_duration
-        
-        # Update control panel
         self.control_panel.zoom_label.setText("100%")
         self.control_panel.duration_spin.blockSignals(True)
         self.control_panel.duration_spin.setValue(self.window_duration)
         self.control_panel.duration_spin.blockSignals(False)
-        
         self._update_time_labels()
         self._invalidate_cache()
         self.update()
-        
         event.accept()
-
 
 
 class SpectrogramControlPanel(QWidget):
     """
     Control panel for spectrogram settings.
-
-    Controls:
-        - Enable/disable spectrogram
-        - Channel
-        - Frequency range
-        - dB color range
-        - Colormap
     """
 
     channelChanged = pyqtSignal(int)
     enabledChanged = pyqtSignal(bool)
-
     minFreqChanged = pyqtSignal(float)
     maxFreqChanged = pyqtSignal(float)
-
     minDbChanged = pyqtSignal(float)
     maxDbChanged = pyqtSignal(float)
     autoDbChanged = pyqtSignal(bool)
-
-
     cmapChanged = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
         self.setWindowTitle("Spectrogram Controls")
         self.setMinimumWidth(250)
-
         self._building_channel_list = False
-
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-
-        layout.setContentsMargins(
-            4, 4, 4, 4
-        )
-
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # --------------------------------------------------------------
-        # Enable
-        # --------------------------------------------------------------
-        self.enabled_checkbox = QCheckBox(
-            "Show Spectrogram"
-        )
-
+        self.enabled_checkbox = QCheckBox("Show Spectrogram")
         self.enabled_checkbox.setChecked(False)
+        self.enabled_checkbox.toggled.connect(self._on_enabled_toggled)
+        layout.addWidget(self.enabled_checkbox)
 
-        self.enabled_checkbox.toggled.connect(
-            self._on_enabled_toggled
-        )
-
-        layout.addWidget(
-            self.enabled_checkbox
-        )
-
-        # --------------------------------------------------------------
-        # Channel
-        # --------------------------------------------------------------
-        channel_group = QGroupBox(
-            "Channel"
-        )
-
-        channel_layout = QVBoxLayout(
-            channel_group
-        )
-
+        channel_group = QGroupBox("Channel")
+        channel_layout = QVBoxLayout(channel_group)
         self.channel_combo = QComboBox()
+        self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        channel_layout.addWidget(self.channel_combo)
+        layout.addWidget(channel_group)
 
-        self.channel_combo.currentIndexChanged.connect(
-            self._on_channel_changed
-        )
-
-        channel_layout.addWidget(
-            self.channel_combo
-        )
-
-        layout.addWidget(
-            channel_group
-        )
-
-        # --------------------------------------------------------------
-        # Frequency range
-        # --------------------------------------------------------------
-        freq_group = QGroupBox(
-            "Frequency Range (Hz)"
-        )
-
-        freq_layout = QGridLayout(
-            freq_group
-        )
-
-        freq_layout.addWidget(
-            QLabel("Min:"),
-            0,
-            0,
-        )
-
+        freq_group = QGroupBox("Frequency Range (Hz)")
+        freq_layout = QGridLayout(freq_group)
+        freq_layout.addWidget(QLabel("Min:"), 0, 0)
         self.min_freq_spin = QDoubleSpinBox()
-
-        self.min_freq_spin.setRange(
-            0.0,
-            49.0,
-        )
-
+        self.min_freq_spin.setRange(0.0, 49.0)
         self.min_freq_spin.setDecimals(1)
-
-        self.min_freq_spin.setSingleStep(
-            1.0
-        )
-
-        self.min_freq_spin.setValue(
-            0.0
-        )
-
-        self.min_freq_spin.valueChanged.connect(
-            self._on_min_freq_changed
-        )
-
-        freq_layout.addWidget(
-            self.min_freq_spin,
-            0,
-            1,
-        )
-
-        freq_layout.addWidget(
-            QLabel("Max:"),
-            1,
-            0,
-        )
-
+        self.min_freq_spin.setSingleStep(1.0)
+        self.min_freq_spin.setValue(0.0)
+        self.min_freq_spin.valueChanged.connect(self._on_min_freq_changed)
+        freq_layout.addWidget(self.min_freq_spin, 0, 1)
+        freq_layout.addWidget(QLabel("Max:"), 1, 0)
         self.max_freq_spin = QDoubleSpinBox()
-
-        self.max_freq_spin.setRange(
-            1.0,
-            50.0,
-        )
-
+        self.max_freq_spin.setRange(1.0, 50.0)
         self.max_freq_spin.setDecimals(1)
-
-        self.max_freq_spin.setSingleStep(
-            1.0
-        )
-
-        self.max_freq_spin.setValue(
-            40.0
-        )
-
-        self.max_freq_spin.valueChanged.connect(
-            self._on_max_freq_changed
-        )
-
-        freq_layout.addWidget(
-            self.max_freq_spin,
-            1,
-            1,
-        )
-
-        layout.addWidget(
-            freq_group
-        )
-
-        # --------------------------------------------------------------
-        # Color scale
-        # --------------------------------------------------------------
-        # layout.addWidget(QLabel("Color scale:"))
+        self.max_freq_spin.setSingleStep(1.0)
+        self.max_freq_spin.setValue(40.0)
+        self.max_freq_spin.valueChanged.connect(self._on_max_freq_changed)
+        freq_layout.addWidget(self.max_freq_spin, 1, 1)
+        layout.addWidget(freq_group)
 
         color_group = QGroupBox("Color Scale (dB)")
         color_layout = QGridLayout(color_group)
-
         self.auto_db_checkbox = QCheckBox("Automatic")
         self.auto_db_checkbox.setChecked(True)
         self.auto_db_checkbox.toggled.connect(self._on_auto_db_changed)
         color_layout.addWidget(self.auto_db_checkbox)
-
-
         color_layout.addWidget(QLabel("Color min:"))
-
         self.min_db_spin = QDoubleSpinBox()
         self.min_db_spin.setRange(-300.0, 100.0)
         self.min_db_spin.setSingleStep(1.0)
@@ -3488,9 +2772,7 @@ class SpectrogramControlPanel(QWidget):
         self.min_db_spin.setEnabled(False)
         self.min_db_spin.valueChanged.connect(self._on_min_db_changed)
         color_layout.addWidget(self.min_db_spin)
-
         color_layout.addWidget(QLabel("Color max:"))
-
         self.max_db_spin = QDoubleSpinBox()
         self.max_db_spin.setRange(-300.0, 100.0)
         self.max_db_spin.setSingleStep(1.0)
@@ -3501,178 +2783,72 @@ class SpectrogramControlPanel(QWidget):
         color_layout.addWidget(self.max_db_spin)
         layout.addWidget(color_group)
 
-
-
-        # --------------------------------------------------------------
-        # Colormap
-        # --------------------------------------------------------------
-        cmap_group = QGroupBox(
-            "Colormap"
-        )
-
-        cmap_layout = QVBoxLayout(
-            cmap_group
-        )
-
+        cmap_group = QGroupBox("Colormap")
+        cmap_layout = QVBoxLayout(cmap_group)
         self.cmap_combo = QComboBox()
-
-        self.cmap_combo.addItems(
-            [
-                "viridis",
-                "plasma",
-                "inferno",
-                "magma",
-                "cividis",
-                "jet",
-            ]
-        )
-
-        self.cmap_combo.setCurrentText(
-            "viridis"
-        )
-
-        self.cmap_combo.currentTextChanged.connect(
-            self._on_cmap_changed
-        )
-
-        cmap_layout.addWidget(
-            self.cmap_combo
-        )
-
-        layout.addWidget(
-            cmap_group
-        )
-
-        # layout.addStretch()
-
-    # ------------------------------------------------------------------
-    # Signal handlers
-    # ------------------------------------------------------------------
+        self.cmap_combo.addItems(["viridis", "plasma", "inferno", "magma", "cividis", "jet"])
+        self.cmap_combo.setCurrentText("viridis")
+        self.cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
+        cmap_layout.addWidget(self.cmap_combo)
+        layout.addWidget(cmap_group)
 
     def _on_min_db_changed(self, value: float):
         self.minDbChanged.emit(value)
 
-
     def _on_max_db_changed(self, value: float):
         self.maxDbChanged.emit(value)
-
 
     def _on_auto_db_changed(self, checked: bool):
         self.min_db_spin.setEnabled(not checked)
         self.max_db_spin.setEnabled(not checked)
         self.autoDbChanged.emit(checked)
 
-        
     def _on_enabled_toggled(self, checked: bool):
-        self.enabledChanged.emit(
-            bool(checked)
-        )
+        self.enabledChanged.emit(bool(checked))
 
     def _on_channel_changed(self, index: int):
-        if self._building_channel_list:
+        if self._building_channel_list or index < 0:
             return
-
-        if index < 0:
-            return
-
-        channel = self.channel_combo.itemData(
-            index
-        )
-
+        channel = self.channel_combo.itemData(index)
         if channel is not None:
-            self.channelChanged.emit(
-                int(channel)
-            )
+            self.channelChanged.emit(int(channel))
 
     def _on_min_freq_changed(self, value: float):
-        self.minFreqChanged.emit(
-            float(value)
-        )
+        self.minFreqChanged.emit(float(value))
 
     def _on_max_freq_changed(self, value: float):
-        self.maxFreqChanged.emit(
-            float(value)
-        )
-
+        self.maxFreqChanged.emit(float(value))
 
     def _on_cmap_changed(self, name: str):
-        self.cmapChanged.emit(
-            str(name)
-        )
-
-    # ------------------------------------------------------------------
-    # Public setters
-    # ------------------------------------------------------------------
+        self.cmapChanged.emit(str(name))
 
     def set_channels(self, channels: list[int]):
-        """Update available spectrogram channels."""
-
         self._building_channel_list = True
-
         current_channel = None
-
         if self.channel_combo.currentIndex() >= 0:
             current_channel = self.channel_combo.currentData()
-
         self.channel_combo.clear()
-
         for channel in channels:
-            self.channel_combo.addItem(
-                f"CH{channel}",
-                int(channel),
-            )
-
-        # Preserve current channel when possible.
+            self.channel_combo.addItem(f"CH{channel}", int(channel))
         if current_channel is not None:
-            self.set_channel(
-                int(current_channel)
-            )
-
+            self.set_channel(int(current_channel))
         self._building_channel_list = False
 
     def set_channel(self, channel: int):
-        """Select a channel in the combo box."""
-
-        for i in range(
-            self.channel_combo.count()
-        ):
-            if (
-                self.channel_combo.itemData(i)
-                == channel
-            ):
+        for i in range(self.channel_combo.count()):
+            if self.channel_combo.itemData(i) == channel:
                 self._building_channel_list = True
-
-                self.channel_combo.setCurrentIndex(
-                    i
-                )
-
+                self.channel_combo.setCurrentIndex(i)
                 self._building_channel_list = False
-
                 return
 
     def set_enabled(self, enabled: bool):
-        """Set spectrogram visibility checkbox."""
-
         enabled = bool(enabled)
-
-        if (
-            self.enabled_checkbox.isChecked()
-            != enabled
-        ):
-            self.enabled_checkbox.setChecked(
-                enabled
-            )
+        if self.enabled_checkbox.isChecked() != enabled:
+            self.enabled_checkbox.setChecked(enabled)
 
     def set_min_db(self, value: float):
-        """Set minimum dB display value."""
-
-        self.min_db_spin.setValue(
-            float(value)
-        )
+        self.min_db_spin.setValue(float(value))
 
     def set_max_db(self, value: float):
-        """Set maximum dB display value."""
-
-        self.max_db_spin.setValue(
-            float(value)
-        )
+        self.max_db_spin.setValue(float(value))
