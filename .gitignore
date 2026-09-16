@@ -5,6 +5,10 @@ bkp/
 *_backup.py
 try_probe_map.py
 
+# --- test folders ---
+/test_data/
+
+
 # --- Python ---
 __pycache__/
 *.py[cod]

@@ -12,6 +12,17 @@ pyqtgraph ScatterPlotItem for all electrodes (one draw call), GPU pan/
 zoom via ViewBox. Electrode color encodes power value via a colormap +
 colorbar instead of the probe map's selection-state colors.
 
+Hover behavior:
+  - pyqtgraph's built-in hover bubble is left enabled; it shows x, y,
+    and the point's `data` field, which we now populate with the
+    channel number (previously unset, hence "data = None").
+  - A second, custom readout at the bottom of the dialog shows
+    "Channel N: value", and highlights the hovered electrode with a
+    bright outline so it's visually obvious which point the info
+    refers to. Both are kept deliberately -- the bubble gives x/y, the
+    custom label gives the channel number and value, and the outline
+    anchors the whole thing to a specific electrode.
+
 Computation runs on a QThread, same as the phase-amplitude dialog, since
 filtering every channel on the probe can take a noticeable moment.
 
@@ -92,6 +103,15 @@ class AmplitudePowerDialog(QDialog):
         self._compute_thread: _ComputeThread | None = None
         self._last_result: dict | None = None
 
+        # Hover state for the scatter: we cache the base brushes/pens
+        # computed in _render so that hovering a point only swaps in a
+        # different PEN for that index, without recomputing the
+        # colormap or touching the brush array. That keeps hover cheap
+        # even at 384+ electrodes.
+        self._hover_brushes: list | None = None
+        self._base_pens: list | None = None
+        self._hovered_index: int | None = None
+
         self._build_ui()
         self._sync_time_range_from_engine()
         self._draw_geometry_only()
@@ -125,11 +145,21 @@ class AmplitudePowerDialog(QDialog):
         self.plot_widget.setLabel("left", "Depth", units="\u00b5m")
         layout.addWidget(self.plot_widget, stretch=1)
 
+        # Custom hover-bubble text. In current pyqtgraph, `tip` is a
+        # CALLABLE (kwarg names x, y, data) that returns the string to
+        # display -- the older format-string style was removed, which
+        # is why passing a str raised "'str' object is not callable".
+        # The default pyqtgraph template prints the point's `data`
+        # attribute under the label "data="; here we label it
+        # "channel=" instead, and reuse `data` to carry the channel
+        # number (set on every setData call).
         self.scatter = pg.ScatterPlotItem(
             size=14, pxMode=True, symbol="s",
             pen=pg.mkPen((0, 0, 0, 120), width=0.5),
             hoverable=True,
+            tip=lambda x, y, data: f"x={x:.1f}, y={y:.1f}, channel={data}",
         )
+
         self.scatter.sigHovered.connect(self._on_hover)
         self.plot_widget.addItem(self.scatter)
 
@@ -239,9 +269,18 @@ class AmplitudePowerDialog(QDialog):
         see the layout immediately rather than a blank plot."""
         x = self.analyzer.xcoords
         y = self.analyzer.ycoords
+        # Invalidate any cached hover state -- the scatter's data shape
+        # is changing, so a stale index would draw an outline on the
+        # wrong electrode.
+        self._hover_brushes = None
+        self._base_pens = None
+        self._hovered_index = None
+
         self.scatter.setData(
             x=x, y=y,
+            data=np.asarray(self.analyzer.channels),
             brush=pg.mkBrush((100, 100, 100, 180)),
+            pen=pg.mkPen((0, 0, 0, 120), width=0.5),
         )
         if len(x) > 0:
             pad_x = max((x.max() - x.min()) * 0.15, 30)
@@ -337,10 +376,22 @@ class AmplitudePowerDialog(QDialog):
         norm = np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
         colors = cmap.map(norm, mode="qcolor")
         brushes = [pg.mkBrush(c) for c in colors]
+        pens = [pg.mkPen((0, 0, 0, 120), width=0.5) for _ in colors]
 
-        self.scatter.setData(x=x, y=y, brush=brushes)
+        # Cache base brushes/pens for the hover-outline logic. The
+        # hovered point gets a different pen (see _on_hover) but keeps
+        # its brush, so the color-coded value stays visible.
+        self._hover_brushes = brushes
+        self._base_pens = pens
+        self._hovered_index = None
+
+        # Pass channel numbers as the per-point `data` field so that
+        # pyqtgraph's built-in hover bubble shows "Channel N" rather
+        # than "data = None", and so the custom hover label can read
+        # the channel directly from the point.
+        channels = np.asarray(result["channels"])
+        self.scatter.setData(x=x, y=y, data=channels, brush=brushes, pen=pens)
         self._hover_values = values  # for hover readout
-        self._hover_channels = result["channels"]
 
         self.colorbar.setColorMap(cmap)
         self.colorbar.setLevels((vmin, vmax))
@@ -355,13 +406,59 @@ class AmplitudePowerDialog(QDialog):
         )
 
     def _on_hover(self, plot_item, points, ev):
-        if not points or self._last_result is None:
+        # pyqtgraph passes `points` as a numpy array of hovered spots,
+        # which can be empty. `not points` on a numpy array raises
+        # "The truth value of an array ... is ambiguous" -- must check
+        # length explicitly.
+        if self._last_result is None or points is None or len(points) == 0:
             self.hover_label.setText("")
+            self._set_hovered_index(None)
             return
+
         idx = points[0].index()
-        ch = self._hover_channels[idx]
+        ch = points[0].data()          # channel number, passed via setData(data=...)
         val = self._hover_values[idx]
-        self.hover_label.setText(f"Channel {ch}: {val:.4g}")
+        # self.hover_label.setText(f"Channel {ch}: {val:.4g}")
+        self._set_hovered_index(idx)
+
+    def _set_hovered_index(self, idx: int | None):
+        """Swap the hovered electrode's pen for a bright outline,
+        restoring the base pen everywhere else.
+
+        Only rebuilds and re-applies the pen array when the hovered
+        index actually changes; every mouse move across empty space
+        after the hover has been cleared is a no-op.
+        """
+        if idx == self._hovered_index:
+            return
+        self._hovered_index = idx
+
+        if self._hover_brushes is None or self._base_pens is None:
+            return
+        if self._last_result is None:
+            return
+
+        # Rebuild the pen list: bright thick outline at the hovered
+        # index, base pen everywhere else. Preserves each point's
+        # brush, so the value-coloring is untouched.
+        n = len(self._base_pens)
+        if idx is None or not (0 <= idx < n):
+            pens = list(self._base_pens)
+        else:
+            outline = pg.mkPen((255, 255, 255, 255), width=2.0)
+            pens = list(self._base_pens)
+            pens[idx] = outline
+
+        # data= is threaded through here too so the built-in hover
+        # bubble keeps reporting the correct channel after this
+        # re-setData.
+        self.scatter.setData(
+            x=self._last_result["xcoords"],
+            y=self._last_result["ycoords"],
+            data=np.asarray(self._last_result["channels"]),
+            brush=self._hover_brushes,
+            pen=pens,
+        )
 
     def _on_cmap_changed(self, name: str):
         if self._last_result is not None:
