@@ -322,6 +322,19 @@ class ThetaEpochDialog(QDialog):
         self.delete_btn.setDefault(False)
         self.delete_btn.clicked.connect(self._delete_selected_epoch)
         grid.addWidget(self.delete_btn, 5, 0, 1, 2)
+
+        self.add_epoch_btn = QPushButton("Add Theta Epoch")
+        self.add_epoch_btn.setCheckable(True)
+        self.add_epoch_btn.setAutoDefault(False)
+        self.add_epoch_btn.setDefault(False)
+        self.add_epoch_btn.setToolTip(
+            "Click, then click-drag on a channel's lane in the main "
+            "trace view to draw a new manual theta epoch there. "
+            "Click again to cancel without creating one."
+        )
+        self.add_epoch_btn.setEnabled(self.trace_view is not None)
+        self.add_epoch_btn.toggled.connect(self._on_add_epoch_toggled)
+        grid.addWidget(self.add_epoch_btn, 5, 2, 1, 2)
         return grid
 
     def _on_detect_clicked(self):
@@ -424,6 +437,28 @@ class ThetaEpochDialog(QDialog):
         self._populate_table()
         self.export_btn.setEnabled(bool(self.epochs))
         self.status_label.setText(f"{len(self.epochs)} theta epochs.")
+        # A successful creation (or split, or drag/merge) coming back
+        # from the trace view means creation mode -- if it was armed --
+        # has already completed and disarmed itself there; keep the
+        # button's checked state in sync rather than leaving it stuck
+        # checked after the epoch was actually created.
+        if self.add_epoch_btn.isChecked():
+            self.add_epoch_btn.blockSignals(True)
+            self.add_epoch_btn.setChecked(False)
+            self.add_epoch_btn.blockSignals(False)
+
+    def _on_add_epoch_toggled(self, checked: bool):
+        if self.trace_view is None:
+            return
+        if checked:
+            self.trace_view.arm_theta_creation()
+            self.status_label.setText(
+                "Click-drag on a channel's lane in the main trace view "
+                "to draw a new theta epoch."
+            )
+        else:
+            self.trace_view.cancel_theta_creation()
+            self.status_label.setText(f"{len(self.epochs)} theta epochs.")
 
     def set_selected_epoch(self, index: int):
         if 0 <= index < self.table.rowCount():
@@ -529,4 +564,6 @@ class ThetaEpochDialog(QDialog):
         if self._detect_thread is not None and self._detect_thread.isRunning():
             self._detect_thread.request_cancel()
             self._detect_thread.wait(2000)
+        if self.trace_view is not None and self.add_epoch_btn.isChecked():
+            self.trace_view.cancel_theta_creation()
         super().closeEvent(event)

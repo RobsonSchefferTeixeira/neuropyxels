@@ -43,6 +43,22 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         self._theta_handle_radius = 7.0
         self._theta_handle_hit_radius = 12.0
 
+        # "Add new window" (click-drag creation) state. Armed via
+        # arm_theta_creation() (called by ThetaEpochDialog's "Add Theta
+        # Epoch" button); the NEXT left-button press/drag on a channel
+        # lane creates a new manual epoch there instead of the usual
+        # pan/select behavior, then disarms itself automatically.
+        self._theta_creating_armed = False
+        self._theta_creating_channel: int | None = None
+        self._theta_creating_start_sample: int | None = None
+        self._theta_creating_end_sample: int | None = None
+        # Minimum epoch width, in samples, below which a click-drag
+        # creation (or a split) is discarded as accidental/too-short
+        # rather than producing a degenerate zero/near-zero-width
+        # epoch. 5ms is short enough to never reject an intentional
+        # drag, long enough to filter out an accidental single click.
+        self._theta_min_epoch_samples = max(1, int(round(0.005 * self.engine.sr)))
+
     # ------------------------------------------------------------------
     # Theta epoch API
     # ------------------------------------------------------------------
@@ -95,6 +111,128 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         self._theta_merge_candidate = None
         self._theta_merge_candidates.clear()
         self.thetaEpochsChanged.emit(self.theta_epochs)
+        self.update()
+        return True
+
+    def arm_theta_creation(self):
+        """
+        Arm click-drag creation of a new manual theta epoch: the NEXT
+        left-button press+drag on a channel lane creates a new epoch
+        there (start = press position, end = release position),
+        instead of the usual pan/select behavior. Disarms itself
+        automatically once the drag completes (or is cancelled by
+        releasing without having moved past _theta_min_epoch_samples).
+
+        Called by ThetaEpochDialog's "Add Theta Epoch" button -- the
+        button-then-drag flow (rather than inserting a fixed-duration
+        epoch immediately) mirrors how resizing an existing epoch's
+        boundary already works, so creating one uses the same gesture
+        instead of introducing a second, different interaction model.
+        """
+        self._theta_creating_armed = True
+        self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+
+    def cancel_theta_creation(self):
+        """Disarm creation mode without creating anything -- e.g. if
+        the dialog's button is clicked again to toggle it off, or the
+        dialog closes while armed."""
+        self._theta_creating_armed = False
+        self._theta_creating_channel = None
+        self._theta_creating_start_sample = None
+        self.unsetCursor()
+
+    def _theta_channel_at_y(self, y: float) -> int | None:
+        """Reverse of _theta_channel_geometry: given a y-pixel
+        position, return which channel's lane it falls in (or None if
+        outside the plot area / no channels)."""
+        rect = self.rect()
+        if hasattr(self, "scrollbar"):
+            rect.setBottom(rect.bottom() - self.scrollbar.height())
+
+        _, _, plot_bottom = self._get_plot_bounds()
+        plot_top = rect.top()
+        n_channels = len(self._sorted_channels)
+        if n_channels <= 0:
+            return None
+
+        channel_height = (plot_bottom - plot_top) / n_channels
+        # Inverse of the y_center formula in _theta_channel_geometry:
+        #   y_center = plot_bottom - (idx + 0.5) * channel_height + channel_offset * channel_height
+        # Solve for idx given y.
+        idx_f = (plot_bottom - y) / channel_height - 0.5 + self._channel_offset
+        idx = int(round(idx_f))
+        if 0 <= idx < n_channels:
+            return self._sorted_channels[idx]
+        return None
+
+    def _theta_split_epoch(self, index: int, split_sample: int):
+        """
+        Split theta_epochs[index] into two epochs at split_sample (a
+        sample position relative to the SAME detection-window basis as
+        epoch.start_sample/end_sample). Both halves are marked
+        manual=True and duplicate the original epoch's aggregate stats
+        (mean_ratio, peak_ratio, mean_theta_power, mean_delta_power)
+        unchanged -- recomputing them properly would require re-running
+        detection math on each half's raw signal, which this dialog
+        doesn't have access to after the fact; duplicating is the same
+        pragmatic choice _theta_merge_epochs already makes by averaging
+        rather than re-detecting.
+
+        No-ops (returns False) if split_sample doesn't leave both
+        halves at least _theta_min_epoch_samples wide, so a double-click
+        very close to either edge can't produce a degenerate sliver.
+        """
+        if not (0 <= index < len(self.theta_epochs)):
+            return False
+        epoch = self.theta_epochs[index]
+        min_w = self._theta_min_epoch_samples
+
+        if split_sample - epoch.start_sample < min_w or epoch.end_sample - split_sample < min_w:
+            return False
+
+        first = ThetaEpoch(
+            channel=epoch.channel,
+            start_sample=epoch.start_sample,
+            end_sample=split_sample,
+            peak_sample=min(epoch.peak_sample, split_sample),
+            mean_theta_power=epoch.mean_theta_power,
+            mean_delta_power=epoch.mean_delta_power,
+            mean_ratio=epoch.mean_ratio,
+            peak_ratio=epoch.peak_ratio,
+            duration_ms=(split_sample - epoch.start_sample) / float(self.engine.sr) * 1000.0,
+            manual=True,
+        )
+        second = ThetaEpoch(
+            channel=epoch.channel,
+            start_sample=split_sample,
+            end_sample=epoch.end_sample,
+            peak_sample=max(epoch.peak_sample, split_sample),
+            mean_theta_power=epoch.mean_theta_power,
+            mean_delta_power=epoch.mean_delta_power,
+            mean_ratio=epoch.mean_ratio,
+            peak_ratio=epoch.peak_ratio,
+            duration_ms=(epoch.end_sample - split_sample) / float(self.engine.sr) * 1000.0,
+            manual=True,
+        )
+
+        self.theta_epochs.pop(index)
+        self.theta_epochs.append(first)
+        self.theta_epochs.append(second)
+        self.theta_epochs.sort(key=lambda e: (e.channel, e.start_sample))
+
+        # Select the first half (whichever new index it landed at after
+        # sorting), mirroring _theta_merge_epochs's own post-op
+        # selection pattern.
+        self._theta_selected_epoch = next(
+            i for i, e in enumerate(self.theta_epochs)
+            if e is first
+        )
+        self._theta_drag_epoch = None
+        self._theta_drag_side = None
+        self._theta_merge_candidate = None
+        self._theta_merge_candidates.clear()
+        self.thetaEpochsChanged.emit(self.theta_epochs)
+        self.thetaEpochSelected.emit(self._theta_selected_epoch)
         self.update()
         return True
 
@@ -203,13 +341,49 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
     def paintEvent(self, event):
         super().paintEvent(event)
 
-        if not self.theta_epochs or not self._sorted_channels:
+        if not self._sorted_channels:
             return
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._draw_theta_epochs(painter)
+        if self.theta_epochs:
+            self._draw_theta_epochs(painter)
+        if self._theta_creating_channel is not None and self._theta_creating_start_sample is not None:
+            self._draw_theta_creation_preview(painter)
         painter.end()
+
+    def _draw_theta_creation_preview(self, painter: QPainter):
+        """Live rectangle shown while dragging out a new epoch (armed
+        via arm_theta_creation(), see mousePressEvent/mouseMoveEvent).
+        Same visual language as a selected epoch, so it's obvious this
+        is "about to become" a real epoch rather than an existing one."""
+        geometry = self._theta_channel_geometry(self._theta_creating_channel)
+        if geometry is None:
+            return
+        _, _, channel_height, y_center = geometry
+        plot_left, plot_right, _ = self._get_plot_bounds()
+
+        start_sample = self._theta_creating_start_sample
+        end_sample = self._theta_creating_end_sample if self._theta_creating_end_sample is not None else start_sample
+        lo, hi = min(start_sample, end_sample), max(start_sample, end_sample)
+
+        x1 = self._theta_time_to_x(self._theta_epoch_time(lo))
+        x2 = self._theta_time_to_x(self._theta_epoch_time(hi))
+        left = max(plot_left, min(x1, x2))
+        right = min(plot_right, max(x1, x2))
+        if right < plot_left or left > plot_right:
+            return
+
+        painter.setBrush(QBrush(QColor(70, 200, 255, 55)))
+        painter.setPen(QPen(QColor(60, 190, 255, 235), 1.5, Qt.PenStyle.DashLine))
+        painter.drawRect(
+            QRectF(
+                left,
+                y_center - channel_height * 0.43,
+                max(1.0, right - left),
+                channel_height * 0.86,
+            )
+        )
 
     def _draw_theta_epochs(self, painter: QPainter):
         _, _, plot_bottom = self._get_plot_bounds()
@@ -403,6 +577,19 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        if self._theta_creating_armed and event.button() == Qt.MouseButton.LeftButton:
+            channel = self._theta_channel_at_y(event.position().y())
+            if channel is not None:
+                sample = self._theta_x_to_sample(event.position().x())
+                self._theta_creating_channel = channel
+                self._theta_creating_start_sample = sample
+                event.accept()
+                return
+            # Clicked outside any channel lane while armed -- disarm
+            # rather than leaving creation mode stuck active with
+            # nothing to anchor it to.
+            self.cancel_theta_creation()
+
         if event.button() == Qt.MouseButton.LeftButton and self.theta_epochs:
             handle = self._theta_handle_at(event.position())
             if handle is not None:
@@ -457,6 +644,16 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._theta_creating_channel is not None and self._theta_creating_start_sample is not None:
+            # Live end position while dragging out a new epoch --
+            # actual creation (with min-width validation) happens on
+            # release; this just tracks the current extent for the
+            # preview rectangle drawn by _draw_theta_epochs.
+            self._theta_creating_end_sample = self._theta_x_to_sample(event.position().x())
+            self.update()
+            event.accept()
+            return
+
         if self._theta_drag_epoch is not None and self._theta_drag_side is not None:
             index = self._theta_drag_epoch
             if not (0 <= index < len(self.theta_epochs)):
@@ -499,6 +696,44 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._theta_creating_channel is not None and self._theta_creating_start_sample is not None:
+            channel = self._theta_creating_channel
+            start_sample = self._theta_creating_start_sample
+            end_sample = self._theta_creating_end_sample if self._theta_creating_end_sample is not None else start_sample
+
+            lo, hi = min(start_sample, end_sample), max(start_sample, end_sample)
+            if hi - lo >= self._theta_min_epoch_samples:
+                new_epoch = ThetaEpoch(
+                    channel=channel,
+                    start_sample=lo,
+                    end_sample=hi,
+                    peak_sample=(lo + hi) // 2,
+                    mean_theta_power=0.0,
+                    mean_delta_power=0.0,
+                    mean_ratio=0.0,
+                    peak_ratio=0.0,
+                    duration_ms=(hi - lo) / float(self.engine.sr) * 1000.0,
+                    manual=True,
+                )
+                self.theta_epochs.append(new_epoch)
+                self.theta_epochs.sort(key=lambda e: (e.channel, e.start_sample))
+                self._theta_selected_epoch = next(
+                    i for i, e in enumerate(self.theta_epochs) if e is new_epoch
+                )
+                self.thetaEpochsChanged.emit(self.theta_epochs)
+                self.thetaEpochSelected.emit(self._theta_selected_epoch)
+            # Too short (e.g. a stray click with no real drag) -- silently
+            # discarded rather than creating a degenerate epoch.
+
+            self._theta_creating_armed = False
+            self._theta_creating_channel = None
+            self._theta_creating_start_sample = None
+            self._theta_creating_end_sample = None
+            self.unsetCursor()
+            self.update()
+            event.accept()
+            return
+
         if self._theta_drag_epoch is not None:
             index = self._theta_drag_epoch
             candidates = set(self._theta_merge_candidates)
@@ -514,6 +749,41 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
             return
 
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click INSIDE the currently selected epoch's rectangle
+        splits it at the click position. Anywhere else, falls through
+        to the base class's double-click-to-reset-view behavior --
+        double-click is only intercepted when it can unambiguously be
+        interpreted as "split this epoch", not generally."""
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._theta_selected_epoch is not None
+            and 0 <= self._theta_selected_epoch < len(self.theta_epochs)
+        ):
+            index = self._theta_selected_epoch
+            epoch = self.theta_epochs[index]
+            geometry = self._theta_channel_geometry(epoch.channel)
+            if geometry is not None:
+                _, _, channel_height, y_center = geometry
+                plot_left, plot_right, _ = self._get_plot_bounds()
+                x1 = self._theta_time_to_x(self._theta_epoch_time(epoch.start_sample))
+                x2 = self._theta_time_to_x(self._theta_epoch_time(epoch.end_sample))
+                left = max(plot_left, min(x1, x2))
+                right = min(plot_right, max(x1, x2))
+                y1 = y_center - channel_height * 0.43
+                y2 = y_center + channel_height * 0.43
+                pos = event.position()
+                if left <= pos.x() <= right and y1 <= pos.y() <= y2:
+                    split_sample = self._theta_x_to_sample(pos.x())
+                    if self._theta_split_epoch(index, split_sample):
+                        event.accept()
+                        return
+                    # Split rejected (too close to an edge) -- fall
+                    # through to the base reset-view behavior rather
+                    # than silently doing nothing on the double-click.
+
+        super().mouseDoubleClickEvent(event)
 
     def _theta_cancel_drag(self):
         self._theta_drag_epoch = None
