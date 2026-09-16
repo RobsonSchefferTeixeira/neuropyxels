@@ -32,8 +32,7 @@ class TraceEngine:
     for one continuous.dat recording. No plotting, no widgets.
     """
 
-    def __init__(self, n_channels: int = 384, sample_rate: float = 30000,
-                 dtype=np.int16):
+    def __init__(self, n_channels: int = 384, sample_rate: float = 30000, dtype=np.int16):
         self.n_channels = n_channels
         self.sr = sample_rate
         self.dtype = dtype
