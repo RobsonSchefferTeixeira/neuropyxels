@@ -16,25 +16,23 @@ second, independent plot -- for two reasons:
      painting that the trace view already does, so every inspection
      paid for that pipeline twice.
   2. Correctness: the trace view owns the one time <-> pixel mapping
-     that the vertical cursor line and the trace both agree on (after
-     a couple of rounds fixing drift bugs there). A second, independent
-     plot risks silently re-diverging from that mapping. Feeding
-     results into the trace view's own paint pipeline means there's
-     exactly one place where "where is time on screen" is decided.
+     that the vertical cursor line and the trace both agree on. A
+     second, independent plot risks silently re-diverging from that
+     mapping. Feeding results into the trace view's own paint pipeline
+     means there's exactly one place where "where is time on screen"
+     is decided.
 
-As of this refactor, ripple events have the same architectural parity
-with theta epochs: the trace view owns a flat list[RippleEvent] plus
-click-select / drag-to-resize boundaries / Delete-key removal /
-merge-on-drag, mirroring ThetaEpochTraceViewWidget exactly. This dialog
-stays the params/table window and the source of truth for
-events_by_channel (summary table, CSV export); rippleEventsChanged /
-rippleEventSelected keep it in sync with edits made directly on the
-trace view.
+Ripple events have the same architectural parity with theta epochs:
+the trace view owns a flat list[RippleEvent] plus click-select /
+drag-to-resize boundaries / Delete-key removal / merge-on-drag /
+split-by-double-click / arm-then-drag add. This dialog stays the
+params/table window and the source of truth for events_by_channel
+(summary table, CSV export); rippleEventsChanged / rippleEventSelected
+keep it in sync with edits made directly on the trace view.
 
 Detection math lives in core/ripple_detector.py; CSD (optional) reuses
 core/phase_amplitude.py's PhaseAmplitudeAnalyzer.compute_csd, the same
-CSD implementation already used and tested there, rather than
-duplicating it.
+CSD implementation already used and tested there.
 
 Selecting a row in the summary table (or Prev/Next Ripple) selects that
 channel in the main trace view and pans/zooms it to center the ripple,
@@ -54,7 +52,7 @@ from PyQt6.QtWidgets import (
 
 from core.ripple_detector import RippleDetector, RippleParams, RippleEvent
 from core.phase_amplitude import PhaseAmplitudeAnalyzer
-from core.ripple_export import export_ripples_to_csv, export_ripples_per_channel
+from core.ripple_export import export_ripples_to_csv, export_ripples_per_channel, read_ripples_from_csv
 from core.trace_engine import TraceEngine
 from gui.ripple_trace_view import RippleTraceViewWidget
 from gui.ripple_triggered_average_dialog import RippleTriggeredAverageDialog
@@ -84,21 +82,15 @@ class _DetectThread(QThread):
         self.csd_spacing = csd_spacing
         self.pac_analyzer = pac_analyzer
         self.detector = RippleDetector()
-        # [(global_start_sample, global_end_sample), ...] -- applied
-        # identically to every channel being detected (theta is treated
-        # as network-wide, not per-channel; see
-        # RippleDialog._theta_global_exclusion_intervals). Global-sample
-        # terms, NOT relative to this thread's own start_idx.
         self.exclude_intervals = exclude_intervals or []
 
     def run(self):
         try:
             # Intentionally plain elapsed-seconds/sample indexing
             # (int(time * sr)), NEVER engine.timestamps-aware. Ripple
-            # (and theta) detection must produce identical results
-            # whether or not the user has loaded a timestamps.npy file --
-            # timestamps are a display-only concern elsewhere in the app,
-            # never load-bearing for detection/positioning here.
+            # detection must produce identical results whether or not
+            # the user has loaded a timestamps.npy file -- timestamps
+            # are a display-only concern elsewhere in the app.
             start_idx = max(0, int(self.start_time * self.sample_rate))
             end_idx = min(self.raw_data.shape[0], int(self.end_time * self.sample_rate))
             if start_idx >= end_idx:
@@ -106,14 +98,10 @@ class _DetectThread(QThread):
 
             n_samples = end_idx - start_idx
 
-            # Build the exclude mask ONCE (same window for every
-            # channel), in window-relative sample terms.
             exclude_mask = None
             if self.exclude_intervals:
                 exclude_mask = np.zeros(n_samples, dtype=bool)
                 for lo, hi in self.exclude_intervals:
-                    # Clip each global interval to this detection
-                    # window, then convert to window-relative indices.
                     rel_lo = max(0, lo - start_idx)
                     rel_hi = min(n_samples - 1, hi - start_idx)
                     if rel_lo <= rel_hi:
@@ -132,29 +120,17 @@ class _DetectThread(QThread):
                         self.start_time, self.end_time, self.csd_spacing,
                     )
                     if not csd_info.get("used", False):
-                        # CSD unavailable for this channel (edge channel,
-                        # no valid neighbors) -- fall back to raw signal
-                        # rather than silently dropping the channel.
+                        # CSD unavailable for this channel -- fall back
+                        # to raw signal rather than silently dropping.
                         signal = self.raw_data[start_idx:end_idx, ch].flatten().astype(np.float64)
 
-                # Filtering (sosfiltfilt) still always runs on the FULL
-                # signal -- it needs surrounding context to be accurate,
-                # so masking the excluded regions out of the signal
-                # itself before filtering would corrupt detection near
-                # their edges. exclude_mask instead keeps theta-time
-                # samples out of the post-filter envelope's mean/SD
-                # baseline AND out of candidate-peak selection (see
-                # RippleDetector.detect's exclude_mask parameter) --
-                # this is the mechanism for "so we only use the ripple
-                # amp thresholds during non-theta", not a purely
-                # post-hoc peak-location filter.
                 events = self.detector.detect(
                     signal, self.sample_rate, self.params, channel=ch,
                     exclude_mask=exclude_mask,
                 )
 
                 results[ch] = events
-                signals_used[ch] = signal  # kept so the overlay can compute the filtered envelope
+                signals_used[ch] = signal
                 self.progress.emit(i + 1, len(self.channels))
 
             self.finished_ok.emit(results, signals_used)
@@ -167,8 +143,9 @@ class RippleDialog(QDialog):
     Non-modal, controls-only ripple detection dialog. Detection results
     are pushed to a RippleTraceViewWidget (or a NeuralTraceViewWidget
     composing it) as an interactive overlay -- click-select, drag
-    boundaries, delete, merge-on-drag -- rather than rendered in this
-    dialog, mirroring how ThetaEpochDialog drives its trace view.
+    boundaries, delete, merge-on-drag, split, add -- rather than
+    rendered in this dialog, mirroring how ThetaEpochDialog drives its
+    trace view.
     """
 
     def __init__(self, probe_data: dict, engine: TraceEngine,
@@ -177,7 +154,7 @@ class RippleDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Ripple Detection")
         self.setModal(False)
-        self.resize(560, 520)
+        self.resize(560, 620)
 
         self.engine = engine
         self.trace_view = trace_view
@@ -189,22 +166,20 @@ class RippleDialog(QDialog):
         # channel -> list[RippleEvent]; source of truth, also what gets
         # exported to CSV.
         self.events_by_channel: dict[int, list[RippleEvent]] = {}
-        self._signal_by_channel: dict[int, np.ndarray] = {}  # raw or CSD signal actually analyzed
+        self._signal_by_channel: dict[int, np.ndarray] = {}
         self._envelope_by_channel: dict[int, np.ndarray] = {}
         self._filtered_by_channel: dict[int, np.ndarray] = {}
-        self._sample_offset = 0  # samples (engine.sr basis), set at detect time
+        self._sample_offset = 0
         self._selected_channel: int | None = None
-        self._params: RippleParams | None = None  # params used for the CURRENT detection run
+        self._params: RippleParams | None = None
         self._open_rta_dialogs: list[RippleTriggeredAverageDialog] = []
 
         self._build_ui()
         self._sync_time_range_from_engine()
 
         # Keep this dialog's events_by_channel / summary table in sync
-        # with edits made directly on the trace view (drag boundary,
-        # Delete key, merge-on-drag), and keep the trace view's selection
-        # in sync with table row selection -- same two-way wiring
-        # MainWindow sets up between ThetaEpochDialog and the trace view.
+        # with edits made directly on the trace view, and keep the
+        # trace view's selection in sync with table row selection.
         self.trace_view.rippleEventsChanged.connect(self.set_events_from_trace)
         self.trace_view.rippleEventSelected.connect(self.set_selected_event)
 
@@ -214,10 +189,6 @@ class RippleDialog(QDialog):
         self._refresh_theta_exclusion_availability()
 
     def showEvent(self, event):
-        # Theta detection can happen (or epochs can be loaded/cleared)
-        # while this dialog stays open, so re-check availability every
-        # time the dialog becomes visible rather than only once at
-        # construction.
         self._refresh_theta_exclusion_availability()
         super().showEvent(event)
 
@@ -261,6 +232,7 @@ class RippleDialog(QDialog):
 
         layout.addLayout(self._build_overlay_controls())
         layout.addLayout(self._build_nav_row())
+        layout.addLayout(self._build_edit_row())
         layout.addLayout(self._build_export_row())
         layout.addLayout(self._build_analysis_row())
 
@@ -347,10 +319,7 @@ class RippleDialog(QDialog):
         self.exclude_theta_check = QCheckBox("Detect ripples outside theta only")
         self.exclude_theta_check.setToolTip(
             "Exclude every theta epoch (on any channel) from both the "
-            "amplitude threshold baseline AND candidate detection -- "
-            "prevents high-frequency activity during theta from "
-            "inflating the ripple threshold. Disabled if no theta "
-            "epochs exist yet."
+            "amplitude threshold baseline AND candidate detection."
         )
         self.exclude_theta_check.setEnabled(False)
         col_pairs.append((None, self.exclude_theta_check))
@@ -380,9 +349,7 @@ class RippleDialog(QDialog):
 
     def _build_summary_table(self) -> QTableWidget:
         self.summary_table = QTableWidget(0, 4)
-        self.summary_table.setHorizontalHeaderLabels(
-            ["Channel", "N Ripples", "Mean Peak Amp.", "Max Peak Amp."]
-        )
+        self.summary_table.setHorizontalHeaderLabels(["Channel", "N Ripples", "Mean Peak Amp.", "Max Peak Amp."])
         self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.summary_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.summary_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -445,6 +412,39 @@ class RippleDialog(QDialog):
         row.addStretch(1)
         return row
 
+    def _build_edit_row(self) -> QHBoxLayout:
+        """Buttons that mirror the theta-epoch editor's manual-edit
+        controls: arm-then-drag creation, and delete-selected. Split
+        and resize are done directly on the trace view (double-click
+        inside a selected ripple to split; drag its boundaries to
+        resize), same as theta."""
+        row = QHBoxLayout()
+
+        self.add_ripple_btn = QPushButton("Add Ripple")
+        self.add_ripple_btn.setCheckable(True)
+        self.add_ripple_btn.setAutoDefault(False)
+        self.add_ripple_btn.setDefault(False)
+        self.add_ripple_btn.setToolTip(
+            "Click, then click-drag on a channel's lane in the main "
+            "trace view to draw a new manual ripple there. Click again "
+            "to cancel without creating one."
+        )
+        self.add_ripple_btn.toggled.connect(self._on_add_ripple_toggled)
+        row.addWidget(self.add_ripple_btn)
+
+        self.delete_ripple_btn = QPushButton("Delete Selected Ripple")
+        self.delete_ripple_btn.setAutoDefault(False)
+        self.delete_ripple_btn.setDefault(False)
+        self.delete_ripple_btn.setToolTip(
+            "Delete the currently-selected ripple event (also "
+            "available via the Delete key on the trace view)."
+        )
+        self.delete_ripple_btn.clicked.connect(self._on_delete_selected_ripple)
+        row.addWidget(self.delete_ripple_btn)
+
+        row.addStretch(1)
+        return row
+
     def _build_export_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.export_selected_btn = QPushButton("Export Selected Channel CSV...")
@@ -465,7 +465,7 @@ class RippleDialog(QDialog):
         self.load_btn.setToolTip(
             "Load a previously-exported ripple CSV. Loaded events are "
             "added to the current set and behave exactly like freshly "
-            "detected ones (draggable, mergeable, deletable)."
+            "detected ones."
         )
         self.load_btn.clicked.connect(self._on_load_clicked)
         row.addWidget(self.load_btn)
@@ -483,8 +483,7 @@ class RippleDialog(QDialog):
         self.rta_btn.setToolTip(
             "Average the raw LFP around every detected ripple event, for "
             "a chosen set of channels, time window, and alignment "
-            "reference (envelope peak, or the ripple's own max/min "
-            "cycle)."
+            "reference."
         )
         self.rta_btn.clicked.connect(self._on_open_rta_clicked)
         row.addWidget(self.rta_btn)
@@ -509,29 +508,11 @@ class RippleDialog(QDialog):
             )
             return
 
-        # Starting channel selection = whatever's currently ACTIVE in
-        # the main trace view, not every channel in the recording -- a
-        # much more useful default, and the RTA dialog's own "Select
-        # from Probe Map..." button covers picking something else
-        # (including channels that never had their own detection run:
-        # "what does channel 12 look like around ripples detected on
-        # channel 5" is still a meaningful, supported question).
         initial_channels = list(self.trace_view.channels) if self.trace_view.channels else []
         if not initial_channels:
-            # Trace view has nothing selected -- fall back to whatever
-            # channels actually have detected/loaded ripple events,
-            # rather than opening with zero channels and forcing an
-            # immediate trip to the probe picker.
             initial_channels = sorted(self.events_by_channel.keys())
 
-        # Single dialog-wide _sample_offset applies to every channel's
-        # events uniformly -- same convention already used everywhere
-        # else in this dialog (export, overlay, nav). See the
-        # constructor comment on _sample_offset and the mismatch warning
-        # in _on_load_clicked for the known limitation this inherits.
-        sample_offset_by_channel = {
-            ch: self._sample_offset for ch in self.events_by_channel.keys()
-        }
+        sample_offset_by_channel = {ch: self._sample_offset for ch in self.events_by_channel.keys()}
 
         dialog = RippleTriggeredAverageDialog(
             self.engine, self.probe_data, self.events_by_channel, sample_offset_by_channel,
@@ -555,10 +536,6 @@ class RippleDialog(QDialog):
             self.end_spin.setValue(min(10.0, self.engine.total_duration))
 
     def _set_full_available_range(self):
-        """Mirrors ThetaEpochDialog._set_full_available_range: expand
-        the analysis interval to the entire loaded recording, sample-
-        indexed (0 to engine.total_duration), same basis _DetectThread
-        already uses -- not tied to timestamps.npy either way."""
         if not self.engine.data_loaded:
             return
         self.start_spin.setValue(0.0)
@@ -595,32 +572,6 @@ class RippleDialog(QDialog):
         )
 
     def _theta_global_exclusion_intervals(self) -> list[tuple[int, int]]:
-        """
-        Build a flat, merged list of [(global_start_sample,
-        global_end_sample), ...] from every theta epoch currently on
-        self.trace_view, regardless of which channel each epoch was
-        detected on.
-
-        Theta is treated as a network/brain-state phenomenon, not a
-        per-channel one: if theta was detected anywhere, that time
-        window is excluded from ripple detection on EVERY channel being
-        processed, not just the channel theta happened to be detected
-        on. This mirrors how the person would reason about it manually
-        (during a period the brain is in a theta state, don't count
-        ripples on any channel).
-
-        Returns [] if the trace view has no theta epochs (or doesn't
-        support them at all -- e.g. a plain RippleTraceViewWidget not
-        composed with theta).
-
-        Both theta epochs and ripple detection index samples with plain
-        sample/sample_rate math only (never engine.timestamps -- see
-        _DetectThread.run() and ThetaEpochTraceViewWidget._theta_epoch_time),
-        so adding each epoch's start/end sample to its own detection-time
-        sample_offset gives a value directly comparable to ripple's
-        start_idx + peak_sample used in _DetectThread, with no
-        timestamp-related drift possible.
-        """
         theta_epochs = getattr(self.trace_view, "theta_epochs", None)
         if not theta_epochs:
             return []
@@ -632,9 +583,6 @@ class RippleDialog(QDialog):
             for e in theta_epochs
         )
 
-        # Merge overlapping/adjacent intervals so downstream containment
-        # checks (any(lo <= x <= hi ...)) and baseline-mask construction
-        # don't have to reason about redundant overlapping ranges.
         merged: list[tuple[int, int]] = []
         for lo, hi in intervals:
             if merged and lo <= merged[-1][1]:
@@ -672,13 +620,6 @@ class RippleDialog(QDialog):
         exclude_intervals = []
         if self.exclude_theta_check.isChecked():
             exclude_intervals = self._theta_global_exclusion_intervals()
-            # exclude_theta_check is only enabled when theta epochs
-            # exist (see _refresh_theta_exclusion_availability), so
-            # exclude_intervals should be non-empty here; an empty
-            # result would only happen if theta epochs were cleared on
-            # the trace view between the checkbox being enabled and
-            # clicking Detect, which is harmless -- detection simply
-            # proceeds without exclusion.
 
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting...")
@@ -688,8 +629,6 @@ class RippleDialog(QDialog):
             "Running detection, please wait..."
         )
 
-        # Sample offset for absolute-position export/overlay: samples from
-        # the start of the recording to the start of the analyzed window.
         self._sample_offset = int(self.start_spin.value() * self.engine.sr)
 
         self._detect_thread = _DetectThread(
@@ -723,23 +662,12 @@ class RippleDialog(QDialog):
         self._signal_by_channel = signals_used
         self._params = self._collect_params()
 
-        # Compute the filtered signal + envelope for EVERY detected
-        # channel up front (not lazily on row-select like the old
-        # inspector did) -- the overlay can show several channels at
-        # once since it rides on whatever's currently visible in the
-        # main trace view, not on a single selected channel. The
-        # filtered (ripple-band bandpassed) signal was already being
-        # computed here to derive the envelope but previously discarded
-        # afterward -- now kept so it can optionally be drawn directly
-        # (the actual ripple-band oscillation, not just its envelope).
         self._envelope_by_channel = {}
         self._filtered_by_channel = {}
         for ch, signal in signals_used.items():
             filtered = self.detector.apply_ripple_filter(signal, self.engine.sr, self._params)
             self._filtered_by_channel[ch] = filtered
-            self._envelope_by_channel[ch] = self.detector.compute_envelope(
-                filtered, self.engine.sr, self._params
-            )
+            self._envelope_by_channel[ch] = self.detector.compute_envelope(filtered, self.engine.sr, self._params)
 
         self._populate_summary_table()
         self._push_overlay_to_trace_view()
@@ -753,17 +681,6 @@ class RippleDialog(QDialog):
     # ------------------------------------------------------------------
     # Overlay: pushing results to the main trace view
     # ------------------------------------------------------------------
-    #
-    # The trace view (RippleTraceViewWidget, or a NeuralTraceViewWidget
-    # composing it) owns interactive ripple state as a flat
-    # list[RippleEvent] -- the same shape ThetaEpochTraceViewWidget uses
-    # for theta epochs -- plus a separate per-channel render-context dict
-    # for envelope/signal/threshold data that isn't part of a ripple
-    # event's own identity. This dialog is the source of truth for
-    # events_by_channel (used by the summary table and CSV export);
-    # set_ripple_events()/set_ripple_render_context() push a fresh
-    # flattened view of it whenever detection results or a manual
-    # edit (drag/delete/merge, via rippleEventsChanged) change it.
 
     def _push_overlay_to_trace_view(self):
         if not self.events_by_channel:
@@ -812,30 +729,58 @@ class RippleDialog(QDialog):
     def set_events_from_trace(self, events: list[RippleEvent]):
         """Slot for trace_view.rippleEventsChanged -- keeps
         events_by_channel (and therefore the summary table / CSV export)
-        in sync after an in-place drag/delete/merge edit made directly
-        on the trace view, mirroring ThetaEpochDialog.set_epochs_from_trace."""
+        in sync after an in-place edit made directly on the trace view
+        (drag boundary, delete, merge, split, add)."""
         regrouped: dict[int, list[RippleEvent]] = {}
         for ev in events:
             regrouped.setdefault(ev.channel, []).append(ev)
-        # Preserve channels that detection covered but that now have zero
-        # events (e.g. the user deleted the only ripple on that channel)
-        # so the summary table still shows a 0-ripple row instead of the
-        # channel disappearing entirely.
         for ch in self.events_by_channel.keys():
             regrouped.setdefault(ch, [])
         self.events_by_channel = regrouped
         self._populate_summary_table()
+
+        # A successful edit (or add) coming back from the trace view
+        # means creation mode -- if it was armed -- has already
+        # disarmed itself there; keep the button's checked state in
+        # sync rather than leaving it stuck checked.
+        if self.add_ripple_btn.isChecked():
+            self.add_ripple_btn.blockSignals(True)
+            self.add_ripple_btn.setChecked(False)
+            self.add_ripple_btn.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Edit-mode handlers
+    # ------------------------------------------------------------------
+
+    def _on_add_ripple_toggled(self, checked: bool):
+        if checked:
+            self.trace_view.arm_ripple_creation()
+            self.status_label.setText(
+                "Click-drag on a channel's lane in the main trace view "
+                "to draw a new ripple. Click 'Add Ripple' again to "
+                "cancel without creating one."
+            )
+        else:
+            self.trace_view.cancel_ripple_creation()
+            self.status_label.setText(f"{len(self.events_by_channel)} channel(s) with ripple data.")
+
+    def _on_delete_selected_ripple(self):
+        deleted = self.trace_view.delete_selected_ripple_event()
+        if not deleted:
+            QMessageBox.information(
+                self, "No ripple selected",
+                "Click a ripple in the main trace view first, then "
+                "press this button (or the Delete key)."
+            )
 
     # ------------------------------------------------------------------
     # Summary table
     # ------------------------------------------------------------------
 
     def _populate_summary_table(self):
-        # Sort channels by mean peak amplitude descending, so the
-        # strongest-ripple channel/depth is immediately visible at the top.
         def mean_peak(events: list[RippleEvent]) -> float:
             if not events:
-                return -1.0  # channels with zero events sort to the bottom
+                return -1.0
             return float(np.mean([e.peak_amplitude for e in events]))
 
         ordered_channels = sorted(
@@ -855,8 +800,6 @@ class RippleDialog(QDialog):
             self.summary_table.setItem(row, 1, QTableWidgetItem(str(n)))
             self.summary_table.setItem(row, 2, QTableWidgetItem(f"{mean_amp:.3g}"))
             self.summary_table.setItem(row, 3, QTableWidgetItem(f"{max_amp:.3g}"))
-            # Stash the channel number on the row so selection lookup
-            # doesn't depend on re-parsing the displayed text.
             self.summary_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, ch)
 
     def _on_table_selection_changed(self):
@@ -868,18 +811,12 @@ class RippleDialog(QDialog):
         channel_item = self.summary_table.item(row, 0)
         self._selected_channel = channel_item.data(Qt.ItemDataRole.UserRole)
         n_events = len(self.events_by_channel.get(self._selected_channel, []))
-        self.status_label.setText(
-            f"Channel {self._selected_channel} selected ({n_events} ripples)."
-        )
+        self.status_label.setText(f"Channel {self._selected_channel} selected ({n_events} ripples).")
         self._show_channel_in_trace_view(self._selected_channel)
 
     def set_selected_event(self, index: int):
         """Slot for trace_view.rippleEventSelected -- index is into the
-        trace view's flat, (channel, start_sample)-sorted event list.
-        Mirrors ThetaEpochDialog.set_selected_epoch, but this dialog's
-        table is grouped by channel rather than listing individual
-        events, so selecting an event just makes sure that event's
-        channel is visible/selected in the summary table."""
+        trace view's flat, (channel, start_sample)-sorted event list."""
         all_events = sorted(
             (ev for evs in self.events_by_channel.values() for ev in evs),
             key=lambda e: (e.channel, e.start_sample),
@@ -898,11 +835,6 @@ class RippleDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _show_channel_in_trace_view(self, channel: int):
-        """Make sure the selected channel is visible in the main trace
-        view (so the overlay actually renders for it), without
-        disturbing the current time window unless the channel has no
-        events -- jumping straight to a ripple is handled separately by
-        _go_to_prev_ripple/_go_to_next_ripple."""
         if channel not in self.trace_view.channels:
             channels = list(self.trace_view.channels)
             channels.append(channel)
@@ -932,8 +864,6 @@ class RippleDialog(QDialog):
         sr = self.engine.sr
         offset_time = self._sample_offset / sr if sr else 0.0
         current_center_time = self.trace_view.start_time + self.trace_view.window_duration / 2
-        # Events' peak_sample is relative to the analyzed segment
-        # (offset by self._sample_offset), so compare in absolute time.
         current_center_sample = (current_center_time - offset_time) * sr
 
         if direction > 0:
@@ -987,9 +917,7 @@ class RippleDialog(QDialog):
         if not dir_str:
             return
         try:
-            written = export_ripples_per_channel(
-                self.events_by_channel, self.engine.sr, self._sample_offset, dir_str
-            )
+            written = export_ripples_per_channel(self.events_by_channel, self.engine.sr, self._sample_offset, dir_str)
             self.status_label.setText(f"Exported {len(written)} file(s) to {dir_str}")
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
@@ -998,9 +926,7 @@ class RippleDialog(QDialog):
         if not self.engine.data_loaded:
             QMessageBox.warning(self, "No data", "No data is currently loaded.")
             return
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, "Load Ripples", "", "CSV files (*.csv);;All files (*)"
-        )
+        path_str, _ = QFileDialog.getOpenFileName(self, "Load Ripples", "", "CSV files (*.csv);;All files (*)")
         if not path_str:
             return
 
@@ -1014,18 +940,6 @@ class RippleDialog(QDialog):
             QMessageBox.information(self, "No events found", f"{path_str} contains no ripple events.")
             return
 
-        # read_ripples_from_csv returns ABSOLUTE (recording-global) sample
-        # positions, unmodified -- unlike theta's importer this isn't
-        # re-based to any particular sample_offset. Loaded events are
-        # ADDED to whatever's already in events_by_channel (rather than
-        # replacing it) so loading multiple exported files, or loading on
-        # top of a fresh detection run, accumulates rather than clobbers.
-        # This does mean a loaded channel's sample_offset must be treated
-        # as 0 for rendering; channels that also have live detection
-        # results keep their detection-time sample_offset/envelope --
-        # mixing the two on the SAME channel in one session isn't
-        # supported (the events would be interpreted against whichever
-        # sample_offset that channel's render context currently uses).
         if self.events_by_channel and self._sample_offset != 0:
             proceed = QMessageBox.question(
                 self, "Sample offset mismatch",
@@ -1054,9 +968,6 @@ class RippleDialog(QDialog):
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
             self._detect_thread.wait(2000)
-        # Disconnect before clearing so clear_ripple_overlay()'s
-        # rippleEventsChanged-adjacent state resets don't loop back into
-        # this (about to be destroyed) dialog's slots.
         try:
             self.trace_view.rippleEventsChanged.disconnect(self.set_events_from_trace)
         except TypeError:
@@ -1065,6 +976,8 @@ class RippleDialog(QDialog):
             self.trace_view.rippleEventSelected.disconnect(self.set_selected_event)
         except TypeError:
             pass
+        if self.add_ripple_btn.isChecked():
+            self.trace_view.cancel_ripple_creation()
         self.trace_view.clear_ripple_overlay()
         for dialog in list(self._open_rta_dialogs):
             dialog.close()
