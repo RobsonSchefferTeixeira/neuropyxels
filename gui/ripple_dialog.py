@@ -181,6 +181,7 @@ class RippleDialog(QDialog):
 
         self.engine = engine
         self.trace_view = trace_view
+        self.probe_data = probe_data
         self.pac_analyzer = PhaseAmplitudeAnalyzer(probe_data)  # reused for CSD only
         self._detect_thread: _DetectThread | None = None
         self.detector = RippleDetector()
@@ -508,11 +509,20 @@ class RippleDialog(QDialog):
             )
             return
 
-        # Every channel currently loaded on the trace engine is a valid
-        # RTA target, not just the ones that had their own detection run
-        # -- e.g. "what does channel 12 look like around ripples
-        # detected on channel 5" is a meaningful question.
-        available_channels = list(range(self.engine.n_channels)) if self.engine.data_loaded else []
+        # Starting channel selection = whatever's currently ACTIVE in
+        # the main trace view, not every channel in the recording -- a
+        # much more useful default, and the RTA dialog's own "Select
+        # from Probe Map..." button covers picking something else
+        # (including channels that never had their own detection run:
+        # "what does channel 12 look like around ripples detected on
+        # channel 5" is still a meaningful, supported question).
+        initial_channels = list(self.trace_view.channels) if self.trace_view.channels else []
+        if not initial_channels:
+            # Trace view has nothing selected -- fall back to whatever
+            # channels actually have detected/loaded ripple events,
+            # rather than opening with zero channels and forcing an
+            # immediate trip to the probe picker.
+            initial_channels = sorted(self.events_by_channel.keys())
 
         # Single dialog-wide _sample_offset applies to every channel's
         # events uniformly -- same convention already used everywhere
@@ -524,8 +534,8 @@ class RippleDialog(QDialog):
         }
 
         dialog = RippleTriggeredAverageDialog(
-            self.engine, self.events_by_channel, sample_offset_by_channel,
-            self._params, available_channels, parent=self,
+            self.engine, self.probe_data, self.events_by_channel, sample_offset_by_channel,
+            self._params, initial_channels, parent=self,
         )
         self._open_rta_dialogs.append(dialog)
         dialog.finished.connect(lambda _res, d=dialog: self._on_rta_dialog_closed(d))

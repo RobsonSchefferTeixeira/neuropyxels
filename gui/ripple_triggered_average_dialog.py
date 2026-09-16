@@ -4,8 +4,8 @@ ripple_triggered_average_dialog.py
 Non-modal QDialog for ripple-triggered average (RTA) analysis: pick
 channels, a time window around each ripple's alignment point, and an
 alignment reference (envelope peak, or the filtered signal's own
-max/min cycle), then compute and display the averaged raw LFP trace
-per channel across every currently-detected ripple event.
+max/min cycle), then compute and display the averaged raw LFP trace per
+channel across every currently-detected ripple event.
 
 Opened from RippleDialog via a "Ripple-Triggered Average..." button,
 using whatever events are in RippleDialog.events_by_channel at the time
@@ -14,35 +14,51 @@ Follows the same non-modal QDialog + QThread-computation pattern as
 amplitude_power_dialog.py / phase_amplitude_dialog.py; the math lives
 in core/ripple_triggered_average.py.
 
+Channel selection and display
+------------------------------
+Starting channel selection is whatever's currently ACTIVE in the main
+trace view (RippleDialog passes this in), not every channel in the
+recording -- the person is expected to already be looking at the
+channels they care about. A "Select channels from Probe Map..." button
+opens a SEPARATE, scoped ProbeMapWidget instance (own popup dialog, not
+shared with the main window) pre-seeded with the current selection, for
+picking a different/wider/narrower set spatially.
+
+Results render as small trace glyphs positioned at each selected
+channel's real (x, y) probe position -- phy2's waveform-view idiom,
+implemented in gui/rta_probe_trace_widget.py's RTAProbeTraceWidget
+(custom QPainter, not pyqtgraph, for performance at high channel
+counts). Channels group into columns by shank, ordered left-to-right by
+real physical x-position, with a vertical divider between distinct
+shank/probe columns -- multiple probes/shanks appear side by side
+rather than interleaved.
+
 Usage
 -----
-    dialog = RippleTriggeredAverageDialog(engine, events_by_channel,
-                                           sample_offsets_by_channel,
-                                           ripple_params, available_channels,
-                                           parent=ripple_dialog)
+    dialog = RippleTriggeredAverageDialog(engine, probe_data, events_by_channel,
+                                           sample_offsets_by_channel, ripple_params,
+                                           initial_channels, parent=ripple_dialog)
     dialog.show()   # non-modal
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QCheckBox, QPushButton, QComboBox, QMessageBox, QWidget, QListWidget,
     QListWidgetItem, QAbstractItemView,
 )
-from PyQt6.QtGui import QColor
 
 from core.ripple_detector import RippleEvent, RippleParams
 from core.ripple_triggered_average import (
     RippleTriggeredAverageAnalyzer, RippleTriggeredAverageParams, ALIGNMENT_MODES,
 )
 from core.trace_engine import TraceEngine
+from gui.probe_map_widget import ProbeMapWidget
+from gui.rta_probe_trace_widget import RTAProbeTraceWidget
 
-
-BG_COLOR = "#1e1e1e"
 
 ALIGNMENT_LABELS = {
     "envelope_peak": "Ripple max amplitude (envelope peak)",
@@ -50,14 +66,6 @@ ALIGNMENT_LABELS = {
     "filtered_min": "Ripple min cycle (filtered signal trough)",
 }
 ALIGNMENT_LABELS_REVERSE = {v: k for k, v in ALIGNMENT_LABELS.items()}
-
-# Distinct, readable line colors cycled across channels -- avoids
-# pyqtgraph's default palette repeating too quickly for probes with
-# many selected channels.
-CHANNEL_COLORS = [
-    "#4a9eff", "#ff6b6b", "#42d77d", "#ffd23f", "#c77dff",
-    "#ff9f1c", "#4cc9f0", "#f72585", "#94d2bd", "#e9c46a",
-]
 
 
 class _ComputeThread(QThread):
@@ -82,34 +90,82 @@ class _ComputeThread(QThread):
             self.failed.emit(str(exc))
 
 
+class _ProbePickerDialog(QDialog):
+    """
+    Small popup hosting a SCOPED ProbeMapWidget instance for selecting
+    which channels feed the ripple-triggered average -- deliberately
+    separate from the main window's own probe map (different selection
+    state, different purpose), reusing the same widget class since the
+    interaction (click electrodes to select, drag/zoom, double-click to
+    clear) is exactly what's wanted here too.
+    """
+
+    def __init__(self, probe_data: dict, initial_channels: list[int], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Channels")
+        self.setModal(True)
+        self.resize(500, 650)
+
+        layout = QVBoxLayout(self)
+        self.probe_map = ProbeMapWidget(probe_data)
+        layout.addWidget(self.probe_map, stretch=1)
+
+        btn_row = QHBoxLayout()
+        done_btn = QPushButton("Done")
+        done_btn.setAutoDefault(False)
+        done_btn.setDefault(False)
+        done_btn.clicked.connect(self.accept)
+        btn_row.addStretch(1)
+        btn_row.addWidget(done_btn)
+        layout.addLayout(btn_row)
+
+        # Seed with whatever's already selected -- set AFTER the widget
+        # is fully constructed and in the layout so its internal scatter
+        # item/state arrays exist.
+        self.probe_map.set_selected_channels(initial_channels)
+
+    def selected_channels(self) -> list[int]:
+        return self.probe_map.get_selected_channels()
+
+
 class RippleTriggeredAverageDialog(QDialog):
     """
     Non-modal dialog: averaged LFP traces around ripple events, for a
-    chosen set of channels, window, and alignment reference.
+    chosen set of channels, window, and alignment reference, displayed
+    as small glyphs positioned by real probe geometry.
     """
 
-    def __init__(self, engine: TraceEngine, events_by_channel: dict[int, list[RippleEvent]],
+    def __init__(self, engine: TraceEngine, probe_data: dict,
+                 events_by_channel: dict[int, list[RippleEvent]],
                  sample_offset_by_channel: dict[int, int], ripple_params: RippleParams,
-                 available_channels: list[int], parent=None):
+                 initial_channels: list[int], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ripple-Triggered Average")
         self.setModal(False)
-        self.resize(900, 700)
+        self.resize(1000, 750)
 
         self.engine = engine
+        self.probe_data = probe_data
         # events_by_channel's sample fields are relative to whatever
         # sample_offset was active for THAT channel's detection run
         # (see RippleDialog's own _sample_offset bookkeeping) -- re-base
         # every event to absolute/global samples ONCE here, so
         # core.ripple_triggered_average only ever deals in one
         # consistent sample basis (its documented convention).
-        self.events_global: list[RippleEvent] = self._rebase_events_to_global(events_by_channel, sample_offset_by_channel)
-        self.available_channels = list(available_channels)
+        self.events_global: list[RippleEvent] = self._rebase_events_to_global(
+            events_by_channel, sample_offset_by_channel
+        )
+        # Starting selection = whatever's currently active in the main
+        # trace view, NOT every channel in the recording -- the person
+        # is expected to already be looking at the channels they care
+        # about; the probe-picker popup covers picking something else.
+        self.selected_channels: list[int] = list(initial_channels)
         self.analyzer = RippleTriggeredAverageAnalyzer(ripple_params)
         self._compute_thread: _ComputeThread | None = None
         self._last_result: dict | None = None
 
         self._build_ui()
+        self.probe_trace_widget.set_geometry_from_probe(self.probe_data, self.selected_channels)
 
     # ------------------------------------------------------------------
     # Setup
@@ -138,9 +194,6 @@ class RippleTriggeredAverageDialog(QDialog):
         return rebased
 
     def _build_ui(self):
-        pg.setConfigOption("background", BG_COLOR)
-        pg.setConfigOption("foreground", "#d0d0d0")
-
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
 
@@ -148,18 +201,15 @@ class RippleTriggeredAverageDialog(QDialog):
 
         btn_row = QHBoxLayout()
         self.compute_btn = QPushButton("Compute Average")
+        self.compute_btn.setAutoDefault(False)
+        self.compute_btn.setDefault(False)
         self.compute_btn.clicked.connect(self._on_compute_clicked)
         btn_row.addWidget(self.compute_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
-        self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setLabel("bottom", "Time from alignment point", units="s")
-        self.plot_widget.setLabel("left", "Amplitude")
-        self.plot_widget.setMenuEnabled(False)
-        self.plot_widget.addLegend(offset=(10, 10))
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
-        layout.addWidget(self.plot_widget, stretch=1)
+        self.probe_trace_widget = RTAProbeTraceWidget()
+        layout.addWidget(self.probe_trace_widget, stretch=1)
 
         self.status_label = QLabel("Select channels and click Compute Average.")
         self.status_label.setStyleSheet("color: #888; font-size: 10px;")
@@ -168,18 +218,25 @@ class RippleTriggeredAverageDialog(QDialog):
     def _build_param_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
 
-        # ---- Channel picker (multi-select list) ----
+        # ---- Channel picker: current selection list + probe-map button ----
         chan_col = QVBoxLayout()
         chan_col.addWidget(QLabel("Channels:"))
         self.channel_list = QListWidget()
         self.channel_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.channel_list.setMaximumWidth(120)
-        for ch in self.available_channels:
-            item = QListWidgetItem(f"CH{ch}")
-            item.setData(Qt.ItemDataRole.UserRole, ch)
-            self.channel_list.addItem(item)
-            item.setSelected(True)  # default: all channels selected
+        self._populate_channel_list()
         chan_col.addWidget(self.channel_list)
+
+        self.pick_from_probe_btn = QPushButton("Select from Probe Map...")
+        self.pick_from_probe_btn.setAutoDefault(False)
+        self.pick_from_probe_btn.setDefault(False)
+        self.pick_from_probe_btn.setToolTip(
+            "Open a probe map to select channels spatially, instead of "
+            "picking from the plain list above."
+        )
+        self.pick_from_probe_btn.clicked.connect(self._on_pick_from_probe_clicked)
+        chan_col.addWidget(self.pick_from_probe_btn)
+
         row.addLayout(chan_col)
 
         # ---- Params grid ----
@@ -207,17 +264,25 @@ class RippleTriggeredAverageDialog(QDialog):
         self.show_sem_check.toggled.connect(self._on_display_options_changed)
         grid.addWidget(self.show_sem_check, 2, 0, 1, 2)
 
-        self.normalize_check = QCheckBox("Offset channels vertically")
-        self.normalize_check.setChecked(True)
-        self.normalize_check.setToolTip(
-            "Stack channels with a vertical offset (like the main trace "
-            "view) instead of overlaying them at their native scale."
-        )
-        self.normalize_check.toggled.connect(self._on_display_options_changed)
-        grid.addWidget(self.normalize_check, 2, 2, 1, 2)
-
         row.addLayout(grid, stretch=1)
         return row
+
+    def _populate_channel_list(self):
+        self.channel_list.clear()
+        for ch in self.selected_channels:
+            item = QListWidgetItem(f"CH{ch}")
+            item.setData(Qt.ItemDataRole.UserRole, ch)
+            self.channel_list.addItem(item)
+            item.setSelected(True)
+
+    def _on_pick_from_probe_clicked(self):
+        picker = _ProbePickerDialog(self.probe_data, self.selected_channels, parent=self)
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            new_selection = picker.selected_channels()
+            if new_selection:
+                self.selected_channels = new_selection
+                self._populate_channel_list()
+                self.probe_trace_widget.set_geometry_from_probe(self.probe_data, self.selected_channels)
 
     # ------------------------------------------------------------------
     # Compute
@@ -256,6 +321,13 @@ class RippleTriggeredAverageDialog(QDialog):
             QMessageBox.warning(self, "Invalid parameters", str(exc))
             return
 
+        # Channel selection may have changed (via the list or the probe
+        # picker) since the geometry was last set -- keep the probe
+        # trace widget's layout in sync with what's about to be computed.
+        if sorted(params.channels) != sorted(self.selected_channels):
+            self.selected_channels = list(params.channels)
+            self.probe_trace_widget.set_geometry_from_probe(self.probe_data, self.selected_channels)
+
         self.compute_btn.setEnabled(False)
         self.compute_btn.setText("Computing...")
         self.status_label.setText(
@@ -292,61 +364,15 @@ class RippleTriggeredAverageDialog(QDialog):
             self._render(self._last_result)
 
     def _render(self, result: dict):
-        self.plot_widget.clear()
-        # addLegend() only needs to be called once per PlotWidget, but
-        # .clear() above wipes the plot items, not the legend -- however
-        # re-adding a second legend on subsequent renders would stack
-        # duplicate legend entries, so remove and rebuild it explicitly.
-        if self.plot_widget.plotItem.legend is not None:
-            self.plot_widget.plotItem.legend.clear()
-
-        t = result["time_axis"]
-        show_sem = self.show_sem_check.isChecked()
-        offset_channels = self.normalize_check.isChecked()
-
         channels = sorted(result["channels"].keys())
         if not channels:
             self.status_label.setText("No channels in the result to display.")
             return
 
-        # Vertical offset step: if stacking, space channels apart by a
-        # multiple of the largest single channel's peak-to-peak mean
-        # amplitude, so traces don't overlap regardless of relative
-        # scale across channels.
-        offset_step = 0.0
-        if offset_channels:
-            max_ptp = max(float(np.ptp(result["channels"][ch]["mean"])) for ch in channels)
-            offset_step = max_ptp * 1.5 if max_ptp > 0 else 1.0
-
-        for i, ch in enumerate(channels):
-            data = result["channels"][ch]
-            mean = data["mean"]
-            sem = data["sem"]
-            color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
-
-            y_offset = -i * offset_step if offset_channels else 0.0
-
-            if show_sem and data["n_events"] > 1:
-                upper = mean + sem + y_offset
-                lower = mean - sem + y_offset
-                fill_color = QColor(color)
-                fill_color.setAlpha(40)
-                fill = pg.FillBetweenItem(
-                    pg.PlotDataItem(t, upper),
-                    pg.PlotDataItem(t, lower),
-                    brush=pg.mkBrush(fill_color),
-                )
-                self.plot_widget.addItem(fill)
-
-            self.plot_widget.plot(
-                t, mean + y_offset,
-                pen=pg.mkPen(color, width=2),
-                name=f"CH{ch} (n={data['n_events']})",
-            )
-
-        # Vertical marker at the alignment point (t=0).
-        vline = pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen("#ffffff", width=1, style=Qt.PenStyle.DashLine))
-        self.plot_widget.addItem(vline)
+        self.probe_trace_widget.set_result(
+            result["time_axis"], result["channels"],
+            show_sem=self.show_sem_check.isChecked(),
+        )
 
         n_total = result["n_events_total"]
         n_skipped = result["n_events_skipped"]
@@ -365,3 +391,4 @@ class RippleTriggeredAverageDialog(QDialog):
         if self._compute_thread is not None and self._compute_thread.isRunning():
             self._compute_thread.wait(2000)
         super().closeEvent(event)
+
