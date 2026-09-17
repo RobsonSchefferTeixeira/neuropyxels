@@ -443,6 +443,7 @@ class MainWindow(QMainWindow):
             <tr><td><b>Mouse wheel</b></td><td>Scroll</td><td>Scroll through time (10% of window)</td></tr>
             <tr><td><b>Ctrl + wheel</b></td><td>Zoom</td><td>Zoom in/out to cursor</td></tr>
             <tr><td><b>Shift + wheel</b></td><td>Gain</td><td>Adjust signal gain (multiply/divide by 1.15 per notch)</td></tr>
+            <tr><td><b>Ctrl + Shift + wheel</b></td><td>Fast scroll</td><td>Scroll 5x faster</td></tr>
             <tr><td><b>Double-click</b></td><td>Reset</td><td>Reset view to start, default duration</td></tr>
             <tr><td><b>+ / -</b></td><td>Zoom</td><td>Zoom in/out</td></tr>
             <tr><td><b>Left / Right</b></td><td>Step</td><td>Move 10% of window</td></tr>

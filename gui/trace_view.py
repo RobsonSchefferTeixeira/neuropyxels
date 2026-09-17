@@ -2502,42 +2502,57 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
 
     def wheelEvent(self, event):
-        """Handle mouse wheel for scrolling, zooming, and gain."""
+        """Handle mouse wheel for scrolling, zooming, and gain.
+
+        Modifier combos are ordered most-specific first so that Ctrl+Shift
+        is checked before Ctrl alone (otherwise Ctrl alone would swallow it).
+        Alt+wheel is deliberately NOT used: on Windows, holding Alt zeroes
+        out the vertical wheel delta (angleDelta().y() == 0), so Alt+wheel
+        events arrive but carry no usable delta.
+        """
         if not self._data_loaded:
             return
 
         delta = event.angleDelta().y()
         modifiers = event.modifiers()
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
 
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
+        if ctrl and shift:
+            # Ctrl + Shift + wheel: fast scroll (5x).
+            time_delta = (delta / 120.0) * 0.5 * self.window_duration
+            min_start = self._get_min_start_time()
+            max_start = self._get_max_start_time()
+            self.start_time = min(max(min_start, self.start_time - time_delta), max_start)
+            self._update_time_labels()
+            self._invalidate_cache()
+            self.update()
+
+        elif ctrl:
             # Ctrl + wheel: zoom to cursor.
             if delta > 0:
                 self._zoom_to_cursor(1.2, event.position())
             else:
                 self._zoom_to_cursor(1 / 1.2, event.position())
-        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
-            # Shift + wheel: adjust gain. Each notch multiplies/divides
-            # gain by a small factor so repeated scrolls feel gradual.
+
+        elif shift:
+            # Shift + wheel: adjust gain.
             factor = 1.15 if delta > 0 else 1 / 1.15
             new_gain = self.global_gain * factor
             new_gain = max(0.1, min(new_gain, 1000.0))
             self.global_gain = new_gain
-            # Sync the control-panel spinbox without re-emitting gainChanged
-            # (that would loop back through _on_control_gain_changed and
-            # call _invalidate_cache twice; harmless but wasteful).
             self.control_panel.gain_spin.blockSignals(True)
             self.control_panel.gain_spin.setValue(new_gain)
             self.control_panel.gain_spin.blockSignals(False)
             self._invalidate_cache()
             self.update()
+
         else:
             # Plain wheel: scroll through time.
             time_delta = (delta / 120.0) * 0.1 * self.window_duration
             min_start = self._get_min_start_time()
             max_start = self._get_max_start_time()
-            self.start_time = min(
-                max(min_start, self.start_time - time_delta), max_start
-            )
+            self.start_time = min(max(min_start, self.start_time - time_delta), max_start)
             self._update_time_labels()
             self._invalidate_cache()
             self.update()
