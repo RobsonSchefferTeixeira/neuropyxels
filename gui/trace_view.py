@@ -2276,6 +2276,7 @@ class TraceViewWidget(QWidget):
                     finite = np.isfinite(draw_y)
                     if not np.any(finite):
                         continue
+                    
                     if self.auto_scale:
                         finite_vals = draw_y[finite]
                         data_min = float(np.min(finite_vals))
@@ -2283,11 +2284,12 @@ class TraceViewWidget(QWidget):
                         data_range = data_max - data_min
                         if data_range <= 0:
                             data_range = 1.0
-                        scale = (channel_height * 0.40) / data_range
-                        y_offsets = -(draw_y - (data_min + data_max) / 2.0) * scale
+                        normalized = (draw_y - (data_min + data_max) / 2.0) / data_range
+                        y_offsets = -normalized * (channel_height * 0.40) * self.global_gain
                     else:
                         scale = (channel_height * 0.40) / global_range
-                        y_offsets = -(draw_y - (global_min + global_max) / 2.0) * scale
+                        y_offsets = -(draw_y - (global_min + global_max) / 2.0) * scale * self.global_gain
+
                     x_pixels = plot_left + x_ratios * plot_width
                     path = QPainterPath()
                     started = False
