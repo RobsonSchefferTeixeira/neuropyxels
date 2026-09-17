@@ -117,6 +117,7 @@ class TraceControlPanel(QWidget):
     goToStartRequested = pyqtSignal()
     goToEndRequested = pyqtSignal()
     stepTimeRequested = pyqtSignal(int)
+    performanceChanged = pyqtSignal(dict)   
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -341,7 +342,38 @@ class TraceControlPanel(QWidget):
         zoom_layout.addStretch()
         layout.addWidget(zoom_group)
 
+        # ---- Performance section ----
+        perf_group = QGroupBox("Performance")
+        perf_layout = QGridLayout(perf_group)
+        perf_layout.addWidget(QLabel("Optimal pts/ch:"), 0, 0)
+        self.optimal_points_spin = QSpinBox()
+        self.optimal_points_spin.setRange(200, 20000)
+        self.optimal_points_spin.setSingleStep(100)
+        self.optimal_points_spin.setValue(2000)
+        self.optimal_points_spin.setToolTip("Target number of points per channel when zoomed out (min/max decimation).")
+        self.optimal_points_spin.valueChanged.connect(self._on_perf_settings_changed)
+        perf_layout.addWidget(self.optimal_points_spin, 0, 1)
+        perf_layout.addWidget(QLabel("Max total pts:"), 1, 0)
+        self.max_total_points_spin = QSpinBox()
+        self.max_total_points_spin.setRange(10000, 2000000)
+        self.max_total_points_spin.setSingleStep(10000)
+        self.max_total_points_spin.setValue(300000)
+        self.max_total_points_spin.setToolTip("Upper bound on points summed across all visible channels.")
+        self.max_total_points_spin.valueChanged.connect(self._on_perf_settings_changed)
+        perf_layout.addWidget(self.max_total_points_spin, 1, 1)
+        layout.addWidget(perf_group)
+
+
+
+        
+
     # ---- Signal emitters ----
+
+    def _on_perf_settings_changed(self):
+        self.performanceChanged.emit({
+            'optimal_points': self.optimal_points_spin.value(),
+            'max_total_points': self.max_total_points_spin.value(),
+        })
 
     def _on_use_timestamps_toggled(self, checked: bool):
         self.useTimestampsChanged.emit(checked)
@@ -456,6 +488,11 @@ class TraceViewWidget(QWidget):
             'channel_offset': 0.0,
         }
 
+        self.optimal_points_per_channel = 2000
+        self.max_total_points = 300000
+        self._trace_path_cache = {}
+        self._trace_cache_key = None
+
         self._time_cursors: list[int] = []
         self._selected_cursor: int | None = None
         self._dragging_cursor: bool = False
@@ -513,8 +550,8 @@ class TraceViewWidget(QWidget):
 
         # GLOBAL filter settings (Trace Controls panel).
         self.filter_enabled = False
-        self.filter_low_freq = 4.0
-        self.filter_high_freq = 30.0
+        self.filter_low_freq = 1.0
+        self.filter_high_freq = 300.0
         self.filter_order = 4
         self.notch_enabled = False
         self.notch_freq = 50.0
@@ -620,6 +657,8 @@ class TraceViewWidget(QWidget):
         self.control_panel.goToStartRequested.connect(self._go_to_start)
         self.control_panel.goToEndRequested.connect(self._go_to_end)
         self.control_panel.stepTimeRequested.connect(self._step_time)
+        self.control_panel.performanceChanged.connect(self._on_performance_changed)
+
 
     def _build_scrollbar(self, layout: QVBoxLayout):
         self.scrollbar = QScrollBar(Qt.Orientation.Horizontal)
@@ -655,6 +694,13 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
     # Control panel handlers
     # ------------------------------------------------------------------
+
+    def _on_performance_changed(self, settings: dict):
+        self.optimal_points_per_channel = int(settings.get('optimal_points', 2000))
+        self.max_total_points = int(settings.get('max_total_points', 300000))
+        self._trace_cache_key = None
+        self._trace_path_cache.clear()
+        self.update()
 
     def _on_use_timestamps_changed(self, enabled: bool):
         self._use_timestamps = enabled
@@ -1462,11 +1508,7 @@ class TraceViewWidget(QWidget):
         # Determine whether this channel can actually compute a CSD.
         self._ensure_csd_neighbor_table()
         csd_pair = self._csd_neighbors.get(channel)
-        csd_available = (
-            csd_pair is not None
-            and csd_pair[0] is not None
-            and csd_pair[1] is not None
-        )
+        csd_available = (csd_pair is not None and csd_pair[0] is not None and csd_pair[1] is not None)
 
         menu = QMenu(self)
         header = menu.addAction(f"CH{channel} — per-channel display")
@@ -1611,7 +1653,17 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
     # Public color / style API
     # ------------------------------------------------------------------
-
+    def _trace_color_for(self, channel: int, mode: str) -> QColor:
+        """Return the pen color for a given channel/mode pair."""
+        base = self.channel_colors.get(channel, self.default_trace_color)
+        if mode == 'raw':
+            return base
+        if mode == 'filtered':
+            return QColor(base.red(), int(base.green() * 0.85), int(base.blue() * 0.85))
+        if mode == 'csd':
+            return QColor(int(base.red() * 0.6), int(base.green() * 0.9), 255)
+        return base
+        
     def set_trace_color(self, color: str | QColor, channel: int | None = None):
         qcolor = QColor(color) if isinstance(color, str) else color
         if not qcolor.isValid():
@@ -1874,6 +1926,8 @@ class TraceViewWidget(QWidget):
         self._spectrogram_cache_key = None
         if self.show_spectrogram and self.spectrogram_channel is not None:
             self._schedule_spectrogram_update()
+        self._trace_cache_key = None
+        self._trace_path_cache.clear()
 
     def _get_data_for_display(self):
         """Fetch data for the current window, per channel.
@@ -2118,149 +2172,138 @@ class TraceViewWidget(QWidget):
             y = rect.top() + ((plot_bottom - rect.top()) * i / num_h_lines)
             painter.drawLine(int(rect.left()), int(y), int(rect.right()), int(y))
 
-    def _draw_traces(self, painter: QPainter, rect: QRectF, data):
-        """
-        Draw neural traces.
-
-        `data` is {channel: [{'mode': str, 'data': ndarray}, ...]}.
-
-        Mode colors:
-          'global'   -- channel's own color; this is what an
-                        unconfigured channel always draws.
-          'raw'      -- channel's own color (explicit raw for an
-                        overridden channel).
-          'filtered' -- FILTERED_COLOR (light cyan).
-          'csd'      -- CSD_COLOR (orange).
-        """
-        if not data or not self._sorted_channels:
+    def _draw_traces(self, painter: QPainter, rect: QRectF, data: dict):
+        display_channels = self.get_display_order()
+        display_channels = [ch for ch in display_channels if ch in data]
+        n_channels = len(display_channels)
+        if n_channels == 0:
             return
-
         plot_left, plot_right, plot_bottom = self._get_plot_bounds()
         plot_top = rect.top()
         plot_width = plot_right - plot_left
         plot_height = plot_bottom - plot_top
-
         if plot_width <= 0 or plot_height <= 0:
             return
-
-        n_channels = len(self._sorted_channels)
-        if n_channels <= 0:
-            return
         channel_height = plot_height / n_channels
-
-        if self.window_duration <= 0:
+        start_time = float(self.start_time)
+        end_time = start_time + float(self.window_duration)
+        if end_time <= start_time:
             return
-
-        # Shared vertical range per "unit group":
-        #   group 0: global + raw + filtered (all in raw signal units)
-        #   group 1: csd (in µV/µm², orders of magnitude smaller)
-        group_ranges: dict[int, list] = {0: [None, None], 1: [None, None]}
+        max_total = max(1000, int(self.max_total_points))
+        target_per_channel = max(64, int(self.optimal_points_per_channel))
+        if target_per_channel * n_channels > max_total:
+            target_per_channel = max(64, max_total // n_channels)
+        global_min = None
+        global_max = None
         if not self.auto_scale:
-            for channel in self._sorted_channels:
-                if channel not in data:
-                    continue
+            for channel in display_channels:
                 for trace in data[channel]:
-                    g = 1 if trace['mode'] == 'csd' else 0
-                    arr = np.asarray(trace['data'], dtype=np.float64)
-                    if arr.size == 0:
+                    channel_data = np.asarray(trace['data'], dtype=np.float64)
+                    if channel_data.size == 0:
                         continue
-                    finite = np.isfinite(arr)
+                    finite = np.isfinite(channel_data)
                     if not np.any(finite):
                         continue
-                    arr = arr[finite]
-                    ch_min = float(np.min(arr))
-                    ch_max = float(np.max(arr))
-                    if group_ranges[g][0] is None or ch_min < group_ranges[g][0]:
-                        group_ranges[g][0] = ch_min
-                    if group_ranges[g][1] is None or ch_max > group_ranges[g][1]:
-                        group_ranges[g][1] = ch_max
-
-        for g in (0, 1):
-            if group_ranges[g][0] is None or group_ranges[g][1] is None:
-                group_ranges[g] = (-1.0, 1.0, 2.0)
-            else:
-                gmin, gmax = group_ranges[g]
-                grange = gmax - gmin
-                if grange <= 0:
-                    grange = 1.0
-                group_ranges[g] = (gmin, gmax, grange)
-
-        max_points = max(200, int(plot_width * 2))
-
-        for idx, channel in enumerate(self._sorted_channels):
-            if channel not in data:
-                continue
-
+                    finite_vals = channel_data[finite]
+                    ch_min = float(np.min(finite_vals))
+                    ch_max = float(np.max(finite_vals))
+                    if global_min is None or ch_min < global_min:
+                        global_min = ch_min
+                    if global_max is None or ch_max > global_max:
+                        global_max = ch_max
+        if global_min is None or global_max is None:
+            global_min = -1.0
+            global_max = 1.0
+        global_range = global_max - global_min
+        if global_range <= 0:
+            global_range = 1.0
+        cache_key = (
+            round(start_time, 6),
+            round(float(self.window_duration), 6),
+            round(float(self._channel_offset), 6),
+            round(float(self.global_gain), 6),
+            bool(self.auto_scale),
+            bool(self.filter_enabled),
+            round(float(self.filter_low_freq), 3),
+            round(float(self.filter_high_freq), 3),
+            bool(self.notch_enabled),
+            round(float(self.notch_freq), 3),
+            bool(self.detrend_enabled),
+            int(target_per_channel),
+            tuple(display_channels),
+            tuple(tuple(t['mode'] for t in data[c]) for c in display_channels),
+        )
+        if cache_key != self._trace_cache_key:
+            self._trace_path_cache = {}
+            self._trace_cache_key = cache_key
+        for idx, channel in enumerate(display_channels):
             y_center = plot_bottom - (idx + 0.5) * channel_height + self._channel_offset * channel_height
             if y_center + channel_height < plot_top or y_center - channel_height > plot_bottom:
                 continue
-
-            for trace in data[channel]:
-                arr = np.asarray(trace['data'], dtype=np.float64)
-                if arr.size == 0:
-                    continue
-
-                mode = trace['mode']
-
-                if mode in ('global', 'raw'):
-                    color = self.channel_colors.get(channel, self.default_trace_color)
-                    width = self.trace_width
-                elif mode == 'filtered':
-                    color = QColor(FILTERED_COLOR)
-                    width = self.trace_width + 0.2
-                else:  # csd
-                    color = QColor(CSD_COLOR)
-                    width = self.trace_width
-
-                n_samples = len(arr)
-                if n_samples > max_points:
-                    step = int(np.ceil(n_samples / max_points))
-                    draw_data = arr[::step]
-                else:
-                    draw_data = arr
-                if draw_data.size == 0:
-                    continue
-
-                finite = np.isfinite(draw_data)
-                if not np.any(finite):
-                    continue
-
-                if self.auto_scale:
-                    finite_values = draw_data[finite]
-                    data_min = float(np.min(finite_values))
-                    data_max = float(np.max(finite_values))
-                    data_range = data_max - data_min
-                    if data_range <= 0:
-                        data_range = 1.0
-                    scale = (channel_height * 0.40) / data_range * self.global_gain
-                    y_values = y_center - (draw_data - (data_min + data_max) / 2.0) * scale
-                else:
-                    g = 1 if mode == 'csd' else 0
-                    g_min, g_max, g_range = group_ranges[g]
-                    scale = (channel_height * 0.40) / g_range * self.global_gain
-                    y_values = y_center - (draw_data - (g_min + g_max) / 2.0) * scale
-
-                n_draw = len(draw_data)
-                if n_draw == 1:
-                    x_values = np.array([plot_left], dtype=np.float64)
-                else:
-                    x_values = np.linspace(plot_left, plot_right, n_draw)
-
-                path = QPainterPath()
-                started = False
-                for x, y, valid in zip(x_values, y_values, np.isfinite(draw_data)):
-                    if not valid or not np.isfinite(y):
-                        started = False
+            traces = data[channel]
+            if not traces:
+                continue
+            for trace_idx, trace in enumerate(traces):
+                cached = self._trace_path_cache.get((channel, trace_idx))
+                if cached is None:
+                    channel_data = np.asarray(trace['data'], dtype=np.float64)
+                    if channel_data.size == 0:
                         continue
-                    y = float(np.clip(y, plot_top, plot_bottom))
-                    if not started:
-                        path.moveTo(float(x), y)
-                        started = True
+                    n_samples = channel_data.size
+                    if n_samples <= target_per_channel:
+                        draw_y = channel_data
+                        x_ratios = np.linspace(0.0, 1.0, n_samples) if n_samples > 1 else np.array([0.0])
                     else:
-                        path.lineTo(float(x), y)
+                        decimated_samples, decimated_values, s_idx, e_idx = self.engine.get_decimated_segment(channel, start_time, end_time, target_per_channel)
+                        if decimated_values.size == 0:
+                            continue
+                        draw_y = decimated_values
+                        if e_idx > s_idx:
+                            x_ratios = (decimated_samples - s_idx) / float(e_idx - s_idx)
+                        else:
+                            x_ratios = np.linspace(0.0, 1.0, decimated_values.size)
+                    finite = np.isfinite(draw_y)
+                    if not np.any(finite):
+                        continue
+                    if self.auto_scale:
+                        finite_vals = draw_y[finite]
+                        data_min = float(np.min(finite_vals))
+                        data_max = float(np.max(finite_vals))
+                        data_range = data_max - data_min
+                        if data_range <= 0:
+                            data_range = 1.0
+                        scale = (channel_height * 0.40) / data_range
+                        y_offsets = -(draw_y - (data_min + data_max) / 2.0) * scale
+                    else:
+                        scale = (channel_height * 0.40) / global_range
+                        y_offsets = -(draw_y - (global_min + global_max) / 2.0) * scale
+                    x_pixels = plot_left + x_ratios * plot_width
+                    path = QPainterPath()
+                    started = False
+                    for x, y_off, ok in zip(x_pixels, y_offsets, finite):
+                        if not ok:
+                            started = False
+                            continue
+                        y = y_center + float(y_off)
+                        if y < plot_top:
+                            y = plot_top
+                        elif y > plot_bottom:
+                            y = plot_bottom
+                        if not started:
+                            path.moveTo(float(x), float(y))
+                            started = True
+                        else:
+                            path.lineTo(float(x), float(y))
+                    self._trace_path_cache[(channel, trace_idx)] = path
+                    cached = path
+                color = self._trace_color_for(channel, trace.get('mode', 'raw'))
+                pen = QPen(color, self.trace_width)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(cached)
 
-                painter.setPen(QPen(color, width))
-                painter.drawPath(path)
+                
 
     def _draw_time_axis(self, painter: QPainter, rect: QRectF):
         painter.setPen(QColor("#888888"))

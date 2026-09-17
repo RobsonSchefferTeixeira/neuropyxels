@@ -341,7 +341,64 @@ class TraceEngine:
             return np.array([])
         return self.data[start_idx:end_idx, channel]
 
+    def get_decimated_segment(self, channel: int, start_time: float, end_time: float, target_points: int) -> tuple[np.ndarray, np.ndarray, int, int]:
+        """
+        Fetch a channel's data over [start_time, end_time) and reduce it to at most
+        ~target_points min/max pairs using numpy binning.
 
+        Returns
+        -------
+        x_samples : (n_out,) int array — sample indices of the output points
+        y_values  : (n_out,) float array — data values at those samples
+        start_idx : int — first sample index of the source window
+        end_idx   : int — one past the last sample index
+
+        The output is ordered so that plotting (x_samples, y_values) as a polyline
+        reproduces the visual envelope of the original signal: within each bin the
+        min and max are emitted in whichever order matches the original signal's
+        direction, so spikes and troughs are preserved even when the bin is much
+        wider than 1 sample.
+        """
+        if not self.data_loaded:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.float64), 0, 0
+        start_idx, end_idx = self.get_time_window_sample_range(start_time, end_time)
+        n_samples = end_idx - start_idx
+        if n_samples <= 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.float64), start_idx, end_idx
+        if target_points >= n_samples:
+            samples = np.arange(start_idx, end_idx, dtype=np.int64)
+            values = np.asarray(self.data[start_idx:end_idx, channel], dtype=np.float64)
+            return samples, values, start_idx, end_idx
+        bin_size = int(np.ceil(n_samples / target_points))
+        n_bins = int(np.ceil(n_samples / bin_size))
+        padded_len = n_bins * bin_size
+        raw = np.asarray(self.data[start_idx:end_idx, channel], dtype=np.float64)
+        if raw.size < padded_len:
+            raw = np.concatenate([raw, np.full(padded_len - raw.size, np.nan)])
+        reshaped = raw.reshape(n_bins, bin_size)
+        all_nan = np.all(np.isnan(reshaped), axis=1)
+        with np.errstate(invalid="ignore"):
+            min_vals = np.nanmin(reshaped, axis=1)
+            max_vals = np.nanmax(reshaped, axis=1)
+        min_vals[all_nan] = np.nan
+        max_vals[all_nan] = np.nan
+        argmin_vals = np.nanargmin(np.where(np.isnan(reshaped), np.inf, reshaped), axis=1)
+        argmax_vals = np.nanargmax(np.where(np.isnan(reshaped), -np.inf, reshaped), axis=1)
+        argmin_vals[all_nan] = 0
+        argmax_vals[all_nan] = 0
+        min_samples = start_idx + np.arange(n_bins) * bin_size + argmin_vals
+        max_samples = start_idx + np.arange(n_bins) * bin_size + argmax_vals
+        min_first = argmin_vals <= argmax_vals
+        x_samples = np.empty(n_bins * 2, dtype=np.int64)
+        y_values = np.empty(n_bins * 2, dtype=np.float64)
+        x_samples[0::2] = np.where(min_first, min_samples, max_samples)
+        x_samples[1::2] = np.where(min_first, max_samples, min_samples)
+        y_values[0::2] = np.where(min_first, min_vals, max_vals)
+        y_values[1::2] = np.where(min_first, max_vals, min_vals)
+        valid = ~np.isnan(y_values)
+        x_samples = x_samples[valid]
+        y_values = y_values[valid]
+        return x_samples, y_values, start_idx, end_idx
 
     def timestamp_to_sample(self, timestamp: float) -> int:
         """Convert a timestamp value to a sample index."""
