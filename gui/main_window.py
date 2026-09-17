@@ -951,7 +951,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_channels_selected(self, channels: list):
-        """Handle channel selection from probe map."""
+        """Handle channel selection from probe map.
+
+        Called with an empty list when the probe map's Clear button is
+        pressed, so the trace view must explicitly be told to drop all
+        channels -- guarding on `channels` being truthy here would leave
+        the trace view showing whatever was last displayed (the Clear
+        button would appear to do nothing).
+        """
         self.selected_list.clear()
         for ch in channels:
             self.selected_list.addItem(QListWidgetItem(f"CH{ch}"))
@@ -959,15 +966,16 @@ class MainWindow(QMainWindow):
             f"Selected Channels ({len(channels)})"
         )
 
-        # Update trace view if data is loaded
-        if self.engine.data_loaded and channels:
+        # Update trace view whenever data is loaded -- including for the
+        # empty-channel case, so Clear actually empties the plot.
+        if self.engine.data_loaded:
             self.trace_view.set_channels(channels)
 
             # Pass depth, x, AND shank info to trace view. Shank info is
             # required for CSD: the 3-point Laplacian is taken within a
             # shank, never across. x-coords are used to break ties among
             # same-depth candidates.
-            if self._current_probe_key and self._probes:
+            if channels and self._current_probe_key and self._probes:
                 probe_data = self._probes["probes"][self._current_probe_key]
                 depths = dict(zip(
                     probe_data["coordinates"]["channels"],
@@ -991,7 +999,7 @@ class MainWindow(QMainWindow):
                 # physical neighbors of a channel, regardless of
                 # whether they happen to be drawn right now.
                 self.trace_view.set_full_probe_geometry(depths, shank_map, xcoords)
-                
+
         if hasattr(self, 'trace_style_panel'):
             self.trace_style_panel.update_channels()
 

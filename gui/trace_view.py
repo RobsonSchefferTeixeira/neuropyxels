@@ -1772,14 +1772,25 @@ class TraceViewWidget(QWidget):
         return 0.0
 
     def set_channels(self, channels: list[int]):
+        """Set which channels to display."""
         self.channels = channels
         self._sort_channels_by_depth()
+
         if hasattr(self, 'control_panel') and hasattr(self.control_panel, 'channel_info_label'):
-            self.control_panel.channel_info_label.setText(f"{len(channels)} channels selected")
+            if channels:
+                self.control_panel.channel_info_label.setText(f"{len(channels)} channels selected")
+            else:
+                self.control_panel.channel_info_label.setText("No channels")
+
         if hasattr(self, 'spectrogram_control'):
             self.spectrogram_control.set_channels(channels)
             if channels:
                 self.spectrogram_control.set_channel(channels[0])
+
+        if not channels:
+            self._trace_path_cache = {}
+            self._trace_cache_key = None
+
         self._invalidate_cache()
         self.update()
 
