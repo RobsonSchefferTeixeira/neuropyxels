@@ -746,6 +746,7 @@ class TraceViewWidget(QWidget):
         self.set_animation_speed(speed_ms)
 
     def _on_control_filter_changed(self, settings: dict):
+        print(f"[CTRL] filter_changed: {settings}")
         self.filter_enabled = settings.get('bandpass_enabled', False)
         self.filter_low_freq = settings.get('low_freq', 1.0)
         self.filter_high_freq = settings.get('high_freq', 300.0)
@@ -1620,6 +1621,8 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _apply_filters(self, data: np.ndarray) -> np.ndarray:
+        print(f"[FILTER] enabled={self.filter_enabled} low={self.filter_low_freq} high={self.filter_high_freq} shape={data.shape}")
+
         """Apply all enabled global filters."""
         if not self.filter_enabled and not self.notch_enabled and not self.detrend_enabled:
             return data
@@ -1970,11 +1973,15 @@ class TraceViewWidget(QWidget):
         for ch in self.channels:
             try:
                 raw = self.engine.get_channel_data(ch, self.start_time, end_time)
+
             except Exception as e:
                 print(f"Error getting channel {ch}: {e}")
                 continue
             if raw is None or len(raw) == 0:
                 continue
+
+            print(f"[DATA] ch={ch} override={self._has_channel_override(ch)} global_active={global_filter_active} modes={self.channel_display_modes.get(ch)}")
+
 
             if self._has_channel_override(ch):
                 modes = self.channel_display_modes[ch]
@@ -2260,19 +2267,16 @@ class TraceViewWidget(QWidget):
                     channel_data = np.asarray(trace['data'], dtype=np.float64)
                     if channel_data.size == 0:
                         continue
+
                     n_samples = channel_data.size
                     if n_samples <= target_per_channel:
                         draw_y = channel_data
                         x_ratios = np.linspace(0.0, 1.0, n_samples) if n_samples > 1 else np.array([0.0])
                     else:
-                        decimated_samples, decimated_values, s_idx, e_idx = self.engine.get_decimated_segment(channel, start_time, end_time, target_per_channel)
-                        if decimated_values.size == 0:
+                        draw_y, x_ratios = self._decimate_minmax(channel_data, target_per_channel)
+                        if draw_y.size == 0:
                             continue
-                        draw_y = decimated_values
-                        if e_idx > s_idx:
-                            x_ratios = (decimated_samples - s_idx) / float(e_idx - s_idx)
-                        else:
-                            x_ratios = np.linspace(0.0, 1.0, decimated_values.size)
+
                     finite = np.isfinite(draw_y)
                     if not np.any(finite):
                         continue
@@ -2316,7 +2320,61 @@ class TraceViewWidget(QWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPath(cached)
 
-                
+    def _decimate_minmax(self, data: np.ndarray, target_points: int) -> tuple[np.ndarray, np.ndarray]:
+        """Min/max decimate a 1-D array to at most ~2*target_points values,
+        preserving peaks and troughs.
+
+        This operates on the array PASSED IN, not on engine.data. That is
+        the whole point: the caller may be handing us a filtered (or CSD)
+        array, and decimating directly from the engine's raw memmap would
+        silently discard the filter/CSD result and draw raw data. This was
+        the actual cause of the "filter does nothing when min/max
+        decimation kicks in" bug.
+
+        Returns (y_values, x_ratios), where x_ratios spans [0, 1] over the
+        original array's extent, so the caller can map it to pixels
+        without needing to know absolute sample indices.
+        """
+        n = data.size
+        if n == 0:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+        if target_points < 2 or n <= target_points:
+            y = data.astype(np.float64, copy=False)
+            x = np.linspace(0.0, 1.0, n) if n > 1 else np.array([0.0])
+            return y, x
+        bin_size = int(np.ceil(n / target_points))
+        n_bins = int(np.ceil(n / bin_size))
+        padded_len = n_bins * bin_size
+        if n < padded_len:
+            padded = np.concatenate([data, np.full(padded_len - n, np.nan)])
+        else:
+            padded = data[:padded_len]
+        reshaped = padded.reshape(n_bins, bin_size)
+        all_nan = np.all(np.isnan(reshaped), axis=1)
+        with np.errstate(invalid="ignore"):
+            min_vals = np.nanmin(reshaped, axis=1)
+            max_vals = np.nanmax(reshaped, axis=1)
+        min_vals[all_nan] = np.nan
+        max_vals[all_nan] = np.nan
+        argmin_vals = np.nanargmin(np.where(np.isnan(reshaped), np.inf, reshaped), axis=1)
+        argmax_vals = np.nanargmax(np.where(np.isnan(reshaped), -np.inf, reshaped), axis=1)
+        argmin_vals[all_nan] = 0
+        argmax_vals[all_nan] = 0
+        bin_starts = np.arange(n_bins) * bin_size
+        min_samples = bin_starts + argmin_vals
+        max_samples = bin_starts + argmax_vals
+        min_first = argmin_vals <= argmax_vals
+        x_out = np.empty(n_bins * 2, dtype=np.float64)
+        y_out = np.empty(n_bins * 2, dtype=np.float64)
+        x_out[0::2] = np.where(min_first, min_samples, max_samples)
+        x_out[1::2] = np.where(min_first, max_samples, min_samples)
+        y_out[0::2] = np.where(min_first, min_vals, max_vals)
+        y_out[1::2] = np.where(min_first, max_vals, min_vals)
+        valid = ~np.isnan(y_out)
+        x_out = x_out[valid]
+        y_out = y_out[valid]
+        x_ratios = x_out / max(1, n - 1)
+        return y_out, x_ratios  
 
     def _draw_time_axis(self, painter: QPainter, rect: QRectF):
         painter.setPen(QColor("#888888"))
