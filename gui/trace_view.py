@@ -67,6 +67,8 @@ from core.filters import bandpass_filter, notch_filter, hilbert
 from scipy.signal import spectrogram, butter, sosfiltfilt, resample_poly
 from matplotlib import colormaps
 
+from gui.channel_options_panel import ChannelOptionsPanel, ChannelOptions
+from core.phase_amplitude import PhaseAmplitudeAnalyzer
 
 # Default colors for the three per-channel display signals. The 'raw'
 # mode uses each channel's own color (default_trace_color or a
@@ -118,6 +120,8 @@ class TraceControlPanel(QWidget):
     goToEndRequested = pyqtSignal()
     stepTimeRequested = pyqtSignal(int)
     performanceChanged = pyqtSignal(dict)   
+    globalFilterEnabledChanged = pyqtSignal(bool)
+    resetChannelCustomizationsRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -248,6 +252,17 @@ class TraceControlPanel(QWidget):
 
         bp_row = QHBoxLayout()
         bp_row.setSpacing(2)
+
+        self.global_filter_checkbox = QCheckBox("Enable global filtering")
+        self.global_filter_checkbox.setChecked(False)
+        self.global_filter_checkbox.setToolTip(
+            "When off, per-channel customization (if any) is authoritative. "
+            "When on, applies to channels with no customization, and to the "
+            "Raw trace of channels whose per-channel panel has Raw enabled."
+        )
+        self.global_filter_checkbox.toggled.connect(self._on_global_filter_toggled)
+        filter_layout.addWidget(self.global_filter_checkbox)
+
         self.filter_checkbox = QCheckBox("Bandpass:")
         self.filter_checkbox.toggled.connect(self._on_filter_toggled)
         bp_row.addWidget(self.filter_checkbox)
@@ -289,8 +304,19 @@ class TraceControlPanel(QWidget):
         filter_layout.addLayout(notch_row)
 
         self.detrend_checkbox = QCheckBox("Detrend (remove DC offset)")
+        self.detrend_checkbox.setEnabled(False)
         self.detrend_checkbox.toggled.connect(self._on_detrend_toggled)
         filter_layout.addWidget(self.detrend_checkbox)
+
+
+        self.reset_channel_options_btn = QPushButton("Reset All Channel Customizations")
+        self.reset_channel_options_btn.setToolTip(
+            "Clear every per-channel customization. Channels will fall "
+            "back to the global filter settings."
+        )
+        self.reset_channel_options_btn.clicked.connect(self._on_reset_channel_options)
+        filter_layout.addWidget(self.reset_channel_options_btn)
+
 
         layout.addWidget(filter_group)
 
@@ -368,6 +394,9 @@ class TraceControlPanel(QWidget):
         
 
     # ---- Signal emitters ----
+
+    def _on_reset_channel_options(self):
+        self.resetChannelCustomizationsRequested.emit()
 
     def _on_perf_settings_changed(self):
         self.performanceChanged.emit({
@@ -458,6 +487,26 @@ class TraceControlPanel(QWidget):
         self.animation_btn.setText("⏸ Pause" if playing else "▶ Play")
 
 
+    def _on_global_filter_toggled(self, checked: bool):
+        """Enable/disable the whole global filter block, and re-emit
+        the current filter settings so the trace view can update."""
+        self.filter_checkbox.setEnabled(checked)
+        self.notch_checkbox.setEnabled(checked)
+        self.detrend_checkbox.setEnabled(checked)
+        if not checked:
+            # Keep the existing values but disable their sub-controls;
+            # when the user re-enables, they come back as they were.
+            self.low_freq_spin.setEnabled(False)
+            self.high_freq_spin.setEnabled(False)
+            self.notch_freq_spin.setEnabled(False)
+        else:
+            self.low_freq_spin.setEnabled(self.filter_checkbox.isChecked())
+            self.high_freq_spin.setEnabled(self.filter_checkbox.isChecked())
+            self.notch_freq_spin.setEnabled(self.notch_checkbox.isChecked())
+        self.globalFilterEnabledChanged.emit(checked)
+        self._emit_filter_settings()
+
+
 class TraceViewWidget(QWidget):
     """
     Scrollable trace display for neural data.
@@ -505,6 +554,22 @@ class TraceViewWidget(QWidget):
 
         self.channels: list[int] = []
         self._sorted_channels: list[int] = []
+
+        self._channel_options: dict[int, ChannelOptions] = {}
+        self._channel_options_panel: ChannelOptionsPanel | None = None
+        self._channel_options_panel_channel: int | None = None
+        self._global_filter_enabled = False
+        self._probe_data: dict | None = None
+        self._csd_analyzer: PhaseAmplitudeAnalyzer | None = None
+        self._channel_buttons: dict[int, "QPushButton"] = {}
+
+        # ---- CSD / probe geometry ----
+        self._probe_data: dict | None = None
+        self._csd_analyzer: PhaseAmplitudeAnalyzer | None = None
+        self._full_probe_depths: dict | None = None
+        self._full_probe_shanks: dict | None = None
+        self._full_probe_xcoords: dict | None = None
+
 
         # ---- Display-selection geometry ----
         # Depth/shank/x for the channels the user has SELECTED for
@@ -658,6 +723,8 @@ class TraceViewWidget(QWidget):
         self.control_panel.goToEndRequested.connect(self._go_to_end)
         self.control_panel.stepTimeRequested.connect(self._step_time)
         self.control_panel.performanceChanged.connect(self._on_performance_changed)
+        self.control_panel.globalFilterEnabledChanged.connect(self._on_global_filter_enabled_changed)
+        self.control_panel.resetChannelCustomizationsRequested.connect(self._on_reset_all_channel_options)
 
 
     def _build_scrollbar(self, layout: QVBoxLayout):
@@ -694,6 +761,32 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
     # Control panel handlers
     # ------------------------------------------------------------------
+
+    def _on_global_filter_enabled_changed(self, enabled: bool):
+        self._global_filter_enabled = bool(enabled)
+        self._filtered_cache.clear()
+        self._invalidate_cache()
+        self.update()
+
+    def _on_reset_all_channel_options(self):
+        from PyQt6.QtWidgets import QMessageBox
+        if not self._channel_options:
+            return
+        reply = QMessageBox.question(
+            self, "Reset Channel Customizations",
+            "This will erase all per-channel customizations.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._channel_options.clear()
+        if self._channel_options_panel is not None:
+            self._channel_options_panel.close()
+            self._channel_options_panel = None
+            self._channel_options_panel_channel = None
+        self._invalidate_cache()
+        self.update()
 
     def _on_performance_changed(self, settings: dict):
         self.optimal_points_per_channel = int(settings.get('optimal_points', 2000))
@@ -1241,6 +1334,116 @@ class TraceViewWidget(QWidget):
     # Channels / depths / shanks / x-coords
     # ------------------------------------------------------------------
 
+    def _get_channel_options(self, channel: int) -> ChannelOptions:
+        """Return the current options for a channel, creating a default
+        entry if none exists yet. The default is Raw-only (matches the
+        'opens with Show Raw checked' contract for the panel)."""
+        opts = self._channel_options.get(channel)
+        if opts is None:
+            opts = ChannelOptions()
+            self._channel_options[channel] = opts
+        return opts
+
+    def _has_channel_override(self, channel: int) -> bool:
+        """True if this channel has any non-default customization active
+        (i.e. the user has opened its panel and changed something, or a
+        ChannelOptions entry exists with more than just raw)."""
+        opts = self._channel_options.get(channel)
+        if opts is None:
+            return False
+        return not opts.is_default()
+
+    def _open_channel_options_panel(self, channel: int):
+        """Open (or refocus) the floating panel for a channel. Closes
+        any panel already open for a different channel."""
+        if (
+            self._channel_options_panel is not None
+            and self._channel_options_panel_channel == channel
+            and self._channel_options_panel.isVisible()
+        ):
+            self._channel_options_panel.raise_()
+            self._channel_options_panel.activateWindow()
+            return
+
+        if self._channel_options_panel is not None:
+            self._channel_options_panel.close()
+            self._channel_options_panel = None
+            self._channel_options_panel_channel = None
+
+        opts = self._get_channel_options(channel)
+
+        panel = ChannelOptionsPanel(channel, opts, parent=self)
+        panel.optionsChanged.connect(self._on_channel_options_changed)
+        panel.closed.connect(self._on_channel_options_panel_closed)        
+        self._channel_options_panel = panel
+        self._channel_options_panel_channel = channel
+        
+        btn = self._channel_buttons.get(channel)
+        if btn is not None:
+            try:
+                global_pos = btn.mapToGlobal(btn.rect().bottomRight())
+                from PyQt6.QtGui import QGuiApplication
+                screen = QGuiApplication.screenAt(global_pos) or QGuiApplication.primaryScreen()
+                if screen is not None:
+                    avail = screen.availableGeometry()
+                    # After the panel is shown and has a size, clamp.
+                    panel.adjustSize()
+                    w, h = panel.sizeHint().width(), panel.sizeHint().height()
+                    x = min(global_pos.x(), avail.right() - w)
+                    y = min(global_pos.y(), avail.bottom() - h)
+                    x = max(x, avail.left())
+                    y = max(y, avail.top())
+                    panel.move(x, y)
+                else:
+                    panel.move(global_pos)
+            except RuntimeError:
+                pass
+        panel.show()
+
+        # Trigger an initial CSD availability check so the status line
+        # is populated as soon as the panel opens.
+        self._refresh_csd_status_for(channel)
+
+
+
+    def _on_channel_options_panel_closed(self):
+        """Called when the panel hides itself (user pressed X, pressed
+        Escape, or clicked outside). Drops our reference so the next
+        click on the same channel's button reopens instead of just
+        refocusing a hidden panel."""
+        self._channel_options_panel = None
+        self._channel_options_panel_channel = None
+
+    def _on_channel_options_changed(self, channel: int, opts: ChannelOptions):
+        self._channel_options[channel] = opts
+        self._refresh_csd_status_for(channel)
+        self._invalidate_cache()
+        self.update()
+
+    def _refresh_csd_status_for(self, channel: int):
+        """Compute whether CSD is available for this channel at its
+        currently configured distance, and report it in the panel."""
+        if self._channel_options_panel is None:
+            return
+        if self._channel_options_panel_channel != channel:
+            return
+        opts = self._get_channel_options(channel)
+        if not opts.show_csd:
+            self._channel_options_panel.set_csd_status("", "info")
+            return
+        analyzer = self._get_csd_analyzer()
+        if analyzer is None:
+            self._channel_options_panel.set_csd_status(
+                "Probe geometry not available for CSD.", "warning"
+            )
+            return
+        check = analyzer.check_csd_availability(channel, opts.csd_distance)
+        if check.get("available"):
+            self._channel_options_panel.set_csd_status(check["message"], "ok")
+        else:
+            self._channel_options_panel.set_csd_status(check["message"], "warning")
+
+            
     def set_channel_depths(self, depths: dict[int, float]):
         self.channel_depths = depths
         self._sort_channels_by_depth()
@@ -1265,20 +1468,25 @@ class TraceViewWidget(QWidget):
         self._csd_neighbor_table_valid = False
         self._invalidate_cache()
 
-    def set_full_probe_geometry(self,
-                                 depths: dict[int, float],
-                                 shanks: dict[int, int],
-                                 xcoords: dict[int, float]):
-        """Set the FULL probe geometry (every channel on the probe, not
-        just the ones currently selected for display). CSD neighbor
-        lookup uses ONLY this geometry, so the Laplacian always uses
-        each channel's physically-adjacent same-shank neighbors -- even
-        if those neighbors aren't currently being drawn."""
-        self.full_probe_depths = dict(depths)
-        self.full_probe_shanks = dict(shanks)
-        self.full_probe_xcoords = dict(xcoords)
-        self._csd_neighbor_table_valid = False
-        self._invalidate_cache()
+    def set_full_probe_geometry(self, depths, shanks, xcoords):
+        """Store the full-probe geometry and build the probe_data dict
+        that PhaseAmplitudeAnalyzer wants for CSD neighbor lookup."""
+        self._full_probe_depths = depths
+        self._full_probe_shanks = shanks
+        self._full_probe_xcoords = xcoords
+        if depths and shanks and xcoords:
+            channels = sorted(depths.keys())
+            self._probe_data = {
+                "coordinates": {
+                    "channels": channels,
+                    "y": [depths[c] for c in channels],
+                    "x": [xcoords[c] for c in channels],
+                },
+                "shanks": {
+                    "ids": [shanks[c] for c in channels],
+                },
+            }
+            self._csd_analyzer = None  # invalidate cache
 
     def _xcoord_of(self, channel: int) -> float | None:
         """Return the x-coordinate for a channel, or None if unknown."""
@@ -1794,6 +2002,16 @@ class TraceViewWidget(QWidget):
             self._trace_path_cache = {}
             self._trace_cache_key = None
 
+        # Close the per-channel options panel if its channel is no
+        # longer in the selection -- the button that opened it is gone,
+        # so leaving the panel floating for an invisible channel would
+        # be a dangling UI element.
+        if self._channel_options_panel is not None:
+            if self._channel_options_panel_channel not in channels:
+                self._channel_options_panel.close()
+                self._channel_options_panel = None
+                self._channel_options_panel_channel = None
+
         self._invalidate_cache()
         self.update()
 
@@ -1946,69 +2164,59 @@ class TraceViewWidget(QWidget):
     def _get_data_for_display(self):
         """Fetch data for the current window, per channel.
 
-        Returns { channel: [ {'mode': str, 'data': ndarray}, ... ] }.
-
-        Two cases per channel:
-          - No per-channel override (default): follow the global
-            pipeline. If a global filter is active, the drawn signal
-            is the filtered version (mode tag 'global' for coloring
-            purposes); otherwise raw (mode tag 'global').
-          - Per-channel override: draw ONLY the signals the user
-            explicitly listed. Global filter is bypassed.
+        Returns {channel: [{'mode': 'raw'|'filtered'|'csd'|'global',
+                            'data': ndarray}, ...]}.
         """
         if not self._data_loaded or not self.channels:
             return None
-
         if self._cached_data is not None and self._cache_start is not None:
-            if self._cache_start <= self.start_time and self._cache_end >= self.start_time + self.window_duration:
+            if (self._cache_start <= self.start_time
+                    and self._cache_end >= self.start_time + self.window_duration):
                 return self._cached_data
 
         end_time = self.start_time + self.window_duration
-        start_idx, end_idx = self.engine.get_time_window_sample_range(self.start_time, end_time)
-
-        global_filter_active = self.filter_enabled or self.notch_enabled or self.detrend_enabled
+        start_idx, end_idx = self.engine.get_time_window_sample_range(
+            self.start_time, end_time
+        )
+        global_filter_on = self._global_filter_enabled
+        global_filter_active = global_filter_on and (
+            self.filter_enabled or self.notch_enabled or self.detrend_enabled
+        )
 
         data: dict[int, list[dict]] = {}
 
         for ch in self.channels:
             try:
                 raw = self.engine.get_channel_data(ch, self.start_time, end_time)
-
             except Exception as e:
                 print(f"Error getting channel {ch}: {e}")
                 continue
             if raw is None or len(raw) == 0:
                 continue
 
-            print(f"[DATA] ch={ch} override={self._has_channel_override(ch)} global_active={global_filter_active} modes={self.channel_display_modes.get(ch)}")
+            opts = self._channel_options.get(ch)
+            has_override = opts is not None and not opts.is_default()
 
-
-            if self._has_channel_override(ch):
-                modes = self.channel_display_modes[ch]
+            if has_override:
+                # Per-channel overrides are authoritative. Global filter
+                # applies only to the Raw trace of this channel.
                 traces: list[dict] = []
-
-                if modes.get('raw'):
-                    traces.append({'mode': 'raw', 'data': raw})
-
-                if modes.get('filtered'):
-                    filtered = self._apply_filters(raw) if global_filter_active else raw
+                if opts.show_raw:
+                    raw_trace = self._apply_filters(raw) if global_filter_active else raw
+                    traces.append({'mode': 'raw', 'data': raw_trace})
+                if opts.show_filtered:
+                    filtered = self._apply_channel_filter(raw, opts.filter_low, opts.filter_high)
                     traces.append({'mode': 'filtered', 'data': filtered})
-
-                if modes.get('csd'):
-                    csd = self._compute_csd_for_channel(ch, basis=raw)
+                if opts.show_csd:
+                    csd = self._compute_channel_csd(ch, raw, opts, end_time)
                     if csd is not None:
                         traces.append({'mode': 'csd', 'data': csd})
-                    # If csd is None, that means this channel has no
-                    # valid both-sided neighbor pair. We deliberately
-                    # do NOT fall back to raw -- falling back would
-                    # make the display ambiguous.
-
-                if not traces:
-                    traces.append({'mode': 'raw', 'data': raw})
-
+                # Even with an override, we may end up with zero traces
+                # (all three unchecked) -- that's a valid state: the
+                # lane is reserved and shown empty.
                 data[ch] = traces
             else:
-                # Global pipeline: exactly the previous behavior.
+                # No override: global pipeline applies exactly as before.
                 if global_filter_active:
                     filtered = self._apply_filters(raw)
                     data[ch] = [{'mode': 'global', 'data': filtered}]
@@ -2022,13 +2230,76 @@ class TraceViewWidget(QWidget):
         self._cache_end_idx = end_idx
         return data
 
+    def _apply_channel_filter(self, raw, low, high):
+        """Per-channel filtered trace: bandpass from the channel's own
+        spinboxes, applied to the source raw signal (never to a globally
+        filtered version)."""
+        if low <= 0 and high <= 0:
+            return raw
+        nyquist = self.engine.sr / 2
+        low = max(0.0, min(low, nyquist - 1))
+        high = max(0.0, min(high, nyquist - 1))
+        if high > 0 and low >= high:
+            low, high = min(low, high), max(low, high)
+        try:
+            if low > 0 and high > 0:
+                return bandpass_filter(raw, self.engine.sr, low, high, order=self.filter_order)
+            if high > 0:
+                return bandpass_filter(raw, self.engine.sr, 0.0, high, order=self.filter_order)
+            if low > 0:
+                return bandpass_filter(raw, self.engine.sr, low, 0.0, order=self.filter_order)
+        except Exception as exc:
+            print(f"Per-channel filter failed: {exc}")
+        return raw
+
+    def _get_csd_analyzer(self):
+        """Lazily build the CSD analyzer from the probe geometry we were
+        given by MainWindow via set_full_probe_geometry(). Returns None
+        if geometry hasn't been set yet (e.g. before any settings.xml
+        was loaded) or if the analyzer fails to construct."""
+        if self._csd_analyzer is not None:
+            return self._csd_analyzer
+        if not self._probe_data:
+            return None
+        try:
+            self._csd_analyzer = PhaseAmplitudeAnalyzer(self._probe_data)
+        except Exception as exc:
+            print(f"CSD analyzer init failed: {exc}")
+            return None
+        return self._csd_analyzer
+
+
+
+    def _compute_channel_csd(self, channel, raw, opts, end_time):
+        """Per-channel CSD using the new distance rule."""
+        analyzer = self._get_csd_analyzer()
+        if analyzer is None:
+            return None
+        try:
+            csd_signal, info = analyzer.compute_csd_with_options(
+                raw, channel, self.engine.sr, self.engine.data,
+                self.start_time, end_time,
+                distance_um=opts.csd_distance,
+                band_low=opts.csd_low,
+                band_high=opts.csd_high,
+            )
+        except Exception as exc:
+            print(f"CSD compute failed for ch {channel}: {exc}")
+            return None
+        if not info.get("used", False):
+            return None
+        return csd_signal
+
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
 
     def paintEvent(self, event):
+    
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        self._update_channel_buttons()
 
         rect = self.rect()
         if hasattr(self, 'scrollbar'):
@@ -2050,6 +2321,7 @@ class TraceViewWidget(QWidget):
             font.setPointSize(12)
             painter.setFont(font)
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Select channels from the probe map to display traces.")
+            
             return
 
         if self.show_grid:
@@ -2067,8 +2339,8 @@ class TraceViewWidget(QWidget):
         if self.show_time_axis:
             self._draw_time_axis(painter, rect)
 
-        if self.show_channel_labels:
-            self._draw_channel_labels(painter, rect, data)
+        # if self.show_channel_labels:
+        #    self._draw_channel_labels(painter, rect, data)
 
         if self.show_depth_scale:
             self._draw_depth_scale(painter, rect, data)
@@ -2423,137 +2695,62 @@ class TraceViewWidget(QWidget):
             float(self._label_strip_header_height() - 4),
         )
 
-    def _draw_channel_labels(self, painter: QPainter, rect: QRectF, data):
-        """Draw channel labels + the per-channel-modes header button,
-        with a small visible button on each row that opens that
-        channel's display-mode menu."""
-        # Strip background.
-        _, _, plot_bottom_full = self._get_plot_bounds()
-        strip_rect = QRectF(
-            float(rect.left()), float(rect.top()),
-            float(LABEL_STRIP_WIDTH), float(plot_bottom_full - rect.top()),
-        )
-        painter.fillRect(strip_rect, LABEL_STRIP_BG)
+    def _update_channel_buttons(self):
+        """Ensure a QPushButton exists for every visible channel and is
+        positioned correctly. Called from paintEvent before drawing."""
+        from PyQt6.QtWidgets import QPushButton
 
-        # ---- Header button (bulk per-channel menu) ----
-        header = self._label_strip_header_rect(rect)
-        n_override = len(self.channel_display_modes)
-        if n_override > 0:
-            header_bg = QColor("#3a5f8a")
-            header_border = QColor("#5a9fff")
-        else:
-            header_bg = QColor("#2d2d2d")
-            header_border = QColor("#4a4a4a")
-
-        painter.setBrush(QBrush(header_bg))
-        painter.setPen(QPen(header_border, 1.0))
-        painter.drawRoundedRect(header, 3, 3)
-
-        painter.setPen(QColor("#e8e8e8"))
-        font = QFont()
-        font.setPointSize(8)
-        font.setBold(True)
-        painter.setFont(font)
-        header_text = "Channel display ▾"
-        if n_override > 0:
-            header_text = f"Channel display ({n_override}) ▾"
-        painter.drawText(header, Qt.AlignmentFlag.AlignCenter, header_text)
-
-        self._label_strip_header_hitbox = header
-
-        # ---- Channel rows ----
         display_channels = self.get_display_order()
-        display_channels = [ch for ch in display_channels if ch in data] or self.get_display_order()
-        n_channels = len(display_channels)
+        visible = set(display_channels)
+
+        # Remove buttons for channels no longer visible.
+        for ch in list(self._channel_buttons.keys()):
+            if ch not in visible:
+                btn = self._channel_buttons.pop(ch)
+                btn.deleteLater()
+
+        if not display_channels:
+            return
 
         _, _, plot_bottom = self._get_plot_bounds()
-        plot_top = rect.top() + self._label_strip_header_height()
-        channel_height = (plot_bottom - plot_top) / max(1, n_channels)
+        rect = self.rect()
+        plot_top = rect.top()
+        n_channels = len(display_channels)
+        if n_channels <= 0:
+            return
+        channel_height = (plot_bottom - plot_top) / n_channels
 
-        name_font = QFont()
-        name_font.setPointSize(LABEL_FONT_POINT_SIZE)
-        name_font.setBold(True)
-
-        depth_font = QFont()
-        depth_font.setPointSize(LABEL_FONT_POINT_SIZE - 1)
-        depth_font.setBold(False)
-
-        # Reset row-button hitboxes; they get repopulated as we draw.
-        self._row_button_rects = {}
+        button_width = 60
+        button_height = max(18, min(int(channel_height) - 2, 26))
 
         for idx, ch in enumerate(display_channels):
-            y_center = plot_bottom - (idx + 0.5) * channel_height + self._channel_offset * channel_height
-
-            if y_center + channel_height < plot_top or y_center - channel_height > plot_bottom:
-                continue
-
-            has_override = self._has_channel_override(ch)
-
-            # ---- Channel number ----
-            painter.setFont(name_font)
-            painter.setPen(LABEL_TEXT_COLOR if not has_override else QColor("#ffd23f"))
-            painter.drawText(int(rect.left()) + 6, int(y_center - 9), 40, 14, Qt.AlignmentFlag.AlignLeft, f"CH{ch}")
-
-            # ---- Depth ----
-            if ch in self.channel_depths:
-                depth = self.channel_depths[ch]
-                painter.setFont(depth_font)
-                painter.setPen(QColor("#b8b8b8"))
-                painter.drawText(int(rect.left()) + 44, int(y_center + 2), 40, 12, Qt.AlignmentFlag.AlignLeft, f"{depth:.0f} µm")
-
-            # ---- Mode indicator dot(s) ----
-            dot_x = int(rect.left()) + LABEL_STRIP_WIDTH - ROW_BUTTON_WIDTH - 20
-            dot_y = int(y_center) - 3
-
-            if has_override:
-                modes = self.channel_display_modes[ch]
-                seg_x = dot_x
-                seg_w = 4
-                seg_h = 6
-                painter.setPen(Qt.PenStyle.NoPen)
-                if modes.get('raw'):
-                    painter.setBrush(QBrush(self.channel_colors.get(ch, self.default_trace_color)))
-                    painter.drawRect(seg_x, dot_y, seg_w, seg_h)
-                    seg_x += seg_w
-                if modes.get('filtered'):
-                    painter.setBrush(QBrush(FILTERED_COLOR))
-                    painter.drawRect(seg_x, dot_y, seg_w, seg_h)
-                    seg_x += seg_w
-                if modes.get('csd'):
-                    painter.setBrush(QBrush(CSD_COLOR))
-                    painter.drawRect(seg_x, dot_y, seg_w, seg_h)
-            else:
-                color = self.channel_colors.get(ch, self.default_trace_color)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(color))
-                painter.drawRect(dot_x, dot_y, 6, 6)
-
-            # ---- Per-row button ----
-            button_rect = QRectF(
-                float(rect.left() + LABEL_STRIP_WIDTH - ROW_BUTTON_WIDTH - 4),
-                float(y_center - ROW_BUTTON_HEIGHT / 2.0),
-                float(ROW_BUTTON_WIDTH),
-                float(ROW_BUTTON_HEIGHT),
+            y_center = (
+                plot_bottom
+                - (idx + 0.5) * channel_height
+                + self._channel_offset * channel_height
             )
-            self._row_button_rects[ch] = button_rect
-
-            hovered = (ch == self._hovered_row_button_channel)
-            btn_bg = ROW_BUTTON_BG_HOVER if hovered else ROW_BUTTON_BG
-            btn_border = ROW_BUTTON_BORDER_HOVER if hovered else ROW_BUTTON_BORDER
-
-            painter.setBrush(QBrush(btn_bg))
-            painter.setPen(QPen(btn_border, 1.0))
-            painter.drawRoundedRect(button_rect, 3, 3)
-
-            # Three-dot glyph, centered.
-            painter.setPen(QPen(ROW_BUTTON_GLYPH, 1.5))
-            glyph_cx = button_rect.center().x()
-            glyph_cy = button_rect.center().y()
-            dot_r = 1.6
-            for dx in (-4.0, 0.0, 4.0):
-                painter.drawEllipse(
-                    QRectF(glyph_cx + dx - dot_r, glyph_cy - dot_r, 2 * dot_r, 2 * dot_r)
+            btn = self._channel_buttons.get(ch)
+            if btn is None:
+                btn = QPushButton(str(ch), self)
+                btn.setFixedSize(button_width, button_height)
+                btn.setStyleSheet(
+                    "QPushButton {"
+                    "  background-color: #2d2d2d;"
+                    "  color: #ddd;"
+                    "  border: 1px solid #555;"
+                    "  border-radius: 3px;"
+                    "  font-size: 9px;"
+                    "}"
+                    "QPushButton:hover { background-color: #3d3d3d; }"
+                    "QPushButton:pressed { background-color: #4a9eff; }"
                 )
+                btn.clicked.connect(
+                    lambda checked=False, c=ch: self._open_channel_options_panel(c)
+                )
+                btn.show()
+                self._channel_buttons[ch] = btn
+            btn.move(5, int(y_center - button_height / 2))
+            btn.setFixedSize(button_width, button_height)
 
     # ------------------------------------------------------------------
     # Event handling
@@ -2978,6 +3175,7 @@ class SpectrogramControlPanel(QWidget):
             self.set_channel(int(current_channel))
         self._building_channel_list = False
 
+                
     def set_channel(self, channel: int):
         for i in range(self.channel_combo.count()):
             if self.channel_combo.itemData(i) == channel:
