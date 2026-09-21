@@ -2165,7 +2165,7 @@ class TraceViewWidget(QWidget):
         """Fetch data for the current window, per channel.
 
         Returns {channel: [{'mode': 'raw'|'filtered'|'csd'|'global',
-                            'data': ndarray}, ...]}.
+                            'data': ndarray, 'gain': float}, ...]}.
         """
         if not self._data_loaded or not self.channels:
             return None
@@ -2198,30 +2198,24 @@ class TraceViewWidget(QWidget):
             has_override = opts is not None and not opts.is_default()
 
             if has_override:
-                # Per-channel overrides are authoritative. Global filter
-                # applies only to the Raw trace of this channel.
                 traces: list[dict] = []
                 if opts.show_raw:
                     raw_trace = self._apply_filters(raw) if global_filter_active else raw
-                    traces.append({'mode': 'raw', 'data': raw_trace})
+                    traces.append({'mode': 'raw', 'data': raw_trace, 'gain': opts.raw_gain})
                 if opts.show_filtered:
                     filtered = self._apply_channel_filter(raw, opts.filter_low, opts.filter_high)
-                    traces.append({'mode': 'filtered', 'data': filtered})
+                    traces.append({'mode': 'filtered', 'data': filtered, 'gain': opts.filtered_gain})
                 if opts.show_csd:
                     csd = self._compute_channel_csd(ch, raw, opts, end_time)
                     if csd is not None:
-                        traces.append({'mode': 'csd', 'data': csd})
-                # Even with an override, we may end up with zero traces
-                # (all three unchecked) -- that's a valid state: the
-                # lane is reserved and shown empty.
+                        traces.append({'mode': 'csd', 'data': csd, 'gain': opts.csd_gain})
                 data[ch] = traces
             else:
-                # No override: global pipeline applies exactly as before.
                 if global_filter_active:
                     filtered = self._apply_filters(raw)
-                    data[ch] = [{'mode': 'global', 'data': filtered}]
+                    data[ch] = [{'mode': 'global', 'data': filtered, 'gain': 1.0}]
                 else:
-                    data[ch] = [{'mode': 'global', 'data': raw}]
+                    data[ch] = [{'mode': 'global', 'data': raw, 'gain': 1.0}]
 
         self._cached_data = data
         self._cache_start = self.start_time
@@ -2288,6 +2282,14 @@ class TraceViewWidget(QWidget):
             return None
         if not info.get("used", False):
             return None
+        print(
+            f"CSD ch={channel} spacing={info.get('spacing')} "
+            f"above={info.get('above_channel')} below={info.get('below_channel')} "
+            f"above_y={info.get('above_y')} center_y={info.get('center_y')} "
+            f"below_y={info.get('below_y')} "
+            f"csd_std={np.std(csd_signal):.6g} raw_std={np.std(raw):.6g} "
+            f"ratio={np.std(csd_signal) / max(1e-12, np.std(raw)):.6g}"
+        )
         return csd_signal
 
     # ------------------------------------------------------------------
@@ -2521,8 +2523,9 @@ class TraceViewWidget(QWidget):
             bool(self.detrend_enabled),
             int(target_per_channel),
             tuple(display_channels),
-            tuple(tuple(t['mode'] for t in data[c]) for c in display_channels),
+            tuple(tuple((t['mode'], round(float(t.get('gain', 1.0)), 4)) for t in data[c]) for c in display_channels),
         )
+        
         if cache_key != self._trace_cache_key:
             self._trace_path_cache = {}
             self._trace_cache_key = cache_key
@@ -2553,18 +2556,35 @@ class TraceViewWidget(QWidget):
                     if not np.any(finite):
                         continue
                     
-                    if self.auto_scale:
+                    trace_gain = float(trace.get('gain', 1.0))
+                    trace_mode = trace.get('mode', 'raw')
+                    # CSD is in different units from LFP (typically 1e-5 of
+                    # raw std), so forcing per-trace normalization for CSD
+                    # lets a modest csd_gain make it visible without the
+                    # user having to type 1e5 into the spinbox.
+                    force_auto = (trace_mode == 'csd')
+
+                    if self.auto_scale or force_auto:
                         finite_vals = draw_y[finite]
-                        data_min = float(np.min(finite_vals))
-                        data_max = float(np.max(finite_vals))
-                        data_range = data_max - data_min
-                        if data_range <= 0:
-                            data_range = 1.0
-                        normalized = (draw_y - (data_min + data_max) / 2.0) / data_range
-                        y_offsets = -normalized * (channel_height * 0.40) * self.global_gain
+                        center = float(np.mean(finite_vals))
+                        half_range = max(
+                            abs(float(np.max(finite_vals)) - center),
+                            abs(center - float(np.min(finite_vals))),
+                        )
+                        if half_range <= 0:
+                            half_range = 1.0
+                        normalized = (draw_y - center) / half_range
+                        y_offsets = -normalized * (channel_height * 0.40) * self.global_gain * trace_gain
                     else:
-                        scale = (channel_height * 0.40) / global_range
-                        y_offsets = -(draw_y - (global_min + global_max) / 2.0) * scale * self.global_gain
+                        center = (global_min + global_max) / 2.0
+                        half_range = max(
+                            abs(global_max - center),
+                            abs(center - global_min),
+                        )
+                        if half_range <= 0:
+                            half_range = 1.0
+                        normalized = (draw_y - center) / half_range
+                        y_offsets = -normalized * (channel_height * 0.40) * self.global_gain * trace_gain
 
                     x_pixels = plot_left + x_ratios * plot_width
                     path = QPainterPath()

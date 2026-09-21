@@ -31,25 +31,29 @@ from PyQt6.QtWidgets import (
 
 @dataclass
 class ChannelOptions:
-    """Per-channel display + filter options."""
+    """Per-channel display + filter + per-mode gain options."""
     show_raw: bool = True
+    raw_gain: float = 1.0
+
     show_filtered: bool = False
     filter_low: float = 1.0
     filter_high: float = 300.0
+    filtered_gain: float = 1.0
 
     show_csd: bool = False
     csd_low: float = 0.0
     csd_high: float = 0.0
     csd_distance: float = 30.0
+    csd_gain: float = 100.0
 
     def is_default(self) -> bool:
-        """True if this is exactly the default state (raw on, everything
-        else off). Used by the Reset All button to skip channels that
-        have nothing to reset."""
+        """True if this is exactly the default state (raw on at gain 1,
+        everything else off)."""
         return (
             self.show_raw
             and not self.show_filtered
             and not self.show_csd
+            and self.raw_gain == 1.0
         )
 
 
@@ -95,11 +99,20 @@ class ChannelOptionsPanel(QWidget):
 
         # ---- Raw ----
         raw_group = QGroupBox("Raw")
-        raw_layout = QVBoxLayout(raw_group)
+        raw_layout = QGridLayout(raw_group)
         self.raw_checkbox = QCheckBox("Show Raw")
         self.raw_checkbox.toggled.connect(self._on_any_changed)
-        raw_layout.addWidget(self.raw_checkbox)
+        raw_layout.addWidget(self.raw_checkbox, 0, 0, 1, 2)
+        raw_layout.addWidget(QLabel("Gain:"), 1, 0)
+        self.raw_gain_spin = QDoubleSpinBox()
+        self.raw_gain_spin.setRange(0.01, 1000.0)
+        self.raw_gain_spin.setSingleStep(0.1)
+        self.raw_gain_spin.setDecimals(3)
+        self.raw_gain_spin.setValue(1.0)
+        self.raw_gain_spin.valueChanged.connect(self._on_any_changed)
+        raw_layout.addWidget(self.raw_gain_spin, 1, 1)
         layout.addWidget(raw_group)
+
 
         # ---- Filtered ----
         filt_group = QGroupBox("Filtered")
@@ -119,7 +132,16 @@ class ChannelOptionsPanel(QWidget):
         self.filter_high_spin.setSingleStep(1.0)
         self.filter_high_spin.valueChanged.connect(self._on_any_changed)
         filt_layout.addWidget(self.filter_high_spin, 2, 1)
+        filt_layout.addWidget(QLabel("Gain:"), 3, 0)
+        self.filtered_gain_spin = QDoubleSpinBox()
+        self.filtered_gain_spin.setRange(0.01, 1000.0)
+        self.filtered_gain_spin.setSingleStep(0.1)
+        self.filtered_gain_spin.setDecimals(3)
+        self.filtered_gain_spin.setValue(1.0)
+        self.filtered_gain_spin.valueChanged.connect(self._on_any_changed)
+        filt_layout.addWidget(self.filtered_gain_spin, 3, 1)
         layout.addWidget(filt_group)
+
 
         # ---- CSD ----
         csd_group = QGroupBox("CSD")
@@ -151,59 +173,79 @@ class ChannelOptionsPanel(QWidget):
         )
         self.csd_distance_spin.valueChanged.connect(self._on_any_changed)
         csd_layout.addWidget(self.csd_distance_spin, 3, 1)
-
+        csd_layout.addWidget(QLabel("Gain:"), 4, 0)
+        self.csd_gain_spin = QDoubleSpinBox()
+        self.csd_gain_spin.setRange(0.01, 10000.0)
+        self.csd_gain_spin.setSingleStep(0.1)
+        self.csd_gain_spin.setDecimals(3)
+        self.csd_gain_spin.setValue(100.0)
+        self.csd_gain_spin.setToolTip(
+            "CSD amplitude is much smaller than raw LFP (divided by "
+            "spacing² in µm²). Increase gain to make it visible."
+        )
+        self.csd_gain_spin.valueChanged.connect(self._on_any_changed)
+        csd_layout.addWidget(self.csd_gain_spin, 4, 1)
         self.csd_status_label = QLabel("")
         self.csd_status_label.setStyleSheet("color: #888; font-size: 10px;")
         self.csd_status_label.setWordWrap(True)
-        csd_layout.addWidget(self.csd_status_label, 4, 0, 1, 2)
-
+        csd_layout.addWidget(self.csd_status_label, 5, 0, 1, 2)
         layout.addWidget(csd_group)
 
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
-
     def _sync_from_options(self):
         o = self._options
         self.raw_checkbox.blockSignals(True)
+        self.raw_gain_spin.blockSignals(True)
         self.filtered_checkbox.blockSignals(True)
         self.csd_checkbox.blockSignals(True)
         self.filter_low_spin.blockSignals(True)
         self.filter_high_spin.blockSignals(True)
+        self.filtered_gain_spin.blockSignals(True)
         self.csd_low_spin.blockSignals(True)
         self.csd_high_spin.blockSignals(True)
         self.csd_distance_spin.blockSignals(True)
+        self.csd_gain_spin.blockSignals(True)
 
         self.raw_checkbox.setChecked(o.show_raw)
+        self.raw_gain_spin.setValue(o.raw_gain)
         self.filtered_checkbox.setChecked(o.show_filtered)
         self.csd_checkbox.setChecked(o.show_csd)
         self.filter_low_spin.setValue(o.filter_low)
         self.filter_high_spin.setValue(o.filter_high)
+        self.filtered_gain_spin.setValue(o.filtered_gain)
         self.csd_low_spin.setValue(o.csd_low)
         self.csd_high_spin.setValue(o.csd_high)
         self.csd_distance_spin.setValue(o.csd_distance)
+        self.csd_gain_spin.setValue(o.csd_gain)
 
         self.raw_checkbox.blockSignals(False)
+        self.raw_gain_spin.blockSignals(False)
         self.filtered_checkbox.blockSignals(False)
         self.csd_checkbox.blockSignals(False)
         self.filter_low_spin.blockSignals(False)
         self.filter_high_spin.blockSignals(False)
+        self.filtered_gain_spin.blockSignals(False)
         self.csd_low_spin.blockSignals(False)
         self.csd_high_spin.blockSignals(False)
         self.csd_distance_spin.blockSignals(False)
+        self.csd_gain_spin.blockSignals(False)
 
         self._update_enabled_states()
 
     def _update_enabled_states(self):
-        """Grey out parameters whose parent checkbox is off, so the
-        panel reflects what's actually active at a glance."""
+        raw_on = self.raw_checkbox.isChecked()
+        self.raw_gain_spin.setEnabled(raw_on)
         filt_on = self.filtered_checkbox.isChecked()
         self.filter_low_spin.setEnabled(filt_on)
         self.filter_high_spin.setEnabled(filt_on)
+        self.filtered_gain_spin.setEnabled(filt_on)
         csd_on = self.csd_checkbox.isChecked()
         self.csd_low_spin.setEnabled(csd_on)
         self.csd_high_spin.setEnabled(csd_on)
         self.csd_distance_spin.setEnabled(csd_on)
+        self.csd_gain_spin.setEnabled(csd_on)
 
     # ------------------------------------------------------------------
     # Change handling
@@ -211,13 +253,16 @@ class ChannelOptionsPanel(QWidget):
 
     def _on_any_changed(self, *args):
         self._options.show_raw = self.raw_checkbox.isChecked()
+        self._options.raw_gain = float(self.raw_gain_spin.value())
         self._options.show_filtered = self.filtered_checkbox.isChecked()
         self._options.filter_low = float(self.filter_low_spin.value())
         self._options.filter_high = float(self.filter_high_spin.value())
+        self._options.filtered_gain = float(self.filtered_gain_spin.value())
         self._options.show_csd = self.csd_checkbox.isChecked()
         self._options.csd_low = float(self.csd_low_spin.value())
         self._options.csd_high = float(self.csd_high_spin.value())
         self._options.csd_distance = float(self.csd_distance_spin.value())
+        self._options.csd_gain = float(self.csd_gain_spin.value())
         self._update_enabled_states()
         self.optionsChanged.emit(self.channel, self._options)
 
