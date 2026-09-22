@@ -44,7 +44,7 @@ class ChannelOptions:
     csd_low: float = 0.0
     csd_high: float = 0.0
     csd_distance: float = 30.0
-    csd_gain: float = 100.0
+    csd_gain: float = 1.0
 
     def is_default(self) -> bool:
         """True if this is exactly the default state (raw on at gain 1,
@@ -178,7 +178,7 @@ class ChannelOptionsPanel(QWidget):
         self.csd_gain_spin.setRange(0.01, 10000.0)
         self.csd_gain_spin.setSingleStep(0.1)
         self.csd_gain_spin.setDecimals(3)
-        self.csd_gain_spin.setValue(100.0)
+        self.csd_gain_spin.setValue(1.0)
         self.csd_gain_spin.setToolTip(
             "CSD amplitude is much smaller than raw LFP (divided by "
             "spacing² in µm²). Increase gain to make it visible."

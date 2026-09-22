@@ -555,6 +555,7 @@ class TraceViewWidget(QWidget):
         self.channels: list[int] = []
         self._sorted_channels: list[int] = []
 
+        # ---- Per-channel customization state ----
         self._channel_options: dict[int, ChannelOptions] = {}
         self._channel_options_panel: ChannelOptionsPanel | None = None
         self._channel_options_panel_channel: int | None = None
@@ -562,6 +563,12 @@ class TraceViewWidget(QWidget):
         self._probe_data: dict | None = None
         self._csd_analyzer: PhaseAmplitudeAnalyzer | None = None
         self._channel_buttons: dict[int, "QPushButton"] = {}
+
+        # ---- Per-trace scale normalization cache ----
+        # (channel, trace_idx) -> (ref_lo, ref_hi, center, half_range).
+        # See _get_trace_normalization() for the invalidation logic.
+        self._trace_normalization_cache: dict[tuple[int, int], tuple[float, float]] = {}
+        self._trace_normalization_key = None
 
         # ---- CSD / probe geometry ----
         self._probe_data: dict | None = None
@@ -1870,9 +1877,17 @@ class TraceViewWidget(QWidget):
         if mode == 'raw':
             return base
         if mode == 'filtered':
-            return QColor(base.red(), int(base.green() * 0.85), int(base.blue() * 0.85))
+            return QColor(
+                base.red(),
+                int(base.green() * 0.85),
+                int(base.blue() * 0.85),
+            )
         if mode == 'csd':
-            return QColor(int(base.red() * 0.6), int(base.green() * 0.9), 255)
+            return QColor(
+                int(base.red() * 0.6),
+                int(base.green() * 0.9),
+                255,
+            )
         return base
         
     def set_trace_color(self, color: str | QColor, channel: int | None = None):
@@ -2246,6 +2261,51 @@ class TraceViewWidget(QWidget):
             print(f"Per-channel filter failed: {exc}")
         return raw
 
+    def _get_trace_normalization(
+        self, channel: int, trace_idx: int, mode: str, draw_y: np.ndarray
+    ) -> tuple[float, float]:
+        """Return (center, half_range) for normalizing a trace.
+
+        Computed once per cache-key change (channel set, gain, filter,
+        mode, zoom) and then held frozen. This removes BOTH the jitter
+        that came from recomputing every repaint AND the drift that
+        came from re-deriving the reference when the view moved out of
+        a bounded "reference window".
+
+        The cache is cleared by _draw_traces whenever the normalization
+        key changes, so the only ways to get a new scale are:
+        - zoom change
+        - gain change
+        - filter setting change
+        - mode set change per channel
+        - channel list change
+
+        Scrolling does not clear it, so scale is stable across scroll.
+        """
+        cache_key = (channel, trace_idx)
+        cached = self._trace_normalization_cache.get(cache_key)
+        if cached is not None:
+            center, half_range = cached
+            return center, half_range
+
+        data = np.asarray(draw_y, dtype=np.float64)
+        finite = np.isfinite(data)
+        if np.any(finite):
+            finite_vals = data[finite]
+            center = float(np.mean(finite_vals))
+            half_range = max(
+                abs(float(np.max(finite_vals)) - center),
+                abs(center - float(np.min(finite_vals))),
+            )
+            if half_range <= 0:
+                half_range = 1.0
+        else:
+            center = 0.0
+            half_range = 1.0
+
+        self._trace_normalization_cache[cache_key] = (center, half_range)
+        return center, half_range
+
     def _get_csd_analyzer(self):
         """Lazily build the CSD analyzer from the probe geometry we were
         given by MainWindow via set_full_probe_geometry(). Returns None
@@ -2470,6 +2530,7 @@ class TraceViewWidget(QWidget):
         n_channels = len(display_channels)
         if n_channels == 0:
             return
+
         plot_left, plot_right, plot_bottom = self._get_plot_bounds()
         plot_top = rect.top()
         plot_width = plot_right - plot_left
@@ -2477,14 +2538,17 @@ class TraceViewWidget(QWidget):
         if plot_width <= 0 or plot_height <= 0:
             return
         channel_height = plot_height / n_channels
+
         start_time = float(self.start_time)
         end_time = start_time + float(self.window_duration)
         if end_time <= start_time:
             return
+
         max_total = max(1000, int(self.max_total_points))
         target_per_channel = max(64, int(self.optimal_points_per_channel))
         if target_per_channel * n_channels > max_total:
             target_per_channel = max(64, max_total // n_channels)
+
         global_min = None
         global_max = None
         if not self.auto_scale:
@@ -2509,7 +2573,11 @@ class TraceViewWidget(QWidget):
         global_range = global_max - global_min
         if global_range <= 0:
             global_range = 1.0
-        cache_key = (
+
+        # Path cache key: depends on view position, so it invalidates on
+        # every scroll. Trace paths are built at absolute pixel positions,
+        # which change whenever the view moves.
+        path_cache_key = (
             round(start_time, 6),
             round(float(self.window_duration), 6),
             round(float(self._channel_offset), 6),
@@ -2523,20 +2591,65 @@ class TraceViewWidget(QWidget):
             bool(self.detrend_enabled),
             int(target_per_channel),
             tuple(display_channels),
-            tuple(tuple((t['mode'], round(float(t.get('gain', 1.0)), 4)) for t in data[c]) for c in display_channels),
+            tuple(
+                tuple(
+                    (t['mode'], round(float(t.get('gain', 1.0)), 4))
+                    for t in data[c]
+                )
+                for c in display_channels
+            ),
         )
-        
-        if cache_key != self._trace_cache_key:
+
+        # Normalization cache key: does NOT depend on view position. It
+        # only invalidates when something that changes "what the trace
+        # is" changes -- channel set, gain, filter settings, zoom level
+        # (window_duration), mode per trace. Scrolling does not change
+        # it, so the reference normalization stays stable while the user
+        # scrolls.
+        normalization_key = (
+            round(float(self.window_duration), 6),
+            round(float(self.global_gain), 6),
+            bool(self.auto_scale),
+            bool(self.filter_enabled),
+            round(float(self.filter_low_freq), 3),
+            round(float(self.filter_high_freq), 3),
+            bool(self.notch_enabled),
+            round(float(self.notch_freq), 3),
+            bool(self.detrend_enabled),
+            tuple(display_channels),
+            tuple(
+                tuple(
+                    (t['mode'], round(float(t.get('gain', 1.0)), 4))
+                    for t in data[c]
+                )
+                for c in display_channels
+            ),
+        )
+
+        if path_cache_key != self._trace_cache_key:
             self._trace_path_cache = {}
-            self._trace_cache_key = cache_key
+            self._trace_cache_key = path_cache_key
+
+        if normalization_key != self._trace_normalization_key:
+            self._trace_normalization_cache = {}
+            self._trace_normalization_key = normalization_key
+
         for idx, channel in enumerate(display_channels):
-            y_center = plot_bottom - (idx + 0.5) * channel_height + self._channel_offset * channel_height
+            y_center = (
+                plot_bottom
+                - (idx + 0.5) * channel_height
+                + self._channel_offset * channel_height
+            )
             if y_center + channel_height < plot_top or y_center - channel_height > plot_bottom:
                 continue
+
             traces = data[channel]
             if not traces:
                 continue
+
             for trace_idx, trace in enumerate(traces):
+                # print(f"DRAW ch={channel} mode={trace.get('mode')} gain={trace.get('gain')} auto={self.auto_scale} n={len(trace['data'])}")
+
                 cached = self._trace_path_cache.get((channel, trace_idx))
                 if cached is None:
                     channel_data = np.asarray(trace['data'], dtype=np.float64)
@@ -2546,45 +2659,59 @@ class TraceViewWidget(QWidget):
                     n_samples = channel_data.size
                     if n_samples <= target_per_channel:
                         draw_y = channel_data
-                        x_ratios = np.linspace(0.0, 1.0, n_samples) if n_samples > 1 else np.array([0.0])
+                        x_ratios = (
+                            np.linspace(0.0, 1.0, n_samples)
+                            if n_samples > 1
+                            else np.array([0.0])
+                        )
                     else:
-                        draw_y, x_ratios = self._decimate_minmax(channel_data, target_per_channel)
+                        draw_y, x_ratios = self._decimate_minmax(
+                            channel_data, target_per_channel
+                        )
                         if draw_y.size == 0:
                             continue
 
                     finite = np.isfinite(draw_y)
                     if not np.any(finite):
                         continue
-                    
+
                     trace_gain = float(trace.get('gain', 1.0))
                     trace_mode = trace.get('mode', 'raw')
-                    # CSD is in different units from LFP (typically 1e-5 of
-                    # raw std), so forcing per-trace normalization for CSD
-                    # lets a modest csd_gain make it visible without the
-                    # user having to type 1e5 into the spinbox.
-                    force_auto = (trace_mode == 'csd')
+                    # CSD is in different units from LFP (typically 1e-5
+                    # of raw std), so force per-trace normalization for
+                    # CSD regardless of the auto-scale toggle. Otherwise
+                    # a modest csd_gain would produce a flat line.
+                    force_auto = (trace_mode in ('csd', 'filtered'))
 
                     if self.auto_scale or force_auto:
+                        _, half_range = self._get_trace_normalization(channel, trace_idx, trace_mode, draw_y)
+                        # Re-center on the current view's own mean.
+                        # half_range stays frozen (no jitter), but the
+                        # trace is always centered on its own current
+                        # baseline, so a drifting mean (which filtered
+                        # traces are more prone to than raw or CSD,
+                        # because the filter's edge behavior depends on
+                        # the window) doesn't become a visual drift.
                         finite_vals = draw_y[finite]
-                        center = float(np.mean(finite_vals))
-                        half_range = max(
-                            abs(float(np.max(finite_vals)) - center),
-                            abs(center - float(np.min(finite_vals))),
-                        )
-                        if half_range <= 0:
-                            half_range = 1.0
-                        normalized = (draw_y - center) / half_range
-                        y_offsets = -normalized * (channel_height * 0.40) * self.global_gain * trace_gain
+                        current_center = float(np.mean(finite_vals))
+                        normalized = (draw_y - current_center) / half_range
+                        y_offsets = (-normalized* (channel_height * 0.40)* self.global_gain* trace_gain)
+
                     else:
+                        # Fixed-scale mode is intentionally global, not
+                        # per-trace: all channels share one reference so
+                        # relative amplitudes are preserved.
                         center = (global_min + global_max) / 2.0
-                        half_range = max(
-                            abs(global_max - center),
-                            abs(center - global_min),
-                        )
+                        half_range = max(abs(global_max - center),abs(center - global_min),)
                         if half_range <= 0:
                             half_range = 1.0
                         normalized = (draw_y - center) / half_range
-                        y_offsets = -normalized * (channel_height * 0.40) * self.global_gain * trace_gain
+                        y_offsets = (
+                            -normalized
+                            * (channel_height * 0.40)
+                            * self.global_gain
+                            * trace_gain
+                        )
 
                     x_pixels = plot_left + x_ratios * plot_width
                     path = QPainterPath()
@@ -2605,6 +2732,7 @@ class TraceViewWidget(QWidget):
                             path.lineTo(float(x), float(y))
                     self._trace_path_cache[(channel, trace_idx)] = path
                     cached = path
+
                 color = self._trace_color_for(channel, trace.get('mode', 'raw'))
                 pen = QPen(color, self.trace_width)
                 pen.setCosmetic(True)
