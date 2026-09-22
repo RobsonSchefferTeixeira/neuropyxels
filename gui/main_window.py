@@ -42,6 +42,7 @@ from core.trace_engine import TraceEngine
 from gui.theta_epoch_dialog import ThetaEpochDialog
 from core.probe_definition import ProbeDefinition
 from gui.probe_definition_dialog import ProbeDefinitionDialog
+from gui.psd_dialog import PsdDialog
 
 class ColorButton(QPushButton):
     """
@@ -330,6 +331,7 @@ class MainWindow(QMainWindow):
         self._open_power_dialogs: list[AmplitudePowerDialog] = []
         self._open_ripple_dialogs: list[RippleDialog] = []
         self._open_theta_dialogs: list[ThetaEpochDialog] = []
+        self._open_psd_dialogs: list[PsdDialog] = []
 
         self._build_menu()
         self._build_trace_view()
@@ -346,7 +348,7 @@ class MainWindow(QMainWindow):
         self.power_map_action.setEnabled(ready)
         self.ripple_detection_action.setEnabled(ready)
         self.theta_epoch_action.setEnabled(ready)
-
+        self.psd_action.setEnabled(ready)
     # ------------------------------------------------------------------
     # UI scaffolding
     # ------------------------------------------------------------------
@@ -355,16 +357,16 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
 
-        open_settings_action = QAction("Open &settings.xml...", self)
+        open_settings_action = QAction("Open &settings.xml", self)
         open_settings_action.setShortcut(QKeySequence.StandardKey.Open)
         open_settings_action.triggered.connect(self._on_open_settings)
         file_menu.addAction(open_settings_action)
 
-        open_data_action = QAction("Open &Data (continuous.dat)...", self)
+        open_data_action = QAction("Open &Data (continuous.dat)", self)
         open_data_action.triggered.connect(self._on_open_data)
         file_menu.addAction(open_data_action)
 
-        open_definition_action = QAction("New Probe &Definition...", self)
+        open_definition_action = QAction("New Probe &Definition", self)
         open_definition_action.setToolTip(
             "Build a probe description by hand (or import one), then use "
             "it with a raw continuous.dat that has no settings.xml."
@@ -372,7 +374,7 @@ class MainWindow(QMainWindow):
         open_definition_action.triggered.connect(self._on_open_probe_definition)
         file_menu.addAction(open_definition_action)
 
-        open_timestamps_action = QAction("Open Timestamps (timestamps.npy)...", self)
+        open_timestamps_action = QAction("Open Timestamps (timestamps.npy)", self)
         open_timestamps_action.triggered.connect(self._on_open_timestamps)
         file_menu.addAction(open_timestamps_action)
 
@@ -384,22 +386,29 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         analysis_menu = menubar.addMenu("&Analysis")
-        self.phase_amplitude_action = QAction("&Phase-Amplitude Coupling...", self)
+        self.phase_amplitude_action = QAction("&Phase-Amplitude Coupling", self)
         self.phase_amplitude_action.setEnabled(False)
         self.phase_amplitude_action.triggered.connect(self._on_open_phase_amplitude)
         analysis_menu.addAction(self.phase_amplitude_action)
 
-        self.power_map_action = QAction("Spatial &Power Map...", self)
+        self.power_map_action = QAction("Spatial &Power Map", self)
         self.power_map_action.setEnabled(False)
         self.power_map_action.triggered.connect(self._on_open_power_map)
         analysis_menu.addAction(self.power_map_action)
 
-        self.ripple_detection_action = QAction("&Ripple Detection...", self)
+
+        self.psd_action = QAction("&PSD Analysis", self)
+        self.psd_action.setEnabled(False)
+        self.psd_action.triggered.connect(self._on_open_psd)
+        analysis_menu.addAction(self.psd_action)
+
+
+        self.ripple_detection_action = QAction("&Ripple Detection", self)
         self.ripple_detection_action.setEnabled(False)
         self.ripple_detection_action.triggered.connect(self._on_open_ripple_detection)
         analysis_menu.addAction(self.ripple_detection_action)
 
-        self.theta_epoch_action = QAction("Theta Epoch Detection...", self)
+        self.theta_epoch_action = QAction("Theta Epoch Detection", self)
         self.theta_epoch_action.setEnabled(False)
         self.theta_epoch_action.triggered.connect(self._on_open_theta_epoch)
         analysis_menu.addAction(self.theta_epoch_action)
@@ -413,11 +422,11 @@ class MainWindow(QMainWindow):
 
         display_menu = menubar.addMenu("&Display")
 
-        trace_color_action = QAction("Trace Color...", self)
+        trace_color_action = QAction("Trace Color", self)
         trace_color_action.triggered.connect(self._on_edit_trace_color)
         display_menu.addAction(trace_color_action)
 
-        bg_color_action = QAction("Background Color...", self)
+        bg_color_action = QAction("Background Color", self)
         bg_color_action.triggered.connect(self._on_edit_bg_color)
         display_menu.addAction(bg_color_action)
 
@@ -569,7 +578,7 @@ class MainWindow(QMainWindow):
         container_layout.addLayout(stream_row)
 
         self._probe_map_placeholder_label = QLabel(
-            "No probe loaded.\n\nUse File \u2192 Open settings.xml... to load one."
+            "No probe loaded.\n\nUse File \u2192 Open settings.xml to load one."
         )
         self._probe_map_placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._probe_map_placeholder_label.setStyleSheet("color: #888; font-size: 12px;")
@@ -763,7 +772,9 @@ class MainWindow(QMainWindow):
             dialog.close()
         for dialog in list(self._open_ripple_dialogs):
             dialog.close()
-
+        for dialog in list(self._open_psd_dialogs):
+            dialog.close()
+            
         self.engine = new_engine
         self.trace_view.set_data_source(self.engine)
         self.trace_view.clear_theta_epochs()
@@ -1118,6 +1129,39 @@ class MainWindow(QMainWindow):
     def _on_power_dialog_closed(self, dialog: AmplitudePowerDialog):
         if dialog in self._open_power_dialogs:
             self._open_power_dialogs.remove(dialog)
+
+
+    def _on_open_psd(self):
+        if not self.engine.data_loaded:
+            QMessageBox.warning(self, "No data loaded",
+                                "Load a continuous.dat file first.")
+            return
+
+        selected = self.get_selected_channels()
+        initial_channel = selected[0] if selected else None
+
+        dialog = PsdDialog(self.engine, initial_channel=initial_channel, parent=self)
+
+        # Pre-fill the time range from the current trace view so the
+        # analysis starts on the window you were just looking at.
+        start = self.trace_view.start_time
+        end = min(
+            self.engine.total_duration,
+            start + max(self.trace_view.window_duration, 1.0),
+        )
+        dialog.start_spin.setValue(start)
+        dialog.end_spin.setValue(end)
+
+        self._open_psd_dialogs.append(dialog)
+        dialog.finished.connect(lambda _res, d=dialog: self._on_psd_closed(d))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_psd_closed(self, dialog: PsdDialog):
+        if dialog in self._open_psd_dialogs:
+            self._open_psd_dialogs.remove(dialog)
+
 
     def _on_open_ripple_detection(self):
         if self.probe_map is None or not self._current_probe_key:
