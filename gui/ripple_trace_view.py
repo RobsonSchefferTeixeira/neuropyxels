@@ -22,22 +22,7 @@ Design notes
   same as theta.
 - INHERITS DIRECTLY FROM ThetaEpochTraceViewWidget (not from
   TraceViewWidget, and not combined with it via multiple inheritance).
-  An earlier version of this file used
-  class NeuralTraceViewWidget(RippleTraceViewWidget, ThetaEpochTraceViewWidget)
-  -- two independent QWidget subclasses combined via Python multiple
-  inheritance. That pattern is NOT supported by PyQt6's meta-object
-  system: pyqtSignal attributes declared on whichever base class ends
-  up second in the MRO fail to bind at connect() time. Single, linear
-  inheritance (this class -> ThetaEpochTraceViewWidget ->
-  TraceViewWidget) is the only reliable way to combine both overlays.
-
-  Every overridden Qt event handler calls super().<handler>(event)
-  either at the top (paintEvent) or as its final fallthrough branch
-  (mouse/key handlers), so a mouse click first gets a chance to hit a
-  ripple handle/event; if it misses, it falls through to
-  ThetaEpochTraceViewWidget's own handle/epoch hit-test; if that also
-  misses, it finally reaches TraceViewWidget's base pan/zoom/cursor
-  logic.
+  See the class-chain explanation at the top of neural_trace_view.py.
 """
 
 from __future__ import annotations
@@ -78,42 +63,80 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         self._ripple_merge_candidate: int | None = None
         self._ripple_merge_candidates: set[int] = set()
         self._ripple_selected_event: int | None = None
-        self.ripple_min_merge_gap_ms = 0.0  # 0 = no auto-merge unless events actually overlap
+        self.ripple_min_merge_gap_ms = 0.0
         self.ripple_min_merge_gap_samples = 0
         self._ripple_drag_original_start = 0
         self._ripple_drag_original_end = 0
 
-        # Drag-handle HIT-TEST radius (invisible at both boundaries),
-        # so resizing works from either edge without a visible circle
-        # cluttering the display.
-        self._ripple_handle_hit_radius = 12.0
+        # Drag-handle hit-test geometry. Horizontal radius is generous
+        # so the resize target is easy to grab; vertical tolerance is
+        # larger still, so a few pixels of vertical error don't cause
+        # the user to miss the handle. Together these give a hit "pill"
+        # around each boundary rather than a circle.
+        self._ripple_handle_hit_radius_x = 22.0
+        self._ripple_handle_hit_radius_y = 40.0
         # Visible peak-marker radius.
         self._ripple_peak_marker_radius = 4.5
 
         # Minimum duration (in samples) for a ripple created by hand
-        # (arm-then-drag) or by splitting an existing one. Anything
-        # shorter is discarded, so a stray click can't create a
-        # degenerate zero-width event.
+        # or by splitting an existing one.
         self._ripple_min_duration_samples = max(1, int(round(0.005 * self.engine.sr)))
 
-        # ---- Arm-and-drag creation state ----
-        # Set by arm_ripple_creation(); the NEXT left-press inside a
-        # channel lane starts a new manual ripple whose width is
-        # defined by the drag. Same UX as ThetaEpochTraceViewWidget.
+        # Arm-and-drag creation state.
         self._ripple_creating_armed = False
         self._ripple_creating_channel: int | None = None
         self._ripple_creating_start_sample: int | None = None
         self._ripple_creating_end_sample: int | None = None
 
     # ------------------------------------------------------------------
+    # Peak recompute
+    # ------------------------------------------------------------------
+
+    def _ripple_recompute_peak(self, event: RippleEvent):
+        """Recompute the event's peak_sample from the render-context
+        envelope over the current [start_sample, end_sample] window.
+
+        Called after every drag step and after every release. The peak
+        marker always tracks the argmax of the envelope within the
+        currently drawn window, so:
+
+          - shrinking the window re-derives the peak from the reduced
+            range (which may move the marker even if the old peak is
+            still inside, if a different sample in the smaller window
+            now has the highest envelope value);
+          - expanding the window re-derives the peak from the enlarged
+            range (which may move the marker if the newly included
+            samples contain a higher envelope value than the old peak);
+          - dragging a boundary past the old peak naturally re-derives
+            it as well, since the old peak is no longer in the window.
+
+        If no envelope is available for this channel, the peak is
+        centered in the window and its amplitude zeroed, so the marker
+        degrades gracefully rather than sitting at a stale position.
+        """
+        ctx = self._ripple_context_for(event.channel)
+        if ctx is not None:
+            envelope = ctx.get("envelope")
+            if envelope is not None and len(envelope) > 0:
+                lo = max(0, int(event.start_sample))
+                hi = min(len(envelope) - 1, int(event.end_sample))
+                if hi > lo:
+                    window = envelope[lo:hi + 1]
+                    rel = int(np.argmax(window))
+                    new_peak = lo + rel
+                    event.peak_sample = new_peak
+                    event.peak_amplitude = float(envelope[new_peak])
+                    return
+
+        # No envelope: center the peak and zero its amplitude.
+        event.peak_sample = (int(event.start_sample) + int(event.end_sample)) // 2
+        event.peak_amplitude = 0.0
+
+    # ------------------------------------------------------------------
     # Ripple event API
     # ------------------------------------------------------------------
 
     def set_ripple_events(self, events: list[RippleEvent] | None):
-        """Replace the current set of ripple events (source of truth for
-        rendering/interaction). Does not touch render context -- call
-        set_ripple_render_context() separately (typically once, right
-        after detection)."""
         self.ripple_events = list(events or [])
         self._ripple_drag_event = None
         self._ripple_drag_side = None
@@ -122,10 +145,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         self.update()
 
     def set_ripple_render_context(self, context: dict[int, dict] | None):
-        """Set (or replace) per-channel envelope/signal/threshold data
-        used purely for rendering. `context` is
-        {channel: {'envelope', 'signal', 'sample_offset', 'sample_rate',
-                    'peak_threshold_sd', 'boundary_threshold_sd'}}."""
         self._ripple_render_context = dict(context or {})
         self.update()
 
@@ -150,7 +169,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             self.update()
 
     def set_ripple_selected_event(self, index: int):
-        """Select a ripple event by its current table/overlay index."""
         if 0 <= int(index) < len(self.ripple_events):
             self._ripple_selected_event = int(index)
             self.update()
@@ -170,9 +188,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         return True
 
     def clear_ripple_overlay(self):
-        """Clear both events and render context -- name kept for parity
-        with the old TraceViewWidget.clear_ripple_overlay() API that
-        RippleDialog already calls."""
         self.ripple_events = []
         self._ripple_render_context = {}
         self._ripple_drag_event = None
@@ -191,17 +206,10 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
     # ------------------------------------------------------------------
 
     def arm_ripple_creation(self):
-        """Arm click-drag creation of a new manual ripple event: the
-        NEXT left-button press-and-drag inside a channel lane creates
-        a new event there (start = press position, end = release
-        position). Disarms itself automatically once the drag
-        completes, or if the press lands outside any channel lane.
-        Same UX as ThetaEpochTraceViewWidget.arm_theta_creation()."""
         self._ripple_creating_armed = True
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
     def cancel_ripple_creation(self):
-        """Disarm creation mode without creating anything."""
         self._ripple_creating_armed = False
         self._ripple_creating_channel = None
         self._ripple_creating_start_sample = None
@@ -209,20 +217,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         self.unsetCursor()
 
     def split_selected_ripple_at(self, split_sample: int) -> bool:
-        """Split the currently-selected ripple event at `split_sample`
-        (a sample index relative to that event's own analysis window).
-
-        Both halves are marked manual=True and duplicate the original's
-        peak_amplitude and trough_sample/amplitude unchanged --
-        recomputing them properly would require re-running the ripple
-        filter on each half, which the trace view doesn't have the
-        full processing context for. Duplicating is the same pragmatic
-        choice the theta merge logic makes when it averages stats
-        rather than re-detecting.
-
-        Returns True if a split happened, False if it was rejected
-        (no selection, or split_sample too close to an edge to leave
-        both halves above the minimum duration)."""
         i = self._ripple_selected_event
         if i is None or not (0 <= i < len(self.ripple_events)):
             return False
@@ -277,10 +271,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         return self._ripple_render_context.get(channel)
 
     def _ripple_event_time(self, event: RippleEvent, sample: int) -> float:
-        """Convert a relative-to-analysis-window sample to recording time.
-        Always pure sample/sample_rate math -- never engine.timestamps --
-        so ripple identity and on-screen position are identical whether
-        or not the user has loaded a timestamps.npy file."""
         ctx = self._ripple_context_for(event.channel)
         sample_offset = int(ctx.get("sample_offset", 0)) if ctx else 0
         sample_rate = float(ctx.get("sample_rate", self.engine.sr)) if ctx else self.engine.sr
@@ -325,15 +315,25 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             sample = event.start_sample
         elif side == "end":
             sample = event.end_sample
-        else:  # "peak"
+        else:
             sample = event.peak_sample
         time = self._ripple_event_time(event, sample)
         return self._ripple_time_to_x(time), y_center
 
     def _ripple_handle_at(self, pos):
-        """Return (event_index, 'start'/'end') for a nearby handle."""
+        """Return (event_index, 'start'/'end') for a nearby handle.
+
+        Hit-test uses an elliptical tolerance around each boundary
+        point: generous horizontally (so short/narrow events still have
+        grab-able edges) and even more generous vertically (so a few
+        pixels of mouse drift don't miss the target). This is a
+        behaviour-only change from the previous circular hit-test; the
+        visual rendering of the boundary is unchanged.
+        """
         best = None
-        best_dist2 = self._ripple_handle_hit_radius ** 2
+        best_dist = None
+        rx = self._ripple_handle_hit_radius_x
+        ry = self._ripple_handle_hit_radius_y
 
         for i, event in enumerate(self.ripple_events):
             if event.channel not in self._sorted_channels:
@@ -346,17 +346,16 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
 
                 dx = pos.x() - point[0]
                 dy = pos.y() - point[1]
-                dist2 = dx * dx + dy * dy
-                if dist2 <= best_dist2:
-                    best = (i, side)
-                    best_dist2 = dist2
+                # Elliptical tolerance: normalized distance squared.
+                dist = (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry)
+                if dist <= 1.0:
+                    if best_dist is None or dist < best_dist:
+                        best = (i, side)
+                        best_dist = dist
 
         return best
 
     def _ripple_x_to_sample(self, x: float, channel: int) -> int:
-        """Convert a screen x-coordinate to a sample index relative to
-        the analysis window for the given channel's render context.
-        Always plain sample/sample_rate math (see _ripple_event_time)."""
         plot_left, plot_right, _ = self._get_plot_bounds()
         ratio = (x - plot_left) / max(1.0, plot_right - plot_left)
         time = self.start_time + ratio * self.window_duration
@@ -391,14 +390,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         painter.end()
 
     def _ripple_context_stats(self, channel: int, ctx: dict, key: str = "envelope"):
-        """Return (data_min, data_max, mean, sd) for ctx[key], computed
-        ONCE per distinct array and cached on the context dict itself --
-        these are whole-signal statistics used only for display
-        scaling / threshold lines, which don't depend on the current
-        pan/zoom window. Recomputing them on every paintEvent is pure
-        waste: a full-recording detection run's envelope can be
-        hundreds of thousands of samples, and every pan/zoom/scroll
-        triggers a repaint."""
         cache_key = f"_stats_cache_{key}"
         cache = ctx.get(cache_key)
         if cache is not None:
@@ -426,10 +417,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                                    plot_top: float, plot_bottom: float,
                                    plot_width: float, max_points: int,
                                    to_y, color: QColor, width: float = 1.0):
-        """Shared windowed/downsampled path-drawing routine used by both
-        the envelope curve and the filtered-signal curve -- resolves the
-        visible sample range directly (no full-length times/mask array),
-        downsamples to ~max_points before building the QPainterPath."""
         n_total = len(array)
         first_idx = int(np.ceil((start_time - sample_offset / sample_rate) * sample_rate))
         last_idx = int(np.floor((end_time - sample_offset / sample_rate) * sample_rate))
@@ -474,10 +461,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         painter.restore()
 
     def _draw_ripple_render_context(self, painter: QPainter):
-        """Draw envelope + filtered-signal + threshold lines per
-        channel (purely visual, not interactive). Only the samples
-        inside the current visible time window are ever touched,
-        downsampled to roughly one point per horizontal pixel."""
         rect = self.rect()
         if hasattr(self, "scrollbar"):
             rect.setBottom(rect.bottom() - self.scrollbar.height())
@@ -565,10 +548,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 )
 
     def _draw_ripple_creation_preview(self, painter: QPainter):
-        """Live preview rectangle shown while dragging out a new ripple
-        (armed via arm_ripple_creation). Same visual language as a
-        selected event so it's obvious this is about to become a real
-        one."""
         geometry = self._ripple_channel_geometry(self._ripple_creating_channel)
         if geometry is None:
             return
@@ -601,9 +580,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         )
 
     def _ripple_event_time_for_channel(self, channel: int, sample: int) -> float:
-        """Same as _ripple_event_time but takes a raw channel id rather
-        than a RippleEvent, so the creation-preview can compute times
-        for a not-yet-existing event."""
         ctx = self._ripple_context_for(channel)
         sample_offset = int(ctx.get("sample_offset", 0)) if ctx else 0
         sample_rate = float(ctx.get("sample_rate", self.engine.sr)) if ctx else self.engine.sr
@@ -611,24 +587,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         return global_sample / float(sample_rate)
 
     def _draw_ripple_events(self, painter: QPainter):
-        """Draw detected/edited ripple events directly OVER the trace
-        lane, so the box is visually anchored to the signal it refers
-        to rather than floating in a strip above it.
-
-        Layout per event:
-          - A translucent filled rectangle spanning the event's time
-            range and the trace lane's own vertical extent, so the
-            underlying signal stays visible through it.
-          - A bright border around that rectangle (color coded by
-            state: default, selected, merge candidate).
-          - A single small circle marker at the envelope's peak_sample,
-            positioned at the trace's vertical center.
-          - Small start/end tick marks, drawn only for the currently
-            selected event, as a visible affordance for resizing.
-
-        Everything is drawn AFTER the trace and the envelope (see
-        paintEvent), so it's unambiguously on top.
-        """
         if not self.show_ripple_events:
             return
 
@@ -643,10 +601,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             return
         channel_height = (plot_bottom - plot_top) / n_channels
 
-        # The trace itself is drawn in _draw_traces with y_values
-        # centered at y_center and a half-extent of channel_height*0.40.
-        # Use the same extents here so the ripple band exactly overlays
-        # the trace's own lane.
         band_half_h = channel_height * 0.40
 
         for i, event in enumerate(self.ripple_events):
@@ -677,23 +631,23 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             selected = i == self._ripple_selected_event
 
             if merge_candidate:
-                fill = QColor(255, 70, 70, 55)
+                fill = QColor(255, 70, 70, 30)
                 border = QColor(255, 60, 60, 235)
                 peak_color = QColor(255, 60, 60)
             elif selected:
-                fill = QColor(70, 255, 70, 55)
+                fill = QColor(70, 255, 70, 30)
                 border = QColor(60, 255, 60, 235)
                 peak_color = QColor(60, 255, 60)
             else:
-                fill = QColor(255, 100, 100, 35)
-                border = QColor(255, 120, 120, 200)
+                fill = QColor(255, 100, 100, 22)
+                border = QColor(255, 120, 120, 255)
                 peak_color = QColor(255, 140, 60)
 
             band_top = y_center - band_half_h
             band_bottom = y_center + band_half_h
 
             painter.setBrush(QBrush(fill))
-            painter.setPen(QPen(border, 1.5))
+            painter.setPen(QPen(border, 2.5))
             painter.drawRect(QRectF(left, band_top, max(1.0, right - left), band_bottom - band_top))
 
             if selected and not merge_candidate:
@@ -701,8 +655,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 painter.setPen(QPen(QColor(255, 255, 255, 220), 2.0))
                 painter.drawRect(QRectF(left, band_top, max(1.0, right - left), band_bottom - band_top))
 
-            # Peak marker -- small filled circle, centered on the
-            # trace's y_center at the envelope's peak_sample time.
             peak_point = self._ripple_handle_position(event, "peak")
             if peak_point is not None:
                 px, _ = peak_point
@@ -711,10 +663,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 painter.setPen(QPen(QColor(20, 20, 20), 1.2))
                 painter.drawEllipse(QRectF(px - r, y_center - r, 2 * r, 2 * r))
 
-            # Start/end tick marks, drawn only for the selected event.
-            # Hit-testing still works for all events (see
-            # _ripple_handle_hit_radius); this is just a visible hint
-            # for the one currently selected.
             if selected:
                 tick_len = max(4.0, band_half_h * 0.25)
                 painter.setPen(QPen(QColor(255, 255, 255, 200), 1.5))
@@ -726,8 +674,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
     # ------------------------------------------------------------------
 
     def _ripple_find_merge_candidates(self, event_index: int, side: str, sample: int) -> set[int]:
-        """Directional merge search, identical logic to theta's
-        _theta_find_merge_candidates but operating on RippleEvent."""
         if not (0 <= event_index < len(self.ripple_events)):
             return set()
 
@@ -803,7 +749,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
-        # ---- Arm-and-drag new-ripple creation ----
         if self._ripple_creating_armed and event.button() == Qt.MouseButton.LeftButton:
             channel = self._theta_channel_at_y(event.position().y())
             if channel is not None:
@@ -814,7 +759,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 return
             self.cancel_ripple_creation()
 
-        # ---- Hit a resize handle ----
         if event.button() == Qt.MouseButton.LeftButton and self.ripple_events:
             handle = self._ripple_handle_at(event.position())
             if handle is not None:
@@ -833,7 +777,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 event.accept()
                 return
 
-        # ---- Click inside an event to select it ----
         if event.button() == Qt.MouseButton.LeftButton and self.ripple_events:
             selected = self._ripple_event_at(event.position())
             if selected is not None:
@@ -878,6 +821,7 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             event.accept()
             return
 
+        # ---- Active drag ----
         if self._ripple_drag_event is not None and self._ripple_drag_side is not None:
             index = self._ripple_drag_event
             if not (0 <= index < len(self.ripple_events)):
@@ -900,6 +844,7 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             else:
                 ev_obj.end_sample = max(sample, ev_obj.start_sample + 1)
             ev_obj.manual = True
+            self._ripple_recompute_peak(ev_obj)
 
             self._ripple_merge_candidates = self._ripple_find_merge_candidates(index, self._ripple_drag_side, sample)
             self._ripple_merge_candidate = min(self._ripple_merge_candidates) if self._ripple_merge_candidates else None
@@ -908,10 +853,24 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
             event.accept()
             return
 
+        # ---- Hover: change cursor when near a resize handle ----
+        # This runs on every mouse move that isn't consumed by a drag or
+        # creation. Because we do NOT call event.accept() here, the
+        # event still propagates to the parent, and the cursor change
+        # takes effect immediately (Qt updates the cursor at the end of
+        # the current event dispatch).
+        if self.ripple_events:
+            handle = self._ripple_handle_at(event.position())
+            if handle is not None:
+                self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
+            else:
+                self.unsetCursor()
+        else:
+            self.unsetCursor()
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        # ---- Commit a new manual ripple, if we were dragging one out ----
         if self._ripple_creating_channel is not None and self._ripple_creating_start_sample is not None:
             channel = self._ripple_creating_channel
             start_sample = self._ripple_creating_start_sample
@@ -932,6 +891,8 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 self.ripple_events.append(new_event)
                 self.ripple_events.sort(key=lambda e: (e.channel, e.start_sample))
                 self._ripple_selected_event = next(j for j, e in enumerate(self.ripple_events) if e is new_event)
+                # Compute the peak for the freshly created event too.
+                self._ripple_recompute_peak(new_event)
                 self.rippleEventsChanged.emit(self.ripple_events)
                 self.rippleEventSelected.emit(self._ripple_selected_event)
 
@@ -954,6 +915,9 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
                 event.accept()
                 return
 
+            if 0 <= index < len(self.ripple_events):
+                self._ripple_recompute_peak(self.ripple_events[index])
+
             self._ripple_cancel_drag()
             self.rippleEventsChanged.emit(self.ripple_events)
             event.accept()
@@ -962,9 +926,6 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        """Double-click INSIDE the currently-selected ripple's band
-        splits it at the click position. Double-click anywhere else
-        falls through to the base class's behavior."""
         if (
             event.button() == Qt.MouseButton.LeftButton
             and self._ripple_selected_event is not None
