@@ -1444,7 +1444,7 @@ class TraceViewWidget(QWidget):
                 "Probe geometry not available for CSD.", "warning"
             )
             return
-        check = analyzer.check_csd_availability(channel, opts.csd_distance)
+        check = analyzer.check_csd_availability_distance(channel, opts.csd_distance)
         if check.get("available"):
             self._channel_options_panel.set_csd_status(check["message"], "ok")
         else:
@@ -2396,8 +2396,6 @@ class TraceViewWidget(QWidget):
         if self.show_spectrogram:
             self._draw_spectrogram(painter)
 
-        self._draw_time_cursors(painter, rect)
-
         if self.show_time_axis:
             self._draw_time_axis(painter, rect)
 
@@ -2414,7 +2412,6 @@ class TraceViewWidget(QWidget):
         plot_left, plot_right, _ = self._get_plot_bounds()
         plot_width = plot_right - plot_left
 
-        self._trash_bin_rects = {}
 
         for i, cursor_fraction in enumerate(self._time_cursors):
             cursor_time = self._cursor_to_time(cursor_fraction)
@@ -2438,30 +2435,22 @@ class TraceViewWidget(QWidget):
             painter.setFont(font)
             painter.drawText(int(x - 25), int(rect.top() + 5), 50, 15, Qt.AlignmentFlag.AlignCenter, f"{cursor_time:.3f}s")
 
-            if is_selected:
-                self._draw_trash_bin(painter, x - 12, rect.top())
-                self._trash_bin_rects[i] = QRectF(int(x) - 22, int(rect.top()) + 20, 20, 20)
-
             painter.setPen(pen)
 
-    def _draw_trash_bin(self, painter: QPainter, x: float, top: float):
-        bin_x = int(x) - 16
-        bin_y = int(top) + 22
-        bin_size = 14
-        bin_color = QColor("#ff6b6b")
-        bin_fill = QColor("#ff6b6b")
-        bin_fill.setAlpha(50)
-        painter.setPen(QPen(bin_color, 2))
-        painter.setBrush(bin_fill)
-        painter.drawRoundedRect(bin_x, bin_y + 3, bin_size, bin_size - 3, 2, 2)
-        painter.drawLine(bin_x - 1, bin_y + 3, bin_x + bin_size + 1, bin_y + 3)
-        painter.drawLine(bin_x + 3, bin_y + 3, bin_x + 3, bin_y + 1)
-        painter.drawLine(bin_x + 3, bin_y + 1, bin_x + bin_size - 3, bin_y + 1)
-        painter.drawLine(bin_x + bin_size - 3, bin_y + 1, bin_x + bin_size - 3, bin_y + 3)
-        painter.setPen(QPen(bin_color, 1))
-        painter.drawLine(bin_x + 4, bin_y + 6, bin_x + 4, bin_y + bin_size - 2)
-        painter.drawLine(bin_x + bin_size - 4, bin_y + 6, bin_x + bin_size - 4, bin_y + bin_size - 2)
+    def _draw_time_cursors_on_top(self, painter: QPainter):
+        """Draw vertical time cursors on top of every other layer.
 
+        Called last in the paint chain by the topmost subclass
+        (RippleTraceViewWidget.paintEvent), so the ruler sits above the
+        traces, spectrogram, theta-epoch overlay, and ripple-event
+        overlay. The base paintEvent does NOT draw the cursors itself.
+        """
+        rect = self.rect()
+        if hasattr(self, "scrollbar"):
+            rect.setBottom(rect.bottom() - self.scrollbar.height())
+        self._draw_time_cursors(painter, rect)
+
+    
     def _compute_time_ticks(self, rect: QRectF):
         plot_left = rect.left() + LABEL_STRIP_WIDTH
         plot_right = rect.right() - 30
@@ -3042,13 +3031,7 @@ class TraceViewWidget(QWidget):
                         event.accept()
                         return
 
-            # ---- Trash bin ----
-            if hasattr(self, '_trash_bin_rects'):
-                for cursor_idx, trash_rect in self._trash_bin_rects.items():
-                    if trash_rect.contains(event.position()):
-                        self._remove_cursor(cursor_idx)
-                        event.accept()
-                        return
+   
 
             # ---- Cursor drag ----
             if self._data_loaded and self._time_cursors:

@@ -86,68 +86,87 @@ class PhaseAmplitudeAnalyzer:
     # ------------------------------------------------------------------
     # CSD
     # ------------------------------------------------------------------
-    def check_csd_availability_distance(
-        self, channel_idx: int, distance_um: float
-    ) -> dict:
-        """Geometry-only check for the new distance rule. Returns
-        {'available': bool, 'message': str, and (if available) neighbor
-        info}."""
+    def check_csd_availability_distance(self, channel_idx: int, distance_um: float) -> dict:
+        """Geometry-only check matching compute_csd_with_options's
+        neighbor rules. Returns {'available': bool, 'message': str}."""
         center_pos = np.where(self.channels == channel_idx)[0]
         if len(center_pos) == 0:
-            return {"available": False,
-                    "message": f"Channel {channel_idx} not found."}
+            return {"available": False, "message": f"Channel {channel_idx} not found."}
         center_pos = center_pos[0]
-        center_shank = self.shank_ids[center_pos]
+
+        center_shank = int(self.shank_ids[center_pos])
         center_y = float(self.ycoords[center_pos])
         center_x = float(self.xcoords[center_pos])
 
-        same_shank = np.where(self.shank_ids == center_shank)[0]
-        same_shank = same_shank[same_shank != center_pos]
+        if distance_um <= 0:
+            return {"available": False, "message": "distance_um must be positive."}
 
-        if len(same_shank) == 0:
-            return {"available": False,
-                    "message": f"No other channels on shank {int(center_shank)}."}
+        max_gap = 3.0 * distance_um
 
-        def _pick(target_y):
-            ys = self.ycoords[same_shank]
-            xs = self.xcoords[same_shank]
-            gaps = np.abs(ys - target_y)
-            eligible = gaps >= distance_um
-            if not np.any(eligible):
+        same_shank = self.shank_ids == center_shank
+        same_x = np.isclose(self.xcoords, center_x)
+        different_y = self.ycoords != center_y
+        within_gap = np.abs(self.ycoords - center_y) <= max_gap
+        pool_mask = same_shank & same_x & different_y & within_gap
+        pool_mask[center_pos] = False
+        pool_idx = np.where(pool_mask)[0]
+
+        def _pick_side(target_y, side):
+            if len(pool_idx) == 0:
                 return None
-            cand_idx = same_shank[eligible]
-            cand_gaps = gaps[eligible]
-            cand_xs = xs[eligible]
-            gap_dist = np.abs(cand_gaps - distance_um)
-            x_gap = np.abs(cand_xs - center_x)
-            order = np.lexsort((x_gap, gap_dist))
-            return int(cand_idx[order[0]])
+            pool_y = self.ycoords[pool_idx]
+            side_idx = pool_idx[pool_y > center_y] if side == "above" else pool_idx[pool_y < center_y]
+            if len(side_idx) == 0:
+                return None
+            side_y = self.ycoords[side_idx]
+            return int(side_idx[int(np.argmin(np.abs(side_y - target_y)))])
 
-        above = _pick(center_y + distance_um)
-        below = _pick(center_y - distance_um)
+        above_idx = _pick_side(center_y + distance_um, "above")
+        below_idx = _pick_side(center_y - distance_um, "below")
 
-        if above is None or below is None:
-            bits = []
-            if above is None:
-                bits.append("no candidate above")
-            if below is None:
-                bits.append("no candidate below")
-            return {"available": False,
-                    "message": f"CSD unavailable ({', '.join(bits)} at "
-                               f"{distance_um:.0f} µm)."}
+        if above_idx is None and below_idx is None:
+            return {
+                "available": False,
+                "message": (
+                    f"No same-shank, same-x neighbors within "
+                    f"{max_gap:.0f} µm of CH{channel_idx}."
+                ),
+            }
+        if above_idx is None:
+            return {
+                "available": False,
+                "message": (
+                    f"No same-shank, same-x channel above CH{channel_idx} "
+                    f"within {max_gap:.0f} µm."
+                ),
+            }
+        if below_idx is None:
+            return {
+                "available": False,
+                "message": (
+                    f"No same-shank, same-x channel below CH{channel_idx} "
+                    f"within {max_gap:.0f} µm."
+                ),
+            }
+
+        above_y = float(self.ycoords[above_idx])
+        below_y = float(self.ycoords[below_idx])
+        above_dist = above_y - center_y
+        below_dist = center_y - below_y
 
         return {
             "available": True,
             "message": (
-                f"Above ch {int(self.channels[above])} "
-                f"(y={float(self.ycoords[above]):.0f}), below ch "
-                f"{int(self.channels[below])} "
-                f"(y={float(self.ycoords[below]):.0f})"
+                f"Above CH{int(self.channels[above_idx])} "
+                f"(y={above_y:.0f}, gap {above_dist:.0f} µm), "
+                f"below CH{int(self.channels[below_idx])} "
+                f"(y={below_y:.0f}, gap {below_dist:.0f} µm)."
             ),
-            "above_channel": int(self.channels[above]),
-            "below_channel": int(self.channels[below]),
+            "above_channel": int(self.channels[above_idx]),
+            "below_channel": int(self.channels[below_idx]),
+            "above_dist": float(above_dist),
+            "below_dist": float(below_dist),
         }
-
 
     def compute_csd_with_options(
         self,
@@ -162,71 +181,129 @@ class PhaseAmplitudeAnalyzer:
         band_high: float = 0.0,
     ) -> tuple[np.ndarray, dict]:
         """
-        Compute 3-point Laplacian CSD with a configurable neighbor-distance
-        rule and optional bandpass on the raw signals.
+        3-point Laplacian CSD with configurable neighbor selection.
 
-        Neighbor selection (same shank only):
-        - Candidates above the center channel are those whose y is at
-            least `distance_um` above the center's y (|y_gap| >= distance).
-        - Among them, pick the one whose |y_gap| is closest to `distance_um`.
-        - Ties (two channels at the same y, e.g. two shanks' worth of
-            electrodes sharing a depth) are broken by smallest |x gap|.
-        - Same for below.
+        Neighbor rules (all four must hold for a candidate to qualify):
+          1. Same shank as the center channel.
+          2. Same x-coordinate as the center channel -- this excludes
+             the "same depth, different x" electrodes that some probes
+             have on the same shank. The Laplacian is a depth
+             derivative, so a lateral neighbor is not a valid term.
+          3. Strictly different y (depth) from the center channel.
+          4. Within MAX_CSD_NEIGHBOR_GAP_UM of the center, where
+             MAX_CSD_NEIGHBOR_GAP_UM is 3x the requested distance (so
+             the search has some slack but doesn't reach across the
+             whole shank).
 
-        If either side has no candidate, returns (signal, {'used': False,
-        'reason': ...}) -- the caller decides whether to warn or skip.
+        Selection among qualifiers:
+          - "Above" is the candidate with y > center_y whose |y gap|
+            is closest to distance_um.
+          - "Below" is the candidate with y < center_y whose |y gap|
+            is closest to distance_um.
+          - Ties (two candidates at exactly the same y) are broken by
+            proximity in x -- but since we now require same x, ties
+            shouldn't normally happen unless the probe has duplicate
+            (shank, y, x) entries, which is a probe-data error.
+
+        The "spacing" reported is (above_dist + below_dist) / 2, using
+        the ACTUAL distances of the chosen neighbors, not the requested
+        distance.
+
+        Returns (csd_signal, info). If either above or below is missing,
+        or if any sanity check fails, returns
+        (signal, {"used": False, "reason": ...}) -- the caller must
+        check info["used"] before plotting.
         """
         center_pos = np.where(self.channels == channel_idx)[0]
         if len(center_pos) == 0:
             return signal, {"used": False, "reason": "Channel not found"}
         center_pos = center_pos[0]
 
-        center_shank = self.shank_ids[center_pos]
+        center_shank = int(self.shank_ids[center_pos])
         center_y = float(self.ycoords[center_pos])
         center_x = float(self.xcoords[center_pos])
 
-        same_shank = np.where(self.shank_ids == center_shank)[0]
-        # Remove the center channel itself from the candidate pool.
-        same_shank = same_shank[same_shank != center_pos]
-
-        def _pick(target_y: float) -> int | None:
-            if len(same_shank) == 0:
-                return None
-            ys = self.ycoords[same_shank]
-            xs = self.xcoords[same_shank]
-            gaps = np.abs(ys - target_y)
-            eligible = gaps >= distance_um
-            if not np.any(eligible):
-                return None
-            cand_idx = same_shank[eligible]
-            cand_gaps = gaps[eligible]
-            cand_xs = xs[eligible]
-            # Closest to `distance_um` in |y gap|. Break ties by |x gap|.
-            gap_dist = np.abs(cand_gaps - distance_um)
-            x_gap = np.abs(cand_xs - center_x)
-            # Lexsort: primary key = gap_dist, secondary = x_gap.
-            order = np.lexsort((x_gap, gap_dist))
-            return int(cand_idx[order[0]])
-
-        above_idx = _pick(center_y + distance_um)
-        below_idx = _pick(center_y - distance_um)
-
-        if above_idx is None or below_idx is None:
-            reason_bits = []
-            if above_idx is None:
-                reason_bits.append("no candidate above")
-            if below_idx is None:
-                reason_bits.append("no candidate below")
+        if distance_um <= 0:
             return signal, {
                 "used": False,
-                "reason": f"CSD unavailable ({', '.join(reason_bits)} at "
-                        f"distance {distance_um:.0f} µm)",
+                "reason": f"distance_um must be positive, got {distance_um}",
+            }
+
+        # Widest gap we'll consider at all, regardless of requested
+        # distance. Anything beyond this is a "no suitable neighbor"
+        # case rather than a "use the closest we can find" case.
+        max_gap = 3.0 * distance_um
+
+        # ---- Build the candidate pool ----
+        # Same shank, same x, strictly different y, gap <= max_gap.
+        same_shank = self.shank_ids == center_shank
+        same_x = np.isclose(self.xcoords, center_x)
+        different_y = self.ycoords != center_y
+        within_gap = np.abs(self.ycoords - center_y) <= max_gap
+        pool_mask = same_shank & same_x & different_y & within_gap
+        pool_mask[center_pos] = False  # exclude the center itself
+
+        pool_idx = np.where(pool_mask)[0]
+
+        def _pick_side(target_y: float, side: str):
+            """Among pool candidates strictly on `side` of center_y,
+            return the one whose y is closest to target_y. None if no
+            candidate exists on that side."""
+            if len(pool_idx) == 0:
+                return None
+            pool_y = self.ycoords[pool_idx]
+            if side == "above":
+                side_mask = pool_y > center_y
+            else:
+                side_mask = pool_y < center_y
+            side_idx = pool_idx[side_mask]
+            if len(side_idx) == 0:
+                return None
+            side_y = self.ycoords[side_idx]
+            # Closest to target_y (NOT closest to center).
+            gap_to_target = np.abs(side_y - target_y)
+            best_rel = int(np.argmin(gap_to_target))
+            return int(side_idx[best_rel])
+
+        above_idx = _pick_side(center_y + distance_um, "above")
+        below_idx = _pick_side(center_y - distance_um, "below")
+
+        if above_idx is None or below_idx is None:
+            reasons = []
+            if above_idx is None:
+                reasons.append(
+                    f"no same-shank, same-x channel above within "
+                    f"{max_gap:.0f} µm"
+                )
+            if below_idx is None:
+                reasons.append(
+                    f"no same-shank, same-x channel below within "
+                    f"{max_gap:.0f} µm"
+                )
+            return signal, {
+                "used": False,
+                "reason": "; ".join(reasons),
             }
 
         above_channel = int(self.channels[above_idx])
         below_channel = int(self.channels[below_idx])
-        above_dist = float(self.ycoords[above_idx]) - center_y
-        below_dist = center_y - float(self.ycoords[below_idx])
+        above_y = float(self.ycoords[above_idx])
+        below_y = float(self.ycoords[below_idx])
+        above_dist = above_y - center_y   # positive
+        below_dist = center_y - below_y   # positive
+
+        # Final sanity: both distances must be strictly positive and
+        # distinct from each other only insofar as the probe geometry
+        # allows. This is defense-in-depth -- by construction they
+        # should already be positive, since we required different_y.
+        if above_dist <= 0 or below_dist <= 0:
+            return signal, {
+                "used": False,
+                "reason": (
+                    f"non-positive neighbor gaps "
+                    f"(above={above_dist}, below={below_dist})"
+                ),
+            }
 
         start_idx = int(start_time * sr)
         end_idx = int(end_time * sr)
@@ -234,7 +311,6 @@ class PhaseAmplitudeAnalyzer:
         below_signal = raw_data[start_idx:end_idx, below_channel].flatten().astype(np.float64)
         center_signal = signal.astype(np.float64, copy=False)
 
-        # Optional bandpass on the three signals before the Laplacian.
         band_applied = False
         if band_low > 0 and band_high > band_low and band_high < sr / 2:
             from core.filters import bandpass_filter
@@ -254,8 +330,8 @@ class PhaseAmplitudeAnalyzer:
             "above_distance": float(above_dist),
             "below_distance": float(below_dist),
             "spacing": float(spacing_um),
-            "above_y": float(self.ycoords[above_idx]),
-            "below_y": float(self.ycoords[below_idx]),
+            "above_y": above_y,
+            "below_y": below_y,
             "center_y": center_y,
             "center_x": center_x,
             "band_low": band_low,
@@ -264,6 +340,9 @@ class PhaseAmplitudeAnalyzer:
             "distance_requested": float(distance_um),
         }
         return csd_signal, csd_info
+
+
+
 
         
     def compute_csd(self, signal: np.ndarray, channel_idx: int, sr: float,
@@ -459,49 +538,3 @@ class PhaseAmplitudeAnalyzer:
             "use_csd": params.use_csd,
         }
 
-    # ------------------------------------------------------------------
-    # CSD availability check (used by the UI to warn before computing)
-    # ------------------------------------------------------------------
-
-    def check_csd_availability(self, channel_idx: int, csd_spacing: float) -> dict:
-        """Returns {'available': bool, 'message': str, ...} without
-        touching any raw data -- geometry-only check."""
-        center_pos = np.where(self.channels == channel_idx)[0]
-        if len(center_pos) == 0:
-            return {"available": False, "message": f"Channel {channel_idx} not found."}
-
-        center_pos = center_pos[0]
-        center_shank = self.shank_ids[center_pos]
-        center_y = self.ycoords[center_pos]
-
-        same_shank = np.where(self.shank_ids == center_shank)[0]
-        same_shank_y = self.ycoords[same_shank]
-
-        y_above = center_y + csd_spacing
-        y_below = center_y - csd_spacing
-        above_mask = same_shank_y >= y_above
-        below_mask = same_shank_y <= y_below
-
-        if np.any(above_mask) and np.any(below_mask):
-            above_candidates = np.where(above_mask)[0]
-            below_candidates = np.where(below_mask)[0]
-            above_idx = same_shank[above_candidates[np.argmin(same_shank_y[above_mask] - y_above)]]
-            below_idx = same_shank[below_candidates[np.argmin(y_below - same_shank_y[below_mask])]]
-            above_dist = self.ycoords[above_idx] - center_y
-            below_dist = center_y - self.ycoords[below_idx]
-
-            if (csd_spacing * 0.5 < above_dist < csd_spacing * 1.5
-                    and csd_spacing * 0.5 < below_dist < csd_spacing * 1.5):
-                return {
-                    "available": True,
-                    "message": (
-                        f"CSD available: above ch {int(self.channels[above_idx])} "
-                        f"({above_dist:.0f}\u00b5m), below ch "
-                        f"{int(self.channels[below_idx])} ({below_dist:.0f}\u00b5m)"
-                    ),
-                }
-
-        return {
-            "available": False,
-            "message": "CSD not available for this channel (no suitable neighbors).",
-        }
