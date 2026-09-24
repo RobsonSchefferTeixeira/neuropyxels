@@ -43,6 +43,8 @@ from gui.theta_epoch_dialog import ThetaEpochDialog
 from core.probe_definition import ProbeDefinition
 from gui.probe_definition_dialog import ProbeDefinitionDialog
 from gui.psd_dialog import PsdDialog
+from gui.phy_units_panel import PhyUnitsPanel
+from core.phy_loader import load_phy_folder, PhyLoadError
 
 class ColorButton(QPushButton):
     """
@@ -332,16 +334,50 @@ class MainWindow(QMainWindow):
         self._open_ripple_dialogs: list[RippleDialog] = []
         self._open_theta_dialogs: list[ThetaEpochDialog] = []
         self._open_psd_dialogs: list[PsdDialog] = []
+        self.phy_units_panel: PhyUnitsPanel | None = None
 
         self._build_menu()
         self._build_trace_view()
         self._build_probe_map_dock()
         self._build_selected_channels_dock()
         self._build_display_settings_dock()
+        self._build_phy_units_dock()
         self._build_panels_menu()
         self.setStatusBar(QStatusBar())
         self._update_status("No settings file or data loaded.")
 
+    def _build_phy_units_dock(self):
+        """Dock that lists sorted units from a loaded Phy folder and
+        drives the trace view's spike raster overlay."""
+        dock = QDockWidget("Phy Units", self)
+        dock.setObjectName("phy_units_dock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea |
+            Qt.DockWidgetArea.RightDockWidgetArea
+        )
+
+        self.phy_units_panel = PhyUnitsPanel()
+        self.phy_units_panel.selectionChanged.connect(self._on_phy_units_selection_changed)
+
+        dock.setWidget(self.phy_units_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.phy_units_dock = dock
+
+        # Not shown at startup. It is opened by loading a Phy folder,
+        # or manually via the Panels menu toggle.
+        dock.setVisible(False)
+        dock.visibilityChanged.connect(self._on_phy_units_visibility_changed)
+
+
+    def _on_phy_units_visibility_changed(self, visible: bool):
+        """Keep the Panels menu checkbox in sync when the dock is
+        opened or closed via its own X button or title bar."""
+        if self.phy_units_dock_action is None:
+            return
+        self.phy_units_dock_action.blockSignals(True)
+        self.phy_units_dock_action.setChecked(visible)
+        self.phy_units_dock_action.blockSignals(False)
+        
     def _update_analysis_actions_enabled(self):
         ready = self.probe_map is not None and self.engine.data_loaded
         self.phase_amplitude_action.setEnabled(ready)
@@ -377,6 +413,17 @@ class MainWindow(QMainWindow):
         open_timestamps_action = QAction("Open Timestamps (timestamps.npy)", self)
         open_timestamps_action.triggered.connect(self._on_open_timestamps)
         file_menu.addAction(open_timestamps_action)
+
+
+        open_phy_action = QAction("Open &Kilosort/Phy Output", self)
+        open_phy_action.setToolTip(
+            "Load a Kilosort4 / Phy output folder to overlay sorted "
+            "units as a spike raster on the trace view."
+        )
+        open_phy_action.triggered.connect(self._on_open_phy_folder)
+        file_menu.addAction(open_phy_action)
+
+
 
         file_menu.addSeparator()
 
@@ -431,6 +478,12 @@ class MainWindow(QMainWindow):
         display_menu.addAction(bg_color_action)
 
         self.panels_menu = menubar.addMenu("&Panels")
+
+        self.phy_units_dock_action = QAction("Phy Units", self)
+        self.phy_units_dock_action.setCheckable(True)
+        self.phy_units_dock_action.setChecked(False)
+        self.phy_units_dock_action.toggled.connect(self._on_toggle_phy_units_dock)
+        self.panels_menu.addAction(self.phy_units_dock_action)
 
         help_menu = menubar.addMenu("&Help")
 
@@ -777,6 +830,13 @@ class MainWindow(QMainWindow):
             
         self.engine = new_engine
         self.trace_view.set_data_source(self.engine)
+        
+        # Spike rasters belong to the old recording. Clear them and
+        # blank the units panel until a new Phy folder is loaded.
+        self.trace_view.set_raster_units([])
+        if self.phy_units_panel is not None:
+            self.phy_units_panel.set_phy_data(None)
+
         self.trace_view.clear_theta_epochs()
 
         if self.probe_map is not None:
@@ -822,6 +882,14 @@ class MainWindow(QMainWindow):
             f"Loaded {path.name}  —  {new_engine.total_duration:.1f}s, "
             f"{new_engine.n_channels} channels @ {new_engine.sr:.0f} Hz"
         )
+
+    def _on_toggle_phy_units_dock(self, checked: bool):
+        """Show or hide the Phy Units dock via the Panels menu."""
+        if self.phy_units_dock is None:
+            return
+        self.phy_units_dock.setVisible(checked)
+        if checked:
+            self.phy_units_dock.raise_()
 
     def _on_open_probe_definition(self):
         """Open the definition editor, then use the resulting definition
@@ -1263,6 +1331,58 @@ class MainWindow(QMainWindow):
             if selected:
                 self.trace_view.set_spectrogram_channel(selected[0])
 
+    def _on_phy_units_selection_changed(self, cluster_ids: list):
+        if self.trace_view is not None:
+            self.trace_view.set_raster_units(cluster_ids)
+        self._update_status(f"{len(cluster_ids)} unit(s) selected for raster")
+
+    def _on_open_phy_folder(self):
+        if not self.engine.data_loaded:
+            QMessageBox.warning(
+                self, "No data loaded",
+                "Load a continuous.dat first; spike times in Phy output "
+                "are sample indices into that recording."
+            )
+            return
+
+        folder_str = QFileDialog.getExistingDirectory(
+            self, "Open Kilosort / Phy output folder"
+        )
+        if not folder_str:
+            return
+
+        success = self.engine.load_phy_folder(Path(folder_str))
+        if not success:
+            QMessageBox.critical(
+                self, "Failed to load Phy folder",
+                f"{folder_str} doesn't look like a Kilosort/Phy output "
+                "folder, or its spike_times.npy / spike_clusters.npy "
+                "couldn't be read. See the terminal for details."
+            )
+            return
+
+        # Push the loaded data into the units panel.
+        if self.phy_units_panel is not None:
+            self.phy_units_panel.set_phy_data(self.engine.phy_data)
+
+        # Show the dock and sync the Panels menu checkbox so the two
+        # stay consistent no matter how the user opens it.
+        if self.phy_units_dock is not None:
+            self.phy_units_dock.setVisible(True)
+            self.phy_units_dock.raise_()
+        if self.phy_units_dock_action is not None:
+            self.phy_units_dock_action.blockSignals(True)
+            self.phy_units_dock_action.setChecked(True)
+            self.phy_units_dock_action.blockSignals(False)
+
+        # Clear any previously-selected units in the trace view; the
+        # new folder's unit ids refer to a different sort.
+        self.trace_view.set_raster_units([])
+
+        n_units = len(self.engine.phy_data.units)
+        self._update_status(
+            f"Loaded Phy folder: {Path(folder_str).name} — {n_units} unit(s)"
+        )
     # ------------------------------------------------------------------
     # Misc
     # ------------------------------------------------------------------

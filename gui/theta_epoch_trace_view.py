@@ -345,12 +345,14 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
             return
 
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if self.theta_epochs:
-            self._draw_theta_epochs(painter)
-        if self._theta_creating_channel is not None and self._theta_creating_start_sample is not None:
-            self._draw_theta_creation_preview(painter)
-        painter.end()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if self.theta_epochs:
+                self._draw_theta_epochs(painter)
+            if self._theta_creating_channel is not None and self._theta_creating_start_sample is not None:
+                self._draw_theta_creation_preview(painter)
+        finally:
+            painter.end()
 
     def _draw_theta_creation_preview(self, painter: QPainter):
         """Live rectangle shown while dragging out a new epoch (armed

@@ -473,30 +473,26 @@ class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
         super().paintEvent(event)
 
         if not self._sorted_channels:
-            # Still draw the time cursors even with no channels selected:
-            # they live in time space, not channel space.
             painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            self._draw_time_cursors_on_top(painter)
-            painter.end()
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                self._draw_time_cursors_on_top(painter)
+            finally:
+                painter.end()
             return
 
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        if self._ripple_render_context:
-            self._draw_ripple_render_context(painter)
-        if self.ripple_events:
-            self._draw_ripple_events(painter)
-        if self._ripple_creating_channel is not None and self._ripple_creating_start_sample is not None:
-            self._draw_ripple_creation_preview(painter)
-
-        # Time cursors draw last so they sit on top of every overlay
-        # (theta, ripple, spectrogram, traces). The ruler must be the
-        # topmost layer of the trace view.
-        self._draw_time_cursors_on_top(painter)
-
-        painter.end()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if self._ripple_render_context:
+                self._draw_ripple_render_context(painter)
+            if self.ripple_events:
+                self._draw_ripple_events(painter)
+            if self._ripple_creating_channel is not None and self._ripple_creating_start_sample is not None:
+                self._draw_ripple_creation_preview(painter)
+            self._draw_time_cursors_on_top(painter)
+        finally:
+            painter.end()
 
     def _ripple_context_stats(self, channel: int, ctx: dict, key: str = "envelope"):
         cache_key = f"_stats_cache_{key}"

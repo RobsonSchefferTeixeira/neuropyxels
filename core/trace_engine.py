@@ -77,7 +77,7 @@ class TraceEngine:
         self.timestamp_end = 0.0
         self.timestamp_duration = 0.0
 
-
+        self.phy_data = None
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
@@ -150,6 +150,49 @@ class TraceEngine:
 
         self.loaded_spikes = True
         return True
+
+    # ------------------------------------------------------------------
+    # Phy / Kilosort unit data (spike rasters)
+    # ------------------------------------------------------------------
+
+    def load_phy_folder(self, folder) -> bool:
+        """Load a Phy folder's spike times / clusters / cluster_info.
+        Returns True on success, False if the folder doesn't look like
+        Phy output (in which case the caller should surface a message).
+        The loaded object is stored on self.phy_data."""
+        from core.phy_loader import load_phy_folder, PhyLoadError
+        try:
+            self.phy_data = load_phy_folder(folder)
+        except PhyLoadError as exc:
+            print(f"[phy] load failed: {exc}")
+            self.phy_data = None
+            return False
+        except Exception as exc:
+            print(f"[phy] unexpected error: {exc}")
+            self.phy_data = None
+            return False
+
+        self.loaded_spikes = True
+        return True
+
+    def spikes_for_unit_in_time_window(
+        self, cluster_id: int, start_time: float, end_time: float
+    ) -> np.ndarray:
+        """Return spike sample indices (absolute, in the recording's
+        sample index space) for one unit in [start_time, end_time).
+
+        The sample index space matches what Phy stores in
+        spike_times.npy: integer sample indices at the recording's
+        original sample rate (self.sr). No timestamps.npy awareness
+        here on purpose -- Phy doesn't know about timestamps.npy
+        either, so a units overlay is only meaningful in "elapsed
+        seconds" mode, same convention as the ripple detector.
+        """
+        if getattr(self, "phy_data", None) is None:
+            return np.array([], dtype=np.int64)
+        start_sample = int(start_time * self.sr)
+        end_sample = int(end_time * self.sr)
+        return self.phy_data.spikes_for_unit_in_window(cluster_id, start_sample, end_sample)
 
     # ------------------------------------------------------------------
     # Channel selection and depths

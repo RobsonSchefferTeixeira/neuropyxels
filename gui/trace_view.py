@@ -655,6 +655,14 @@ class TraceViewWidget(QWidget):
         self._cache_start_idx = None
         self._cache_end_idx = None
 
+        # ---- Phy spike raster overlay ----
+        # Set of cluster ids to draw as a raster, and per-unit display
+        # color. The unit-to-channel mapping comes from engine.phy_data;
+        # if that's None (no Phy folder loaded) nothing is drawn.
+        self._raster_unit_ids: list[int] = []
+        self._raster_unit_colors: dict[int, QColor] = {}
+        self.show_spike_raster = True
+
         # ---- Spectrogram ----
         self.show_spectrogram = False
         self.spectrogram_channel = None
@@ -693,6 +701,7 @@ class TraceViewWidget(QWidget):
 
         if engine.data_loaded:
             self._setup_from_engine()
+
 
     # ------------------------------------------------------------------
     # UI scaffolding
@@ -764,6 +773,8 @@ class TraceViewWidget(QWidget):
             self._update_scrollbar_range()
             self._update_time_labels()
             self.update()
+
+
 
     # ------------------------------------------------------------------
     # Control panel handlers
@@ -1836,7 +1847,7 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _apply_filters(self, data: np.ndarray) -> np.ndarray:
-        print(f"[FILTER] enabled={self.filter_enabled} low={self.filter_low_freq} high={self.filter_high_freq} shape={data.shape}")
+        # print(f"[FILTER] enabled={self.filter_enabled} low={self.filter_low_freq} high={self.filter_high_freq} shape={data.shape}")
 
         """Apply all enabled global filters."""
         if not self.filter_enabled and not self.notch_enabled and not self.detrend_enabled:
@@ -2032,6 +2043,14 @@ class TraceViewWidget(QWidget):
 
     def set_data_source(self, engine: TraceEngine):
         self.engine = engine
+
+        # A new data source means any previously-selected units no
+        # longer apply -- their spike times belong to the old recording.
+        # Clear raster state BEFORE the repaint so the first paint with
+        # the new engine never shows stale ticks.
+        self._raster_unit_ids = []
+        self._raster_unit_colors = {}
+        self._raster_overflow_warned = False
         if engine.data_loaded:
             self._data_loaded = True
             self._setup_from_engine()
@@ -2040,6 +2059,7 @@ class TraceViewWidget(QWidget):
         else:
             self._data_loaded = False
             self.control_panel.set_timestamps_available(False)
+
         self._invalidate_cache()
         self.update()
 
@@ -2355,55 +2375,64 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
-
     def paintEvent(self, event):
-    
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        self._update_channel_buttons()
+            self._update_channel_buttons()
 
-        rect = self.rect()
-        if hasattr(self, 'scrollbar'):
-            rect.setBottom(rect.bottom() - self.scrollbar.height())
+            rect = self.rect()
+            if hasattr(self, 'scrollbar'):
+                rect.setBottom(rect.bottom() - self.scrollbar.height())
 
-        painter.fillRect(rect, self.background_color)
+            painter.fillRect(rect, self.background_color)
 
-        if not self._data_loaded:
-            painter.setPen(QColor("#888888"))
-            font = QFont()
-            font.setPointSize(14)
-            painter.setFont(font)
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No data loaded.")
-            return
+            if not self._data_loaded:
+                painter.setPen(QColor("#888888"))
+                font = QFont()
+                font.setPointSize(14)
+                painter.setFont(font)
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No data loaded.")
+                return
 
-        if not self.channels:
-            painter.setPen(QColor("#888888"))
-            font = QFont()
-            font.setPointSize(12)
-            painter.setFont(font)
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Select channels from the probe map to display traces.")
+            if not self.channels:
+                painter.setPen(QColor("#888888"))
+                font = QFont()
+                font.setPointSize(12)
+                painter.setFont(font)
+                painter.drawText(
+                    rect, Qt.AlignmentFlag.AlignCenter,
+                    "Select channels from the probe map to display traces."
+                )
+                return
+
+            if self.show_grid:
+                self._draw_grid(painter, rect)
+
+            data = self._get_data_for_display()
+            self._draw_traces(painter, rect, data)
+
+            if self.show_spike_raster and self._raster_unit_ids:
+                self._draw_spike_raster(painter, rect)
+
+            if self.show_spectrogram:
+                self._draw_spectrogram(painter)
+
+            # Time cursors are drawn last by the topmost subclass
+            # (RippleTraceViewWidget.paintEvent), via
+            # _draw_time_cursors_on_top, so they sit above every
+            # overlay.
+
+            if self.show_time_axis:
+                self._draw_time_axis(painter, rect)
+
+            if self.show_depth_scale:
+                self._draw_depth_scale(painter, rect, data)
+        finally:
+            painter.end()
+
             
-            return
-
-        if self.show_grid:
-            self._draw_grid(painter, rect)
-
-        data = self._get_data_for_display()
-
-        self._draw_traces(painter, rect, data)
-
-        if self.show_spectrogram:
-            self._draw_spectrogram(painter)
-
-        if self.show_time_axis:
-            self._draw_time_axis(painter, rect)
-
-        # if self.show_channel_labels:
-        #    self._draw_channel_labels(painter, rect, data)
-
-        if self.show_depth_scale:
-            self._draw_depth_scale(painter, rect, data)
 
     def _draw_time_cursors(self, painter: QPainter, rect: QRectF):
         if not self._time_cursors:
@@ -2512,6 +2541,107 @@ class TraceViewWidget(QWidget):
         for i in range(num_h_lines + 1):
             y = rect.top() + ((plot_bottom - rect.top()) * i / num_h_lines)
             painter.drawLine(int(rect.left()), int(y), int(rect.right()), int(y))
+
+    def _draw_spike_raster(self, painter: QPainter, rect: QRectF):
+        """Draw one vertical tick per spike, in the lane of the unit's
+        assigned channel. Only draws units whose channel is in the
+        currently-displayed set, and only spikes within the visible
+        time window.
+
+        The tick spans a fraction of the lane height (not the full
+        height) so it doesn't obscure the trace underneath.
+        """
+        phy_data = getattr(self.engine, "phy_data", None)
+        if phy_data is None:
+            return
+
+        display_channels = self.get_display_order()
+        if not display_channels:
+            return
+
+        channel_to_row = {ch: idx for idx, ch in enumerate(display_channels)}
+
+        plot_left, plot_right, plot_bottom = self._get_plot_bounds()
+        plot_top = rect.top()
+        plot_width = plot_right - plot_left
+        plot_height = plot_bottom - plot_top
+        if plot_width <= 0 or plot_height <= 0:
+            return
+
+        n_channels = len(display_channels)
+        channel_height = plot_height / n_channels
+
+        start_time = float(self.start_time)
+        end_time = start_time + float(self.window_duration)
+        if end_time <= start_time:
+            return
+
+        tick_half_h = max(2.0, channel_height * 0.28)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        # Cap the total number of ticks drawn in one frame to keep the
+        # paint cost bounded, even if the user selects a huge number
+        # of high-firing-rate units. If exceeded, we stop drawing and
+        # emit a one-time warning to stderr (not per-paint).
+        max_total_ticks = 200_000
+        total_drawn = 0
+
+        for cid in self._raster_unit_ids:
+            unit = phy_data.units.get(cid)
+            if unit is None or unit.channel is None:
+                continue
+
+            ch = int(unit.channel)
+            row = channel_to_row.get(ch)
+            if row is None:
+                # Unit's channel isn't currently displayed -- skip.
+                continue
+
+            spikes = self.engine.spikes_for_unit_in_time_window(cid, start_time, end_time)
+            if spikes.size == 0:
+                continue
+
+            # Convert absolute spike samples to seconds (elapsed-time
+            # convention, same as the ripple detector).
+            spike_times = spikes.astype(np.float64) / float(self.engine.sr)
+            x_ratios = (spike_times - start_time) / (end_time - start_time)
+            x_pixels = plot_left + x_ratios * plot_width
+
+            y_center = (
+                plot_bottom
+                - (row + 0.5) * channel_height
+                + self._channel_offset * channel_height
+            )
+            if y_center + tick_half_h < plot_top or y_center - tick_half_h > plot_bottom:
+                continue
+
+            color = self._raster_unit_colors.get(
+                cid, self._default_raster_color(0)
+            )
+            painter.setPen(QPen(color, 1.4))
+
+            y_top = int(y_center - tick_half_h)
+            y_bottom = int(y_center + tick_half_h)
+
+            for x in x_pixels:
+                if x < plot_left or x > plot_right:
+                    continue
+                painter.drawLine(int(x), y_top, int(x), y_bottom)
+                total_drawn += 1
+                if total_drawn >= max_total_ticks:
+                    if not getattr(self, "_raster_overflow_warned", False):
+                        print(
+                            f"[raster] drew {max_total_ticks} spike ticks and "
+                            f"stopped; reduce the number of selected units or "
+                            f"zoom in for full detail."
+                        )
+                        self._raster_overflow_warned = True
+                    painter.restore()
+                    return
+
+        painter.restore()
 
     def _draw_traces(self, painter: QPainter, rect: QRectF, data: dict):
         display_channels = self.get_display_order()
@@ -2889,6 +3019,32 @@ class TraceViewWidget(QWidget):
             btn.move(5, int(y_center - button_height / 2))
             btn.setFixedSize(button_width, button_height)
 
+
+
+
+    def set_raster_units(self, cluster_ids: list[int]):
+        """Set which units to draw as a spike raster."""
+        self._raster_unit_ids = list(cluster_ids)
+        # Ensure every unit has a color assigned.
+        for cid in self._raster_unit_ids:
+            if cid not in self._raster_unit_colors:
+                self._raster_unit_colors[cid] = self._default_raster_color(len(self._raster_unit_colors))
+        self.update()
+
+    def set_spike_raster_visible(self, visible: bool):
+        self.show_spike_raster = bool(visible)
+        self.update()
+
+    @staticmethod
+    def _default_raster_color(index: int) -> QColor:
+        """A small palette that reads on the dark background and
+        cycles if the user selects more units than colors."""
+        palette = [
+            "#ffd23f", "#4cc9f0", "#f72585", "#42d77d",
+            "#c77dff", "#ff9f1c", "#3a86ff", "#ff6b6b",
+        ]
+        from PyQt6.QtGui import QColor
+        return QColor(palette[index % len(palette)])
     # ------------------------------------------------------------------
     # Event handling
     # ------------------------------------------------------------------
@@ -3325,3 +3481,4 @@ class SpectrogramControlPanel(QWidget):
 
     def set_max_db(self, value: float):
         self.max_db_spin.setValue(float(value))
+
