@@ -412,7 +412,28 @@ class ProbeMapWidget(QWidget):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def set_selected_channels(self, channels: list[int]):
+        """Programmatically set the selection to exactly `channels`,
+        clearing any previous selection. Used by MainWindow's focus
+        mode to push a neighborhood selection into the probe map
+        without simulating user clicks.
 
+        Channels already in the excluded state (state == 2) are left
+        excluded, not selected -- excluded means "user explicitly
+        rejected this channel", and focus mode shouldn't silently
+        override that. Channels in `channels` that are not excluded
+        get state 1 (selected); everything else not in the list and
+        not excluded gets state 0 (active).
+        """
+        wanted = set(int(c) for c in channels)
+        for ch, idx in self._chan_to_idx.items():
+            if self.state[idx] == 2:
+                # Excluded channels stay excluded; don't touch.
+                continue
+            self.state[idx] = 1 if ch in wanted else 0
+        self._update_colors()
+        self._emit_selection()
+        
     def select_all(self):
         self.state[self.state != 2] = 1
         self._update_colors()

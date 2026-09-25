@@ -363,6 +363,11 @@ class MainWindow(QMainWindow):
         self.phy_units_panel.recolorVisibleChanged.connect(self._on_recolor_visible_changed)
         self.phy_units_panel.recolorWindowChanged.connect(self._on_recolor_window_changed)
 
+        self.phy_units_panel.focusModeChanged.connect(self._on_focus_mode_changed)
+        self.phy_units_panel.focusNeighborhoodChanged.connect(self._on_focus_neighborhood_size_changed)
+        self.phy_units_panel.focusedUnitChanged.connect(self._on_focused_unit_changed)
+
+
         dock.setWidget(self.phy_units_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.phy_units_dock = dock
@@ -371,6 +376,255 @@ class MainWindow(QMainWindow):
         # or manually via the Panels menu toggle.
         dock.setVisible(False)
         dock.visibilityChanged.connect(self._on_phy_units_visibility_changed)
+
+
+
+    def _on_focus_mode_changed(self, enabled: bool):
+        """Entering focus mode clears the current display so the user
+        sees an empty trace view and an empty probe map, then waits
+        for a unit to be selected. Leaving focus mode does nothing
+        automatic -- the current selection stays in place, and
+        multi-select is re-enabled in the panel."""
+        if enabled:
+            # Clear trace view + probe map.
+            if self.trace_view is not None:
+                self.trace_view.set_raster_units([])
+                self.trace_view.set_channels([])
+            if self.probe_map is not None:
+                self.probe_map.set_selected_channels([])
+            if hasattr(self, "selected_list"):
+                self.selected_list.clear()
+            self._update_status(
+                "Focus mode: select one unit to open its local "
+                "neighborhood."
+            )
+
+    def _on_focus_neighborhood_size_changed(self, _n: int):
+        """If a unit is already focused, recompute its neighborhood
+        with the new size."""
+        if not self.phy_units_panel.focus_mode_enabled():
+            return
+        unit_id = self.phy_units_panel.focused_unit_id()
+        if unit_id >= 0:
+            self._apply_focus_neighborhood(unit_id)
+
+    def _on_focused_unit_changed(self, unit_id: int):
+        """Apply or clear focus for the given unit id. -1 means no
+        unit is selected (either deselected or focus mode is off)."""
+        if unit_id < 0:
+            if self.phy_units_panel.focus_mode_enabled():
+                # User deselected inside focus mode -- clear the view
+                # so it's obvious nothing is focused right now.
+                if self.trace_view is not None:
+                    self.trace_view.set_raster_units([])
+                    self.trace_view.set_channels([])
+                if self.probe_map is not None:
+                    self.probe_map.set_selected_channels([])
+                if hasattr(self, "selected_list"):
+                    self.selected_list.clear()
+            return
+        if not self.phy_units_panel.focus_mode_enabled():
+            return
+        self._apply_focus_neighborhood(unit_id)
+
+    def _apply_focus_neighborhood(self, unit_id: int):
+        """Look up the unit's channel, compute its neighborhood, and
+        push the resulting channel set to both the trace view and the
+        probe map. Also set the unit as the sole raster unit."""
+        phy_data = getattr(self.engine, "phy_data", None)
+        if phy_data is None:
+            return
+        unit = phy_data.units.get(int(unit_id))
+        if unit is None or unit.channel is None:
+            self._update_status(
+                f"Focus mode: unit {unit_id} has no assigned channel."
+            )
+            return
+
+        center_ch = int(unit.channel)
+        n_levels = self.phy_units_panel.focus_neighborhood_size()
+        neighborhood = self.trace_view.compute_focus_neighborhood(
+            center_ch, n_levels
+        )
+        if not neighborhood:
+            self._update_status(
+                f"Focus mode: could not compute neighborhood for "
+                f"unit {unit_id} (CH{center_ch}) -- is the probe "
+                f"geometry loaded?"
+            )
+            return
+
+        # Push to the trace view first, then to the probe map. Both
+        # use the same channel list, so selection stays consistent
+        # between the two views.
+        self.trace_view.set_channels(neighborhood)
+        self.trace_view.set_raster_units([int(unit_id)])
+
+        if self.probe_map is not None:
+            self.probe_map.set_selected_channels(neighborhood)
+
+        # Mirror the selection in the Selected Channels list.
+        if hasattr(self, "selected_list"):
+            from PyQt6.QtWidgets import QListWidgetItem
+            self.selected_list.clear()
+            for ch in neighborhood:
+                self.selected_list.addItem(QListWidgetItem(f"CH{ch}"))
+            self.selected_channels_dock.setWindowTitle(
+                f"Selected Channels ({len(neighborhood)})"
+            )
+
+        # Push depth info to the trace view for the new channel set.
+        if self._current_probe_key and self._probes:
+            probe_data = self._probes["probes"][self._current_probe_key]
+            depths = dict(zip(
+                probe_data["coordinates"]["channels"],
+                probe_data["coordinates"]["y"],
+            ))
+            self.trace_view.set_channel_depths(depths)
+            xcoords = dict(zip(
+                probe_data["coordinates"]["channels"],
+                probe_data["coordinates"]["x"],
+            ))
+            self.trace_view.set_channel_xcoords(xcoords)
+            shank_ids = (
+                probe_data.get("shanks", {}).get("ids")
+                or [0] * len(probe_data["coordinates"]["channels"])
+            )
+            shank_map = dict(zip(
+                probe_data["coordinates"]["channels"], shank_ids
+            ))
+            self.trace_view.set_channel_shanks(shank_map)
+            self.trace_view.set_full_probe_geometry(
+                depths, shank_map, xcoords
+            )
+
+        self._update_status(
+            f"Focus mode: unit {unit_id} (CH{center_ch}) — "
+            f"{len(neighborhood)} channel(s) in neighborhood."
+        )
+    def _on_focus_mode_changed(self, enabled: bool):
+        """Entering focus mode clears the current display so the user
+        sees an empty trace view and an empty probe map, then waits
+        for a unit to be selected. Leaving focus mode does nothing
+        automatic -- the current selection stays in place, and
+        multi-select is re-enabled in the panel."""
+        if enabled:
+            # Clear trace view + probe map.
+            if self.trace_view is not None:
+                self.trace_view.set_raster_units([])
+                self.trace_view.set_channels([])
+            if self.probe_map is not None:
+                self.probe_map.set_selected_channels([])
+            if hasattr(self, "selected_list"):
+                self.selected_list.clear()
+            self._update_status(
+                "Focus mode: select one unit to open its local "
+                "neighborhood."
+            )
+
+    def _on_focus_neighborhood_size_changed(self, _n: int):
+        """If a unit is already focused, recompute its neighborhood
+        with the new size."""
+        if not self.phy_units_panel.focus_mode_enabled():
+            return
+        unit_id = self.phy_units_panel.focused_unit_id()
+        if unit_id >= 0:
+            self._apply_focus_neighborhood(unit_id)
+
+    def _on_focused_unit_changed(self, unit_id: int):
+        """Apply or clear focus for the given unit id. -1 means no
+        unit is selected (either deselected or focus mode is off)."""
+        if unit_id < 0:
+            if self.phy_units_panel.focus_mode_enabled():
+                # User deselected inside focus mode -- clear the view
+                # so it's obvious nothing is focused right now.
+                if self.trace_view is not None:
+                    self.trace_view.set_raster_units([])
+                    self.trace_view.set_channels([])
+                if self.probe_map is not None:
+                    self.probe_map.set_selected_channels([])
+                if hasattr(self, "selected_list"):
+                    self.selected_list.clear()
+            return
+        if not self.phy_units_panel.focus_mode_enabled():
+            return
+        self._apply_focus_neighborhood(unit_id)
+
+    def _apply_focus_neighborhood(self, unit_id: int):
+        """Look up the unit's channel, compute its neighborhood, and
+        push the resulting channel set to both the trace view and the
+        probe map. Also set the unit as the sole raster unit."""
+        phy_data = getattr(self.engine, "phy_data", None)
+        if phy_data is None:
+            return
+        unit = phy_data.units.get(int(unit_id))
+        if unit is None or unit.channel is None:
+            self._update_status(
+                f"Focus mode: unit {unit_id} has no assigned channel."
+            )
+            return
+
+        center_ch = int(unit.channel)
+        n_levels = self.phy_units_panel.focus_neighborhood_size()
+        neighborhood = self.trace_view.compute_focus_neighborhood(
+            center_ch, n_levels
+        )
+        if not neighborhood:
+            self._update_status(
+                f"Focus mode: could not compute neighborhood for "
+                f"unit {unit_id} (CH{center_ch}) -- is the probe "
+                f"geometry loaded?"
+            )
+            return
+
+        # Push to the trace view first, then to the probe map. Both
+        # use the same channel list, so selection stays consistent
+        # between the two views.
+        self.trace_view.set_channels(neighborhood)
+        self.trace_view.set_raster_units([int(unit_id)])
+
+        if self.probe_map is not None:
+            self.probe_map.set_selected_channels(neighborhood)
+
+        # Mirror the selection in the Selected Channels list.
+        if hasattr(self, "selected_list"):
+            from PyQt6.QtWidgets import QListWidgetItem
+            self.selected_list.clear()
+            for ch in neighborhood:
+                self.selected_list.addItem(QListWidgetItem(f"CH{ch}"))
+            self.selected_channels_dock.setWindowTitle(
+                f"Selected Channels ({len(neighborhood)})"
+            )
+
+        # Push depth info to the trace view for the new channel set.
+        if self._current_probe_key and self._probes:
+            probe_data = self._probes["probes"][self._current_probe_key]
+            depths = dict(zip(
+                probe_data["coordinates"]["channels"],
+                probe_data["coordinates"]["y"],
+            ))
+            self.trace_view.set_channel_depths(depths)
+            xcoords = dict(zip(
+                probe_data["coordinates"]["channels"],
+                probe_data["coordinates"]["x"],
+            ))
+            self.trace_view.set_channel_xcoords(xcoords)
+            shank_ids = (
+                probe_data.get("shanks", {}).get("ids")
+                or [0] * len(probe_data["coordinates"]["channels"])
+            )
+            shank_map = dict(zip(
+                probe_data["coordinates"]["channels"], shank_ids
+            ))
+            self.trace_view.set_channel_shanks(shank_map)
+            self.trace_view.set_full_probe_geometry(
+                depths, shank_map, xcoords
+            )
+
+        self._update_status(
+            f"Focus mode: unit {unit_id} (CH{center_ch}) — "
+            f"{len(neighborhood)} channel(s) in neighborhood."
+        )
 
     def _on_raster_visible_changed(self, visible: bool):
         if self.trace_view is not None:

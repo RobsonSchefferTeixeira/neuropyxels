@@ -19,10 +19,12 @@ recolorWindowChanged(float)
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
+
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QCheckBox, QPushButton, QDoubleSpinBox,
+    QCheckBox, QPushButton, QDoubleSpinBox, QSpinBox,
 )
 
 from core.phy_loader import PhyData, Unit
@@ -41,6 +43,10 @@ class PhyUnitsPanel(QWidget):
     rasterVisibleChanged = pyqtSignal(bool)
     recolorVisibleChanged = pyqtSignal(bool)
     recolorWindowChanged = pyqtSignal(float)
+    focusModeChanged = pyqtSignal(bool)
+    focusNeighborhoodChanged = pyqtSignal(int)
+    focusedUnitChanged = pyqtSignal(int)   # -1 when no focused unit
+        
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,6 +95,38 @@ class PhyUnitsPanel(QWidget):
 
         action_row.addStretch(1)
         layout.addLayout(action_row)
+
+
+        # ---- Focus mode row ----
+        focus_row = QHBoxLayout()
+
+        self.focus_check = QCheckBox("Focus mode")
+        self.focus_check.setChecked(False)
+        self.focus_check.setToolTip(
+            "Select exactly one unit at a time and automatically open "
+            "that unit's local neighborhood on the trace view and probe "
+            "map. Channels are replaced, not added -- turning focus mode "
+            "off leaves the current selection in place."
+        )
+        self.focus_check.toggled.connect(self._on_focus_toggled)
+        focus_row.addWidget(self.focus_check)
+
+        focus_row.addWidget(QLabel("± channels:"))
+        self.focus_n_spin = QSpinBox()
+        self.focus_n_spin.setRange(1, 20)
+        self.focus_n_spin.setValue(5)
+        self.focus_n_spin.setToolTip(
+            "Number of depth levels above and below the focused unit's "
+            "depth to include. All channels at each selected depth on "
+            "the same shank are included (across all x positions on "
+            "that shank)."
+        )
+        self.focus_n_spin.valueChanged.connect(self.focusNeighborhoodChanged.emit)
+        focus_row.addWidget(self.focus_n_spin)
+
+        focus_row.addStretch(1)
+        layout.addLayout(focus_row)
+
 
         # ---- Spike visualization controls ----
         spike_row = QHBoxLayout()
@@ -261,9 +299,31 @@ class PhyUnitsPanel(QWidget):
     # ------------------------------------------------------------------
     # Selection events
     # ------------------------------------------------------------------
-
     def _on_selection_changed(self):
-        self.selectionChanged.emit(self.selected_cluster_ids())
+        selected = self.selected_cluster_ids()
+        if self.focus_check.isChecked() and len(selected) > 1:
+            # Belt-and-suspenders: the table's SelectionMode should
+            # already prevent this, but if anything ever slips through,
+            # collapse to the first.
+            selected = [selected[0]]
+            self.table.blockSignals(True)
+            first_cid = selected[0]
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 0)
+                if item is None:
+                    continue
+                if item.data(Qt.ItemDataRole.UserRole) == first_cid:
+                    self.table.clearSelection()
+                    item.setSelected(True)
+                    break
+            self.table.blockSignals(False)
+
+        self.selectionChanged.emit(selected)
+
+        if self.focus_check.isChecked():
+            self.focusedUnitChanged.emit(
+                int(selected[0]) if selected else -1
+            )
 
     def _select_all_good(self):
         self.table.blockSignals(True)
@@ -279,3 +339,66 @@ class PhyUnitsPanel(QWidget):
         self.table.clearSelection()
         self.table.blockSignals(False)
         self.selectionChanged.emit([])
+
+
+    def _on_focus_toggled(self, checked: bool):
+        """Focus mode restricts the table to single-selection and
+        emits the new state. The panel itself doesn't know how to
+        compute neighborhoods -- it just reports intent; MainWindow
+        does the computation."""
+        if checked:
+            self.table.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+            # Collapse an existing multi-selection down to the first
+            # selected row, so turning focus mode on doesn't leave the
+            # table in an inconsistent state.
+            selected = self.selected_cluster_ids()
+            if len(selected) > 1:
+                self.table.blockSignals(True)
+                first_cid = selected[0]
+                for row in range(self.table.rowCount()):
+                    item = self.table.item(row, 0)
+                    if item is None:
+                        continue
+                    if item.data(Qt.ItemDataRole.UserRole) == first_cid:
+                        self.table.clearSelection()
+                        item.setSelected(True)
+                        break
+                self.table.blockSignals(False)
+                self.selectionChanged.emit([first_cid])
+            elif len(selected) == 1:
+                # Already fine; just re-emit so MainWindow runs its
+                # focus pipeline on the now-active mode.
+                self.selectionChanged.emit(selected)
+            # If nothing selected, nothing to do until the user picks.
+        else:
+            self.table.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+        self.focusModeChanged.emit(bool(checked))
+        if checked:
+            selected = self.selected_cluster_ids()
+            self.focusedUnitChanged.emit(
+                int(selected[0]) if selected else -1
+            )
+        else:
+            self.focusedUnitChanged.emit(-1)
+
+    def focus_mode_enabled(self) -> bool:
+        return bool(self.focus_check.isChecked())
+
+    def focus_neighborhood_size(self) -> int:
+        return int(self.focus_n_spin.value())
+
+    def focused_unit_id(self) -> int:
+        ids = self.selected_cluster_ids()
+        return int(ids[0]) if ids else -1
+
+    def set_focus_mode(self, enabled: bool):
+        """Programmatically set focus mode without re-emitting the
+        toggle handler's full side-effect chain beyond what's needed."""
+        self.focus_check.blockSignals(True)
+        self.focus_check.setChecked(bool(enabled))
+        self.focus_check.blockSignals(False)
+        self._on_focus_toggled(bool(enabled))

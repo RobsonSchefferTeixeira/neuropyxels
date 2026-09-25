@@ -3132,7 +3132,52 @@ class TraceViewWidget(QWidget):
             btn.setFixedSize(button_width, button_height)
 
 
+    def compute_focus_neighborhood(self, center_channel: int, n_levels: int) -> list[int]:
+        """Return the list of channels forming the local neighborhood
+        of `center_channel` on its shank.
 
+        Rules:
+          - Same shank as center_channel.
+          - Neighborhood is defined in terms of DEPTH LEVELS, not
+            individual channels: on probes where multiple channels
+            share the same y on the same shank (different x), they
+            count as ONE level. All channels at a chosen level are
+            included in the result, regardless of x.
+          - N levels above and N levels below the center channel's
+            level, inclusive of the center's own level.
+
+        Returns an empty list if the full-probe geometry hasn't been
+        loaded or center_channel isn't in it.
+        """
+        depths = self.full_probe_depths
+        shanks = self.full_probe_shanks
+        if not depths or not shanks or center_channel not in depths:
+            return []
+
+        center_shank = int(shanks.get(center_channel, 0))
+        center_y = float(depths[center_channel])
+
+        # Group channels on this shank by depth level.
+        levels: dict[float, list[int]] = {}
+        for ch, y in depths.items():
+            if int(shanks.get(ch, 0)) != center_shank:
+                continue
+            levels.setdefault(float(y), []).append(int(ch))
+
+        if center_y not in levels:
+            return []
+
+        sorted_depths = sorted(levels.keys())
+        center_idx = sorted_depths.index(center_y)
+
+        lo = max(0, center_idx - int(n_levels))
+        hi = min(len(sorted_depths) - 1, center_idx + int(n_levels))
+
+        neighborhood: list[int] = []
+        for y in sorted_depths[lo:hi + 1]:
+            neighborhood.extend(sorted(levels[y]))
+
+        return neighborhood
 
     def set_raster_units(self, cluster_ids: list[int]):
         """Set which units to draw as a spike raster."""
