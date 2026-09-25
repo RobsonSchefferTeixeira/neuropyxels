@@ -359,6 +359,10 @@ class MainWindow(QMainWindow):
         self.phy_units_panel = PhyUnitsPanel()
         self.phy_units_panel.selectionChanged.connect(self._on_phy_units_selection_changed)
 
+        self.phy_units_panel.rasterVisibleChanged.connect(self._on_raster_visible_changed)
+        self.phy_units_panel.recolorVisibleChanged.connect(self._on_recolor_visible_changed)
+        self.phy_units_panel.recolorWindowChanged.connect(self._on_recolor_window_changed)
+
         dock.setWidget(self.phy_units_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.phy_units_dock = dock
@@ -368,6 +372,17 @@ class MainWindow(QMainWindow):
         dock.setVisible(False)
         dock.visibilityChanged.connect(self._on_phy_units_visibility_changed)
 
+    def _on_raster_visible_changed(self, visible: bool):
+        if self.trace_view is not None:
+            self.trace_view.set_spike_raster_visible(visible)
+
+    def _on_recolor_visible_changed(self, visible: bool):
+        if self.trace_view is not None:
+            self.trace_view.set_spike_recolor_visible(visible)
+
+    def _on_recolor_window_changed(self, window_ms: float):
+        if self.trace_view is not None:
+            self.trace_view.set_spike_recolor_window_ms(window_ms)
 
     def _on_phy_units_visibility_changed(self, visible: bool):
         """Keep the Panels menu checkbox in sync when the dock is
@@ -836,6 +851,12 @@ class MainWindow(QMainWindow):
         self.trace_view.set_raster_units([])
         if self.phy_units_panel is not None:
             self.phy_units_panel.set_phy_data(None)
+        if self.phy_units_panel is not None:
+            self.phy_units_panel.set_recolor_enabled(False)
+        if self.trace_view is not None:
+            self.trace_view.set_spike_recolor_visible(False)
+
+
 
         self.trace_view.clear_theta_epochs()
 
@@ -888,6 +909,7 @@ class MainWindow(QMainWindow):
         if self.phy_units_dock is None:
             return
         self.phy_units_dock.setVisible(checked)
+        self.phy_units_dock.setFloating(True)
         if checked:
             self.phy_units_dock.raise_()
 
@@ -1369,6 +1391,7 @@ class MainWindow(QMainWindow):
         # stay consistent no matter how the user opens it.
         if self.phy_units_dock is not None:
             self.phy_units_dock.setVisible(True)
+            self.phy_units_dock.setFloating(True)
             self.phy_units_dock.raise_()
         if self.phy_units_dock_action is not None:
             self.phy_units_dock_action.blockSignals(True)

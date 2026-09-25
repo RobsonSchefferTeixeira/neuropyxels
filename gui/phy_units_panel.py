@@ -8,6 +8,12 @@ Signals
 -------
 selectionChanged(list[int])
     Emitted whenever the set of selected cluster ids changes.
+rasterVisibleChanged(bool)
+    Emitted when the "Raster ticks" checkbox is toggled.
+recolorVisibleChanged(bool)
+    Emitted when the "Recolor trace at spikes" checkbox is toggled.
+recolorWindowChanged(float)
+    Emitted when the "Window (ms)" spinbox value changes.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QCheckBox, QPushButton,
+    QCheckBox, QPushButton, QDoubleSpinBox,
 )
 
 from core.phy_loader import PhyData, Unit
@@ -27,10 +33,14 @@ class PhyUnitsPanel(QWidget):
 
     Selection is communicated via selectionChanged(list[int]). The
     panel does NOT know anything about the trace view -- it just reports
-    which cluster ids the user has selected.
+    which cluster ids the user has selected, and what visual options
+    they want applied to those selections.
     """
 
     selectionChanged = pyqtSignal(list)
+    rasterVisibleChanged = pyqtSignal(bool)
+    recolorVisibleChanged = pyqtSignal(bool)
+    recolorWindowChanged = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -79,6 +89,45 @@ class PhyUnitsPanel(QWidget):
 
         action_row.addStretch(1)
         layout.addLayout(action_row)
+
+        # ---- Spike visualization controls ----
+        spike_row = QHBoxLayout()
+
+        self.raster_check = QCheckBox("Raster ticks")
+        self.raster_check.setChecked(True)
+        self.raster_check.setToolTip(
+            "Draw one vertical tick per spike, in the lane of the "
+            "unit's assigned channel."
+        )
+        self.raster_check.toggled.connect(self.rasterVisibleChanged.emit)
+        spike_row.addWidget(self.raster_check)
+
+        self.recolor_check = QCheckBox("Recolor trace at spikes")
+        self.recolor_check.setChecked(False)
+        self.recolor_check.setToolTip(
+            "Redraw every displayed trace in the unit's color over a "
+            "short window around each spike time. Works across all "
+            "channels and shanks, so you can see what every channel "
+            "was doing at that instant."
+        )
+        self.recolor_check.toggled.connect(self.recolorVisibleChanged.emit)
+        spike_row.addWidget(self.recolor_check)
+
+        spike_row.addWidget(QLabel("Window (ms):"))
+        self.recolor_window_spin = QDoubleSpinBox()
+        self.recolor_window_spin.setRange(0.05, 20.0)
+        self.recolor_window_spin.setDecimals(2)
+        self.recolor_window_spin.setSingleStep(0.1)
+        self.recolor_window_spin.setValue(1.0)
+        self.recolor_window_spin.setToolTip(
+            "Total window width, centered on each spike. The trace is "
+            "recolored within this interval."
+        )
+        self.recolor_window_spin.valueChanged.connect(self.recolorWindowChanged.emit)
+        spike_row.addWidget(self.recolor_window_spin)
+
+        spike_row.addStretch(1)
+        layout.addLayout(spike_row)
 
         # ---- Table ----
         self.table = QTableWidget(0, 7)
@@ -132,6 +181,17 @@ class PhyUnitsPanel(QWidget):
                 if cid is not None:
                     ids.append(int(cid))
         return ids
+
+    def set_recolor_enabled(self, enabled: bool):
+        """Programmatically set the recolor checkbox state without
+        re-emitting recolorVisibleChanged (avoids a redundant round-
+        trip through MainWindow when resetting after a data reload)."""
+        self.recolor_check.blockSignals(True)
+        self.recolor_check.setChecked(bool(enabled))
+        self.recolor_check.blockSignals(False)
+
+    def recolor_window_ms(self) -> float:
+        return float(self.recolor_window_spin.value())
 
     # ------------------------------------------------------------------
     # Filtering / population

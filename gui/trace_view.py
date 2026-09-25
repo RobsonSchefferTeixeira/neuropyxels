@@ -54,12 +54,13 @@ from PyQt6.QtWidgets import (
     QGroupBox, QFrame, QToolBar, QSlider, QDockWidget, QMainWindow,
     QMenu, QToolButton, QGridLayout,
 )
+
 from PyQt6.QtGui import (
     QPainter, QPen, QColor, QBrush, QFont, QPainterPath, QIcon,
-    QPixmap, QImage,
+    QPixmap, QImage, QRegion,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
 
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
 
 from core.trace_engine import TraceEngine
 from core.filters import bandpass_filter, notch_filter, hilbert
@@ -663,6 +664,19 @@ class TraceViewWidget(QWidget):
         self._raster_unit_colors: dict[int, QColor] = {}
         self.show_spike_raster = True
 
+        # ---- Spike trace recolor overlay ----
+        # When enabled, at every spike of every selected unit, every
+        # displayed trace is redrawn in the unit's color over a small
+        # symmetric window around the spike time. The redraw uses the
+        # exact same x_pixels / y_offsets the main trace uses, so the
+        # recolored segment always lies pixel-for-pixel on the trace,
+        # whatever the trace is (raw, filtered, CSD, per-channel
+        # override, global filter).
+        self.show_spike_recolor = False
+        self._spike_recolor_window_ms = 1.0
+        self._spike_recolor_cap_windows = 2000   # per frame, per unit
+        self._spike_recolor_overflow_warned = False
+
         # ---- Spectrogram ----
         self.show_spectrogram = False
         self.spectrogram_channel = None
@@ -817,6 +831,15 @@ class TraceViewWidget(QWidget):
         self._use_timestamps = enabled
         self._invalidate_cache()
         self._update_time_labels()
+        self.update()
+
+    def set_spike_recolor_visible(self, visible: bool):
+        self.show_spike_recolor = bool(visible)
+        self._spike_recolor_overflow_warned = False
+        self.update()
+
+    def set_spike_recolor_window_ms(self, window_ms: float):
+        self._spike_recolor_window_ms = max(0.05, float(window_ms))
         self.update()
 
     def _on_control_time_changed(self, start_time: float, duration: float):
@@ -2753,6 +2776,69 @@ class TraceViewWidget(QWidget):
             self._trace_normalization_cache = {}
             self._trace_normalization_key = normalization_key
 
+        # ---- Precompute spike recolor regions (once per frame) ----
+        # The spike-time regions are identical for every channel and
+        # every trace on this frame: they depend only on the time
+        # window and the plot geometry, not on the channel. Building
+        # them once here instead of once per trace-per-channel-per-unit
+        # eliminates a surprising amount of redundant work (each
+        # spikes_for_unit_in_time_window call does two searchsorted on
+        # the full spike array).
+        recolor_regions: list[tuple[QColor, QRegion]] = []
+        if self.show_spike_recolor and self._raster_unit_ids:
+            phy_data = getattr(self.engine, "phy_data", None)
+            if phy_data is not None:
+                half_window_s = self._spike_recolor_window_ms / 2000.0
+                half_px = max(
+                    0.75,
+                    (half_window_s / (end_time - start_time)) * plot_width,
+                )
+                for cid in self._raster_unit_ids:
+                    color = self._raster_unit_colors.get(cid)
+                    if color is None:
+                        continue
+
+                    spikes = self.engine.spikes_for_unit_in_time_window(
+                        cid,
+                        start_time - half_window_s,
+                        end_time + half_window_s,
+                    )
+                    if spikes.size == 0:
+                        continue
+
+                    if spikes.size > self._spike_recolor_cap_windows:
+                        if not self._spike_recolor_overflow_warned:
+                            print(
+                                f"[recolor] unit {cid}: "
+                                f"{spikes.size} spike windows in view, "
+                                f"capped at {self._spike_recolor_cap_windows}. "
+                                f"Zoom in for full detail."
+                            )
+                            self._spike_recolor_overflow_warned = True
+                        spikes = spikes[: self._spike_recolor_cap_windows]
+
+                    spike_times = spikes.astype(np.float64) / float(self.engine.sr)
+                    x_centers = (
+                        plot_left
+                        + ((spike_times - start_time) / (end_time - start_time))
+                        * plot_width
+                    )
+
+                    region = QRegion()
+                    for xc in x_centers:
+                        left = int(xc - half_px)
+                        right = int(xc + half_px)
+                        if right < int(plot_left) or left > int(plot_right):
+                            continue
+                        region = region.united(
+                            QRegion(
+                                left, int(plot_top),
+                                max(1, right - left), int(plot_height),
+                            )
+                        )
+                    if not region.isEmpty():
+                        recolor_regions.append((color, region))
+
         for idx, channel in enumerate(display_channels):
             y_center = (
                 plot_bottom
@@ -2767,8 +2853,6 @@ class TraceViewWidget(QWidget):
                 continue
 
             for trace_idx, trace in enumerate(traces):
-                # print(f"DRAW ch={channel} mode={trace.get('mode')} gain={trace.get('gain')} auto={self.auto_scale} n={len(trace['data'])}")
-
                 cached = self._trace_path_cache.get((channel, trace_idx))
                 if cached is None:
                     channel_data = np.asarray(trace['data'], dtype=np.float64)
@@ -2803,7 +2887,9 @@ class TraceViewWidget(QWidget):
                     force_auto = (trace_mode in ('csd', 'filtered'))
 
                     if self.auto_scale or force_auto:
-                        _, half_range = self._get_trace_normalization(channel, trace_idx, trace_mode, draw_y)
+                        _, half_range = self._get_trace_normalization(
+                            channel, trace_idx, trace_mode, draw_y
+                        )
                         # Re-center on the current view's own mean.
                         # half_range stays frozen (no jitter), but the
                         # trace is always centered on its own current
@@ -2814,14 +2900,21 @@ class TraceViewWidget(QWidget):
                         finite_vals = draw_y[finite]
                         current_center = float(np.mean(finite_vals))
                         normalized = (draw_y - current_center) / half_range
-                        y_offsets = (-normalized* (channel_height * 0.40)* self.global_gain* trace_gain)
-
+                        y_offsets = (
+                            -normalized
+                            * (channel_height * 0.40)
+                            * self.global_gain
+                            * trace_gain
+                        )
                     else:
                         # Fixed-scale mode is intentionally global, not
                         # per-trace: all channels share one reference so
                         # relative amplitudes are preserved.
                         center = (global_min + global_max) / 2.0
-                        half_range = max(abs(global_max - center),abs(center - global_min),)
+                        half_range = max(
+                            abs(global_max - center),
+                            abs(center - global_min),
+                        )
                         if half_range <= 0:
                             half_range = 1.0
                         normalized = (draw_y - center) / half_range
@@ -2858,6 +2951,25 @@ class TraceViewWidget(QWidget):
                 painter.setPen(pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPath(cached)
+
+                # ---- Spike recolor overlay ----
+                # Redraw the same cached path, clipped to the union of
+                # every selected unit's spike time-windows, once per
+                # unit so each unit's spikes get its own color.
+                # `recolor_regions` was precomputed once per frame at
+                # the top of _draw_traces -- see the comment there for
+                # why it isn't rebuilt here.
+                if recolor_regions:
+                    for recolor_color, region in recolor_regions:
+                        painter.save()
+                        painter.setClipRegion(region)
+                        recolor_pen = QPen(recolor_color, self.trace_width)
+                        recolor_pen.setCosmetic(True)
+                        painter.setPen(recolor_pen)
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawPath(cached)
+                        painter.restore()
+
 
     def _decimate_minmax(self, data: np.ndarray, target_points: int) -> tuple[np.ndarray, np.ndarray]:
         """Min/max decimate a 1-D array to at most ~2*target_points values,
