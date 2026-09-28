@@ -428,9 +428,6 @@ class MainWindow(QMainWindow):
         self._apply_focus_neighborhood(unit_id)
 
     def _apply_focus_neighborhood(self, unit_id: int):
-        """Look up the unit's channel, compute its neighborhood, and
-        push the resulting channel set to both the trace view and the
-        probe map. Also set the unit as the sole raster unit."""
         phy_data = getattr(self.engine, "phy_data", None)
         if phy_data is None:
             return
@@ -454,16 +451,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Push to the trace view first, then to the probe map. Both
-        # use the same channel list, so selection stays consistent
-        # between the two views.
         self.trace_view.set_channels(neighborhood)
         self.trace_view.set_raster_units([int(unit_id)])
 
         if self.probe_map is not None:
             self.probe_map.set_selected_channels(neighborhood)
 
-        # Mirror the selection in the Selected Channels list.
         if hasattr(self, "selected_list"):
             from PyQt6.QtWidgets import QListWidgetItem
             self.selected_list.clear()
@@ -473,35 +466,14 @@ class MainWindow(QMainWindow):
                 f"Selected Channels ({len(neighborhood)})"
             )
 
-        # Push depth info to the trace view for the new channel set.
-        if self._current_probe_key and self._probes:
-            probe_data = self._probes["probes"][self._current_probe_key]
-            depths = dict(zip(
-                probe_data["coordinates"]["channels"],
-                probe_data["coordinates"]["y"],
-            ))
-            self.trace_view.set_channel_depths(depths)
-            xcoords = dict(zip(
-                probe_data["coordinates"]["channels"],
-                probe_data["coordinates"]["x"],
-            ))
-            self.trace_view.set_channel_xcoords(xcoords)
-            shank_ids = (
-                probe_data.get("shanks", {}).get("ids")
-                or [0] * len(probe_data["coordinates"]["channels"])
-            )
-            shank_map = dict(zip(
-                probe_data["coordinates"]["channels"], shank_ids
-            ))
-            self.trace_view.set_channel_shanks(shank_map)
-            self.trace_view.set_full_probe_geometry(
-                depths, shank_map, xcoords
-            )
-
         self._update_status(
             f"Focus mode: unit {unit_id} (CH{center_ch}) — "
             f"{len(neighborhood)} channel(s) in neighborhood."
         )
+
+
+
+
     def _on_focus_mode_changed(self, enabled: bool):
         """Entering focus mode clears the current display so the user
         sees an empty trace view and an empty probe map, then waits
@@ -1042,7 +1014,49 @@ class MainWindow(QMainWindow):
         self._probe_map_container_layout.addWidget(self.probe_map, stretch=1)
         self.selected_list.clear()
         self._update_analysis_actions_enabled()
+        self._push_full_probe_geometry_to_trace_view()
+        print(f"[geo-push] after call: "
+              f"n_depths={len(self.trace_view.full_probe_depths)} "
+              f"n_shanks={len(self.trace_view.full_probe_shanks)}")
+              
+    def _push_full_probe_geometry_to_trace_view(self):
+        print(f"[geo-push] called; key={self._current_probe_key} "
+              f"has_probes={bool(self._probes)} "
+              f"trace_view={self.trace_view is not None}")
+        if not self._current_probe_key or not self._probes:
+            print("[geo-push] bailing: no current probe key or no probes")
+            return
+        
+        """Push the entire probe's depth/shank/x geometry into the
+        trace view, so features that need to reason about the probe as
+        a whole (CSD neighbor lookup, focus-mode neighborhoods) work
+        even when nothing is currently selected for display.
 
+        Called once per stream load, in _load_probe_map. Not called
+        from _on_channels_selected -- that method's job is to update
+        the *selection*, not the *geometry*, and geometry doesn't
+        change when the selection does.
+        """
+        if not self._current_probe_key or not self._probes:
+            return
+        probe_data = self._probes["probes"][self._current_probe_key]
+        coords = probe_data.get("coordinates", {})
+        channels = coords.get("channels", [])
+        if not channels:
+            return
+
+        depths = dict(zip(channels, coords.get("y", [])))
+        xcoords = dict(zip(channels, coords.get("x", [])))
+        shank_ids = (
+            probe_data.get("shanks", {}).get("ids")
+            or [0] * len(channels)
+        )
+        shank_map = dict(zip(channels, shank_ids))
+
+        self.trace_view.set_channel_depths(depths)
+        self.trace_view.set_channel_shanks(shank_map)
+        self.trace_view.set_channel_xcoords(xcoords)
+        self.trace_view.set_full_probe_geometry(depths, shank_map, xcoords)
     # ------------------------------------------------------------------
     # continuous.dat loading
     # ------------------------------------------------------------------
@@ -1308,11 +1322,9 @@ class MainWindow(QMainWindow):
     def _on_channels_selected(self, channels: list):
         """Handle channel selection from probe map.
 
-        Called with an empty list when the probe map's Clear button is
-        pressed, so the trace view must explicitly be told to drop all
-        channels -- guarding on `channels` being truthy here would leave
-        the trace view showing whatever was last displayed (the Clear
-        button would appear to do nothing).
+        Geometry (depths, shanks, xcoords, full-probe maps) is pushed
+        once per stream load in _push_full_probe_geometry_to_trace_view;
+        this method only updates the *selection*.
         """
         self.selected_list.clear()
         for ch in channels:
@@ -1321,50 +1333,19 @@ class MainWindow(QMainWindow):
             f"Selected Channels ({len(channels)})"
         )
 
-        # Update trace view whenever data is loaded -- including for the
-        # empty-channel case, so Clear actually empties the plot.
         if self.engine.data_loaded:
             self.trace_view.set_channels(channels)
-
-            # Pass depth, x, AND shank info to trace view. Shank info is
-            # required for CSD: the 3-point Laplacian is taken within a
-            # shank, never across. x-coords are used to break ties among
-            # same-depth candidates.
-            if channels and self._current_probe_key and self._probes:
-                probe_data = self._probes["probes"][self._current_probe_key]
-                depths = dict(zip(
-                    probe_data["coordinates"]["channels"],
-                    probe_data["coordinates"]["y"]
-                ))
-                self.trace_view.set_channel_depths(depths)
-
-                xcoords = dict(zip(
-                    probe_data["coordinates"]["channels"],
-                    probe_data["coordinates"]["x"]
-                ))
-                self.trace_view.set_channel_xcoords(xcoords)
-
-                shank_ids = probe_data.get("shanks", {}).get("ids") or [0] * len(probe_data["coordinates"]["channels"])
-                shank_map = dict(zip(probe_data["coordinates"]["channels"], shank_ids))
-                self.trace_view.set_channel_shanks(shank_map)
-
-                # Full-probe geometry for CSD neighbor lookup: every
-                # channel on the probe, not just the ones currently
-                # selected for display. CSD's Laplacian must use the
-                # physical neighbors of a channel, regardless of
-                # whether they happen to be drawn right now.
-                self.trace_view.set_full_probe_geometry(depths, shank_map, xcoords)
 
         if hasattr(self, 'trace_style_panel'):
             self.trace_style_panel.update_channels()
 
-        self._update_status(
-            f"{len(channels)} channels selected"
-        )
+        self._update_status(f"{len(channels)} channels selected")
 
         if hasattr(self, 'trace_view') and self.trace_view.show_spectrogram:
             if channels:
                 self.trace_view.set_spectrogram_channel(channels[0])
+
+
 
     def get_selected_channels(self) -> list[int]:
         """Public accessor for whatever consumes the selection next."""

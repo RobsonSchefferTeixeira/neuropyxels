@@ -571,12 +571,6 @@ class TraceViewWidget(QWidget):
         self._trace_normalization_cache: dict[tuple[int, int], tuple[float, float]] = {}
         self._trace_normalization_key = None
 
-        # ---- CSD / probe geometry ----
-        self._probe_data: dict | None = None
-        self._csd_analyzer: PhaseAmplitudeAnalyzer | None = None
-        self._full_probe_depths: dict | None = None
-        self._full_probe_shanks: dict | None = None
-        self._full_probe_xcoords: dict | None = None
 
 
         # ---- Display-selection geometry ----
@@ -1510,11 +1504,19 @@ class TraceViewWidget(QWidget):
         self._invalidate_cache()
 
     def set_full_probe_geometry(self, depths, shanks, xcoords):
-        """Store the full-probe geometry and build the probe_data dict
-        that PhaseAmplitudeAnalyzer wants for CSD neighbor lookup."""
-        self._full_probe_depths = depths
-        self._full_probe_shanks = shanks
-        self._full_probe_xcoords = xcoords
+        """Store the full-probe geometry for features that need to
+        reason about every channel on the probe, not just the ones
+        currently selected for display (CSD neighbor lookup,
+        focus-mode neighborhoods).
+
+        Uses the same `full_probe_*` attribute names that
+        compute_focus_neighborhood reads from -- see the duplicate
+        `_full_probe_*` attributes in __init__, which are now unused
+        and can be deleted.
+        """
+        self.full_probe_depths = dict(depths or {})
+        self.full_probe_shanks = dict(shanks or {})
+        self.full_probe_xcoords = dict(xcoords or {})
         if depths and shanks and xcoords:
             channels = sorted(depths.keys())
             self._probe_data = {
@@ -3149,6 +3151,12 @@ class TraceViewWidget(QWidget):
         Returns an empty list if the full-probe geometry hasn't been
         loaded or center_channel isn't in it.
         """
+        print(f"[focus] center={center_channel} "
+              f"n_depths={len(self.full_probe_depths)} "
+              f"n_shanks={len(self.full_probe_shanks)} "
+              f"center_in_depths={center_channel in self.full_probe_depths}")
+
+
         depths = self.full_probe_depths
         shanks = self.full_probe_shanks
         if not depths or not shanks or center_channel not in depths:
