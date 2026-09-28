@@ -650,6 +650,14 @@ class TraceViewWidget(QWidget):
         self._cache_start_idx = None
         self._cache_end_idx = None
 
+
+        # Fixed-scale reference, cached per normalization_key. Recomputed
+        # only when the cache key changes (channel set, gain, filter,
+        # zoom) -- not on every scroll. See _draw_traces for the lookup.
+        self._global_scale_cache: tuple[float, float] | None = None
+        self._global_scale_key = None
+
+        
         # ---- Phy spike raster overlay ----
         # Set of cluster ids to draw as a raster, and per-unit display
         # color. The unit-to-channel mapping comes from engine.phy_data;
@@ -2693,31 +2701,6 @@ class TraceViewWidget(QWidget):
         if target_per_channel * n_channels > max_total:
             target_per_channel = max(64, max_total // n_channels)
 
-        global_min = None
-        global_max = None
-        if not self.auto_scale:
-            for channel in display_channels:
-                for trace in data[channel]:
-                    channel_data = np.asarray(trace['data'], dtype=np.float64)
-                    if channel_data.size == 0:
-                        continue
-                    finite = np.isfinite(channel_data)
-                    if not np.any(finite):
-                        continue
-                    finite_vals = channel_data[finite]
-                    ch_min = float(np.min(finite_vals))
-                    ch_max = float(np.max(finite_vals))
-                    if global_min is None or ch_min < global_min:
-                        global_min = ch_min
-                    if global_max is None or ch_max > global_max:
-                        global_max = ch_max
-        if global_min is None or global_max is None:
-            global_min = -1.0
-            global_max = 1.0
-        global_range = global_max - global_min
-        if global_range <= 0:
-            global_range = 1.0
-
         # Path cache key: depends on view position, so it invalidates on
         # every scroll. Trace paths are built at absolute pixel positions,
         # which change whenever the view moves.
@@ -2748,8 +2731,8 @@ class TraceViewWidget(QWidget):
         # only invalidates when something that changes "what the trace
         # is" changes -- channel set, gain, filter settings, zoom level
         # (window_duration), mode per trace. Scrolling does not change
-        # it, so the reference normalization stays stable while the user
-        # scrolls.
+        # it, so both the per-trace normalization and the fixed-scale
+        # global reference stay stable while the user scrolls.
         normalization_key = (
             round(float(self.window_duration), 6),
             round(float(self.global_gain), 6),
@@ -2777,6 +2760,52 @@ class TraceViewWidget(QWidget):
         if normalization_key != self._trace_normalization_key:
             self._trace_normalization_cache = {}
             self._trace_normalization_key = normalization_key
+            # Invalidate the fixed-scale reference too: any change that
+            # would invalidate per-trace normalization also changes what
+            # the fixed-scale reference should be.
+            self._global_scale_cache = None
+            self._global_scale_key = None
+
+        # ---- Fixed-scale reference ----
+        # Frozen per normalization_key, so scrolling doesn't change it.
+        # Previously this was recomputed from the visible window on every
+        # frame, which made the trace amplitudes drift as the user
+        # scrolled. The reference is now stable until something that
+        # genuinely changes the trace (channel set, gain, filter, zoom)
+        # invalidates it.
+        global_min = -1.0
+        global_max = 1.0
+        if not self.auto_scale:
+            if (self._global_scale_cache is not None
+                    and self._global_scale_key == normalization_key):
+                global_min, global_max = self._global_scale_cache
+            else:
+                gmin = None
+                gmax = None
+                for channel in display_channels:
+                    for trace in data[channel]:
+                        channel_data = np.asarray(trace['data'], dtype=np.float64)
+                        if channel_data.size == 0:
+                            continue
+                        finite = np.isfinite(channel_data)
+                        if not np.any(finite):
+                            continue
+                        finite_vals = channel_data[finite]
+                        ch_min = float(np.min(finite_vals))
+                        ch_max = float(np.max(finite_vals))
+                        if gmin is None or ch_min < gmin:
+                            gmin = ch_min
+                        if gmax is None or ch_max > gmax:
+                            gmax = ch_max
+                if gmin is not None and gmax is not None:
+                    global_min = gmin
+                    global_max = gmax
+                self._global_scale_cache = (global_min, global_max)
+                self._global_scale_key = normalization_key
+
+        global_range = global_max - global_min
+        if global_range <= 0:
+            global_range = 1.0
 
         # ---- Precompute spike recolor regions (once per frame) ----
         # The spike-time regions are identical for every channel and
