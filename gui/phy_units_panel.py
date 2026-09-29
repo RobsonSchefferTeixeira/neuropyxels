@@ -172,9 +172,15 @@ class PhyUnitsPanel(QWidget):
         self.table.setHorizontalHeaderLabels([
             "Unit", "Channel", "Depth (µm)", "Quality", "n spikes", "FR (Hz)", "Shank"
         ])
+
+
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
+
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -268,15 +274,26 @@ class PhyUnitsPanel(QWidget):
         self.table.blockSignals(True)
         self.table.setRowCount(len(visible))
         for row, u in enumerate(visible):
-            item_id = QTableWidgetItem(str(u.cluster_id))
+            cells = [
+                str(u.cluster_id),
+                "" if u.channel is None else str(u.channel),
+                "" if u.depth is None else f"{u.depth:.0f}",
+                u.quality or "",
+                str(u.n_spikes),
+                "" if u.firing_rate is None else f"{u.firing_rate:.2f}",
+                "" if u.shank is None else str(u.shank),
+            ]
+            item_id = None
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                )
+                self.table.setItem(row, col, item)
+                if col == 0:
+                    item_id = item
             item_id.setData(Qt.ItemDataRole.UserRole, u.cluster_id)
-            self.table.setItem(row, 0, item_id)
-            self.table.setItem(row, 1, QTableWidgetItem("" if u.channel is None else str(u.channel)))
-            self.table.setItem(row, 2, QTableWidgetItem("" if u.depth is None else f"{u.depth:.0f}"))
-            self.table.setItem(row, 3, QTableWidgetItem(u.quality or ""))
-            self.table.setItem(row, 4, QTableWidgetItem(str(u.n_spikes)))
-            self.table.setItem(row, 5, QTableWidgetItem("" if u.firing_rate is None else f"{u.firing_rate:.2f}"))
-            self.table.setItem(row, 6, QTableWidgetItem("" if u.shank is None else str(u.shank)))
+        
 
             if u.cluster_id in prev_selected:
                 item_id.setSelected(True)
