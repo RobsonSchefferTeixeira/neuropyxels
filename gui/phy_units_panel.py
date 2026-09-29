@@ -46,7 +46,8 @@ class PhyUnitsPanel(QWidget):
     focusModeChanged = pyqtSignal(bool)
     focusNeighborhoodChanged = pyqtSignal(int)
     focusedUnitChanged = pyqtSignal(int)   # -1 when no focused unit
-        
+    prevSpikeRequested = pyqtSignal()
+    nextSpikeRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -128,6 +129,36 @@ class PhyUnitsPanel(QWidget):
         layout.addLayout(focus_row)
 
 
+
+        # ---- Spike navigation row ----
+        nav_row = QHBoxLayout()
+
+        self.prev_spike_btn = QPushButton("\u25c4 Prev Spike")
+        self.prev_spike_btn.setAutoDefault(False)
+        self.prev_spike_btn.setDefault(False)
+        self.prev_spike_btn.setToolTip(
+            "Jump the trace view to the previous spike of the focused "
+            "unit (or the first selected unit if focus mode is off).\n"
+            "Shortcut: Alt+PageUp"
+        )
+        self.prev_spike_btn.clicked.connect(self.prevSpikeRequested.emit)
+        nav_row.addWidget(self.prev_spike_btn)
+
+        self.next_spike_btn = QPushButton("Next Spike \u25ba")
+        self.next_spike_btn.setAutoDefault(False)
+        self.next_spike_btn.setDefault(False)
+        self.next_spike_btn.setToolTip(
+            "Jump the trace view to the next spike of the focused unit "
+            "(or the first selected unit if focus mode is off).\n"
+            "Shortcut: Alt+PageDown"
+        )
+        self.next_spike_btn.clicked.connect(self.nextSpikeRequested.emit)
+        nav_row.addWidget(self.next_spike_btn)
+
+        nav_row.addStretch(1)
+        layout.addLayout(nav_row)
+
+        
         # ---- Spike visualization controls ----
         spike_row = QHBoxLayout()
 

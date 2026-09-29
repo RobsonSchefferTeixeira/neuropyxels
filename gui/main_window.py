@@ -367,6 +367,13 @@ class MainWindow(QMainWindow):
         self.phy_units_panel.focusNeighborhoodChanged.connect(self._on_focus_neighborhood_size_changed)
         self.phy_units_panel.focusedUnitChanged.connect(self._on_focused_unit_changed)
 
+        self.phy_units_panel.prevSpikeRequested.connect(
+            self._on_prev_spike_requested
+        )
+        self.phy_units_panel.nextSpikeRequested.connect(
+            self._on_next_spike_requested
+        )
+
 
         dock.setWidget(self.phy_units_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -378,6 +385,94 @@ class MainWindow(QMainWindow):
         dock.visibilityChanged.connect(self._on_phy_units_visibility_changed)
 
 
+    def _on_prev_spike_requested(self):
+        self._jump_to_adjacent_spike(direction=-1)
+
+    def _on_next_spike_requested(self):
+        self._jump_to_adjacent_spike(direction=+1)
+
+    def _jump_to_adjacent_spike(self, direction: int):
+        """Move the trace view to the previous or next spike of the
+        currently-targeted unit.
+
+        Target selection, in order of preference:
+          1. If focus mode is on and a unit is focused, use that unit.
+          2. Otherwise, if exactly one unit is selected in the table,
+             use it.
+          3. Otherwise, print a status message and do nothing.
+        """
+        phy_data = getattr(self.engine, "phy_data", None)
+        if phy_data is None:
+            self._update_status(
+                "Prev/Next spike: no Phy folder loaded."
+            )
+            return
+
+        unit_id = -1
+        if (self.phy_units_panel is not None
+                and self.phy_units_panel.focus_mode_enabled()):
+            unit_id = self.phy_units_panel.focused_unit_id()
+        if unit_id < 0 and self.phy_units_panel is not None:
+            selected = self.phy_units_panel.selected_cluster_ids()
+            if len(selected) == 1:
+                unit_id = int(selected[0])
+
+        if unit_id < 0:
+            self._update_status(
+                "Prev/Next spike: select a single unit (or enable focus "
+                "mode and pick one) to navigate its spikes."
+            )
+            return
+
+        spikes = phy_data.spikes_for_unit(unit_id)
+        if spikes.size == 0:
+            self._update_status(
+                f"Prev/Next spike: unit {unit_id} has no spikes."
+            )
+            return
+
+        sr = float(self.engine.sr)
+        spike_times = spikes.astype(np.float64) / sr
+
+        # Current center of the visible window, in seconds.
+        center_time = (
+            self.trace_view.start_time
+            + self.trace_view.window_duration / 2.0
+        )
+
+        if direction > 0:
+            candidates = spike_times[spike_times > center_time + 1e-9]
+            if candidates.size == 0:
+                self._update_status(
+                    f"Prev/Next spike: no later spikes for unit {unit_id}."
+                )
+                return
+            target = float(candidates[0])
+        else:
+            candidates = spike_times[spike_times < center_time - 1e-9]
+            if candidates.size == 0:
+                self._update_status(
+                    f"Prev/Next spike: no earlier spikes for unit {unit_id}."
+                )
+                return
+            target = float(candidates[-1])
+
+        # Center the view on the target spike.
+        new_start = target - self.trace_view.window_duration / 2.0
+        min_start = self.trace_view._get_min_start_time()
+        max_start = self.trace_view._get_max_start_time()
+        new_start = max(min_start, min(new_start, max_start))
+
+        self.trace_view.start_time = new_start
+        self.trace_view._update_time_labels()
+        self.trace_view._update_scrollbar_position()
+        self.trace_view._invalidate_cache()
+        self.trace_view.update()
+
+        self._update_status(
+            f"Unit {unit_id}: jumped to spike at {target:.4f} s "
+            f"({'(next)' if direction > 0 else '(prev)'})"
+        )
 
     def _on_focus_mode_changed(self, enabled: bool):
         """Entering focus mode clears the current display so the user
@@ -825,6 +920,8 @@ class MainWindow(QMainWindow):
     def _build_trace_view(self):
         """Build the trace view and add control panels as docks."""
         self.trace_view = TraceViewWidget(self.engine)
+        self.trace_view.spikeNavigationRequested.connect(self._jump_to_adjacent_spike)
+
         self.setCentralWidget(self.trace_view)
 
         controls_dock = QDockWidget("Trace Controls", self)

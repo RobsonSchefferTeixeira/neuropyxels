@@ -123,7 +123,7 @@ class TraceControlPanel(QWidget):
     performanceChanged = pyqtSignal(dict)   
     globalFilterEnabledChanged = pyqtSignal(bool)
     resetChannelCustomizationsRequested = pyqtSignal()
-
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Trace Controls")
@@ -517,6 +517,7 @@ class TraceViewWidget(QWidget):
     """
 
     timeWindowChanged = pyqtSignal(float, float)
+    spikeNavigationRequested = pyqtSignal(int)  # -1 = prev, +1 = next
 
     def __init__(self, engine: TraceEngine, parent: QWidget | None = None):
         super().__init__(parent)
@@ -3305,6 +3306,17 @@ class TraceViewWidget(QWidget):
         if not self._data_loaded:
             super().keyPressEvent(event)
             return
+
+        alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        if alt and event.key() == Qt.Key.Key_PageUp:
+            self.spikeNavigationRequested.emit(-1)
+            event.accept()
+            return
+        if alt and event.key() == Qt.Key.Key_PageDown:
+            self.spikeNavigationRequested.emit(+1)
+            event.accept()
+            return
+
         if event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
             self._zoom(1.2)
         elif event.key() == Qt.Key.Key_Minus:
