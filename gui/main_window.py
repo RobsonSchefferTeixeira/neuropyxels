@@ -31,7 +31,6 @@ from PyQt6.QtWidgets import (
     QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox, QDialog,
 )
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QIcon, QPixmap
-
 from gui.probe_map_widget import ProbeMapWidget
 from gui.neural_trace_view import NeuralTraceViewWidget as TraceViewWidget
 from gui.phase_amplitude_dialog import PhaseAmplitudeDialog
@@ -47,6 +46,7 @@ from gui.phy_units_panel import PhyUnitsPanel
 from core.phy_loader import load_phy_folder, PhyLoadError
 
 class ColorButton(QPushButton):
+
     """
     A push button that displays a color swatch and opens a color dialog
     when clicked. The button shows the actual color, not just a name.
@@ -345,6 +345,289 @@ class MainWindow(QMainWindow):
         self._build_panels_menu()
         self.setStatusBar(QStatusBar())
         self._update_status("No settings file or data loaded.")
+
+
+    def _on_reset(self):
+        """Reset the entire application to its just-launched state.
+        The MainWindow object and its menu / toolbar / dock layout are
+        preserved; every data-bound widget's *contents*, every loaded
+        file, and every customization are removed. The user can then
+        load a fresh settings.xml + continuous.dat as if the app had
+        just been started."""
+        reply = QMessageBox.question(
+            self, "Reset application",
+            "This will close all dialogs and unload the current probe, "
+            "data, Phy folder, and every customization.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # ---- 1. Close every open analysis dialog ----
+        for dlg_list_name in (
+            "_open_pac_dialogs",
+            "_open_power_dialogs",
+            "_open_ripple_dialogs",
+            "_open_theta_dialogs",
+            "_open_psd_dialogs",
+        ):
+            dlg_list = getattr(self, dlg_list_name, None)
+            if dlg_list:
+                for dialog in list(dlg_list):
+                    try:
+                        dialog.close()
+                    except Exception:
+                        pass
+                dlg_list.clear()
+
+        # ---- 2. Reset the trace view to a blank state ----
+        self._reset_trace_view()
+
+        # ---- 3. Tear down the probe map and its dock contents ----
+        self._reset_probe_map()
+
+        # ---- 4. Reset the Phy Units panel ----
+        if self.phy_units_panel is not None:
+            try:
+                # Rebuild the panel from scratch so nothing survives --
+                # this drops the table rows, the phy_data reference, and
+                # every selection / filter / focus-mode state.
+                self.phy_units_panel.set_phy_data(None)
+                self.phy_units_panel.set_focus_mode(False)
+                self.phy_units_panel.clear_selection()
+                self.phy_units_panel.search_edit.clear()
+                self.phy_units_panel.quality_combo.setCurrentIndex(0)
+                self.phy_units_panel.show_only_selected_check.setChecked(False)
+                self.phy_units_panel.raster_check.setChecked(True)
+                self.phy_units_panel.recolor_check.setChecked(False)
+                self.phy_units_panel.recolor_window_spin.setValue(1.0)
+                self.phy_units_panel.focus_n_spin.setValue(5)
+            except Exception:
+                pass
+
+        # ---- 5. Replace the engine with a fresh, empty one ----
+        # The old engine's memmap is closed when the old instance is
+        # garbage-collected; we drop our only reference here.
+        self.engine = TraceEngine()
+        if self.trace_view is not None:
+            self.trace_view.engine = self.engine
+            self.trace_view._data_loaded = False
+
+        # ---- 6. Clear MainWindow's file/probe bookkeeping ----
+        self._settings_path = None
+        self._probes = {}
+        print(f"[reset] before: current_probe_key={self._current_probe_key}")
+        self._current_probe_key = None
+        print(f"[reset] after: current_probe_key={self._current_probe_key}")
+        # ---- 7. Reset the stream picker ----
+        self.stream_picker.blockSignals(True)
+        self.stream_picker.clear()
+        self.stream_picker.setEnabled(False)
+        self.stream_picker.blockSignals(False)
+
+        # ---- 8. Re-run the enabled-state sweep ----
+        self._update_analysis_actions_enabled()
+
+        # ---- 9. Reset the trace view's sample rate to the default ----
+        # so the filter spinboxes go back to their just-launched ranges.
+        if self.trace_view is not None:
+            try:
+                self.trace_view.control_panel.set_sample_rate(self.engine.sr)
+            except Exception:
+                pass
+
+        self._update_status("Application reset. No settings file or data loaded.")
+
+
+    def _reset_trace_view(self):
+        tv = self.trace_view
+        if tv is None:
+            return
+
+        # Channels and geometry.
+        tv.channels = []
+        tv._sorted_channels = []
+        tv.channel_depths = {}
+        tv.channel_shanks = {}
+        tv.channel_xcoords = {}
+        tv.full_probe_depths = {}
+        tv.full_probe_shanks = {}
+        tv.full_probe_xcoords = {}
+        tv._probe_data = None
+        tv._csd_analyzer = None
+
+        # Color customizations.
+        tv.channel_colors = {}
+        tv.default_trace_color = QColor("#ffffff")
+        tv.background_color = QColor("#1e1e1e")
+        tv.grid_color = QColor("#555555")
+        tv.show_grid = True
+        tv.trace_width = 1.0
+
+        # Gain and scaling.
+        tv.global_gain = 1.0
+        tv.auto_scale = False
+        tv.control_panel.set_gain(1.0)
+        tv.control_panel.set_auto_scale(False)
+
+        # Global filter state + panel.
+        tv.filter_enabled = False
+        tv.filter_low_freq = 1.0
+        tv.filter_high_freq = 300.0
+        tv.notch_enabled = False
+        tv.notch_freq = 50.0
+        tv.detrend_enabled = False
+        tv._global_filter_enabled = False
+        tv.control_panel.global_filter_checkbox.blockSignals(True)
+        tv.control_panel.global_filter_checkbox.setChecked(False)
+        tv.control_panel.global_filter_checkbox.blockSignals(False)
+        tv.control_panel.filter_checkbox.setChecked(False)
+        tv.control_panel.notch_checkbox.setChecked(False)
+        tv.control_panel.detrend_checkbox.setChecked(False)
+
+        # Per-channel customizations.
+        tv._channel_options = {}
+        if tv._channel_options_panel is not None:
+            try:
+                tv._channel_options_panel.close()
+            except Exception:
+                pass
+            tv._channel_options_panel = None
+            tv._channel_options_panel_channel = None
+        tv.channel_display_modes = {}
+
+        # Remove any channel buttons on screen.
+        for ch, btn in list(tv._channel_buttons.items()):
+            try:
+                btn.setParent(None)
+                btn.deleteLater()
+            except Exception:
+                pass
+        tv._channel_buttons = {}
+
+        # Phy raster and recolor.
+        tv._raster_unit_ids = []
+        tv._raster_unit_colors = {}
+        tv._raster_overflow_warned = False
+        tv.show_spike_raster = True
+        tv.show_spike_recolor = False
+        tv._spike_recolor_overflow_warned = False
+
+        # Ripple overlay.
+        tv.ripple_events = []
+        tv._ripple_render_context = {}
+        tv._ripple_selected_event = None
+        tv._ripple_drag_event = None
+        tv._ripple_merge_candidates = set()
+        tv._ripple_undo_stack = []
+        tv._ripple_snap_active_side = None
+        tv._ripple_creating_armed = False
+        tv._ripple_creating_channel = None
+        tv._ripple_creating_start_sample = None
+        tv._ripple_creating_end_sample = None
+
+        # Theta overlay.
+        tv.theta_epochs = []
+        tv.theta_detection_start_time = 0.0
+        tv.theta_detection_sample_offset = 0
+        tv._theta_drag_epoch = None
+        tv._theta_drag_side = None
+        tv._theta_merge_candidate = None
+        tv._theta_merge_candidates = set()
+        tv._theta_selected_epoch = None
+        tv._theta_creating_armed = False
+        tv._theta_creating_channel = None
+        tv._theta_creating_start_sample = None
+        tv._theta_creating_end_sample = None
+
+        # Spectrogram.
+        tv.show_spectrogram = False
+        tv.spectrogram_channel = None
+        tv.spectrogram_data = None
+        tv.spectrogram_freqs = None
+        tv.spectrogram_times = None
+        tv._spectrogram_display_data = None
+        tv._spectrogram_display_freqs = None
+        tv._spectrogram_image = None
+        tv._spectrogram_cache_key = None
+        if hasattr(tv, "spectrogram_control"):
+            try:
+                tv.spectrogram_control.set_enabled(False)
+                tv.spectrogram_control.set_channels([])
+            except Exception:
+                pass
+
+        # Time cursors.
+        tv._time_cursors = []
+        tv._selected_cursor = None
+
+        # Caches.
+        tv._cached_data = None
+        tv._cache_start = None
+        tv._cache_end = None
+        tv._cache_start_idx = None
+        tv._cache_end_idx = None
+        tv._filtered_cache = {}
+        tv._trace_path_cache = {}
+        tv._trace_cache_key = None
+        tv._trace_normalization_cache = {}
+        tv._trace_normalization_key = None
+        tv._global_scale_cache = None
+        tv._global_scale_key = None
+        # If the fixed-scale reference attributes don't exist on your
+        # version yet, drop the two lines above -- they're harmless
+        # either way when guarded with hasattr elsewhere.
+
+        tv.update()
+
+    def _reset_probe_map(self):
+        """Destroy the probe map completely and rebuild the dock's
+        placeholder from scratch.
+
+        Two subtleties:
+          - The previous placeholder widget was destroyed by Qt when the
+            probe map replaced it, so it cannot be reused. We build a
+            fresh one each reset.
+          - deleteLater() alone does not guarantee the old probe map is
+            gone before the dock shows the new widget, and if any other
+            reference exists the widget survives. setParent(None) forces
+            it out of the hierarchy before scheduling deletion.
+        """
+        old_map = self.probe_map
+        self.probe_map = None
+
+        # Build a fresh placeholder.
+        placeholder = QWidget()
+        vlayout = QVBoxLayout(placeholder)
+        label = QLabel(
+            "No probe loaded.\n\nUse File \u2192 Open settings.xml... to load one."
+        )
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #888; font-size: 12px;")
+        vlayout.addWidget(label)
+
+        # Replace the dock's widget (this orphans the old probe map).
+        self.probe_map_dock.setWidget(placeholder)
+
+        # Explicitly detach and destroy the old probe map.
+        if old_map is not None:
+            try:
+                old_map.channelsSelected.disconnect(self._on_channels_selected)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                old_map.setParent(None)
+            except Exception:
+                pass
+            try:
+                old_map.deleteLater()
+            except Exception:
+                pass
+
+        self.selected_list.clear()
+        self.selected_channels_dock.setWindowTitle("Selected Channels")
 
     def _build_phy_units_dock(self):
         """Dock that lists sorted units from a loaded Phy folder and
@@ -768,11 +1051,25 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+
+        file_menu.addSeparator()
+
+        reset_action = QAction("&Reset Application", self)
+        reset_action.setToolTip(
+            "Close all dialogs and unload the current settings.xml, "
+            "continuous.dat, Phy folder, and every customization. "
+            "The app returns to its just-launched state."
+        )
+        reset_action.triggered.connect(self._on_reset)
+        file_menu.addAction(reset_action)
+
+        
         analysis_menu = menubar.addMenu("&Analysis")
         self.phase_amplitude_action = QAction("&Phase-Amplitude Coupling", self)
         self.phase_amplitude_action.setEnabled(False)
         self.phase_amplitude_action.triggered.connect(self._on_open_phase_amplitude)
         analysis_menu.addAction(self.phase_amplitude_action)
+
 
         self.power_map_action = QAction("Spatial &Power Map", self)
         self.power_map_action.setEnabled(False)
@@ -1098,28 +1395,34 @@ class MainWindow(QMainWindow):
         )
 
     def _load_probe_map(self, probe_data: dict):
+        #print(f"[load-map] start; probe_map={self.probe_map!r}")
+        #print(f"[load-map] dock widget={self.probe_map_dock.widget()!r}")
+        #print(f"[load-map] dock visible={self.probe_map_dock.isVisible()}")
+
+        # Tear down any previous probe map cleanly before building the new one.
         if self.probe_map is not None:
-            self.probe_map.channelsSelected.disconnect(self._on_channels_selected)
-            self._probe_map_container_layout.removeWidget(self.probe_map)
+            try:
+                self.probe_map.channelsSelected.disconnect(self._on_channels_selected)
+            except (TypeError, RuntimeError):
+                pass
             self.probe_map.deleteLater()
             self.probe_map = None
 
-        self._probe_map_placeholder_label.setVisible(False)
-
         self.probe_map = ProbeMapWidget(probe_data)
+        #print(f"[load-map] constructed new map={self.probe_map!r}")
+
         self.probe_map.channelsSelected.connect(self._on_channels_selected)
-        self._probe_map_container_layout.addWidget(self.probe_map, stretch=1)
+        self.probe_map_dock.setWidget(self.probe_map)
+        self.probe_map_dock.setVisible(True)
+        #print(f"[load-map] after setWidget, dock widget={self.probe_map_dock.widget()!r}")
+        #print(f"[load-map] dock visible now={self.probe_map_dock.isVisible()}")
+
         self.selected_list.clear()
         self._update_analysis_actions_enabled()
         self._push_full_probe_geometry_to_trace_view()
-        print(f"[geo-push] after call: "
-              f"n_depths={len(self.trace_view.full_probe_depths)} "
-              f"n_shanks={len(self.trace_view.full_probe_shanks)}")
               
     def _push_full_probe_geometry_to_trace_view(self):
-        print(f"[geo-push] called; key={self._current_probe_key} "
-              f"has_probes={bool(self._probes)} "
-              f"trace_view={self.trace_view is not None}")
+        #print(f"[geo-push] called; key={self._current_probe_key} " f"has_probes={bool(self._probes)} " f"trace_view={self.trace_view is not None}")
         if not self._current_probe_key or not self._probes:
             print("[geo-push] bailing: no current probe key or no probes")
             return

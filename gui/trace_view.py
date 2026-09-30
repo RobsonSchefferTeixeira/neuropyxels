@@ -101,6 +101,7 @@ MAX_CSD_NEIGHBOR_GAP_UM = 60.0
 
 
 class TraceControlPanel(QWidget):
+
     """
     Control panel for trace view settings.
     Can be used as a dockable widget or embedded in the trace view.
@@ -262,14 +263,16 @@ class TraceControlPanel(QWidget):
             "Raw trace of channels whose per-channel panel has Raw enabled."
         )
         self.global_filter_checkbox.toggled.connect(self._on_global_filter_toggled)
+
         filter_layout.addWidget(self.global_filter_checkbox)
 
         self.filter_checkbox = QCheckBox("Bandpass:")
+
         self.filter_checkbox.toggled.connect(self._on_filter_toggled)
         bp_row.addWidget(self.filter_checkbox)
 
         self.low_freq_spin = QDoubleSpinBox()
-        self.low_freq_spin.setRange(0.0, 15000.0)
+        self.low_freq_spin.setRange(0.0, 1e9)
         self.low_freq_spin.setValue(1.0)
         self.low_freq_spin.setSuffix(" Hz")
         self.low_freq_spin.setEnabled(False)
@@ -278,7 +281,7 @@ class TraceControlPanel(QWidget):
         bp_row.addWidget(self.low_freq_spin)
 
         self.high_freq_spin = QDoubleSpinBox()
-        self.high_freq_spin.setRange(0.0, 15000.0)
+        self.high_freq_spin.setRange(0.0, 1e9)
         self.high_freq_spin.setValue(300.0)
         self.high_freq_spin.setSuffix(" Hz")
         self.high_freq_spin.setEnabled(False)
@@ -295,7 +298,7 @@ class TraceControlPanel(QWidget):
         notch_row.addWidget(self.notch_checkbox)
 
         self.notch_freq_spin = QDoubleSpinBox()
-        self.notch_freq_spin.setRange(0.0, 5000.0)
+        self.notch_freq_spin.setRange(0.0, 1e9)
         self.notch_freq_spin.setValue(50.0)
         self.notch_freq_spin.setSuffix(" Hz")
         self.notch_freq_spin.setEnabled(False)
@@ -309,6 +312,7 @@ class TraceControlPanel(QWidget):
         self.detrend_checkbox.toggled.connect(self._on_detrend_toggled)
         filter_layout.addWidget(self.detrend_checkbox)
 
+        self._on_global_filter_toggled(self.global_filter_checkbox.isChecked())
 
         self.reset_channel_options_btn = QPushButton("Reset All Channel Customizations")
         self.reset_channel_options_btn.setToolTip(
@@ -317,7 +321,6 @@ class TraceControlPanel(QWidget):
         )
         self.reset_channel_options_btn.clicked.connect(self._on_reset_channel_options)
         filter_layout.addWidget(self.reset_channel_options_btn)
-
 
         layout.addWidget(filter_group)
 
@@ -391,9 +394,38 @@ class TraceControlPanel(QWidget):
         layout.addWidget(perf_group)
 
 
-
         
+    def set_sample_rate(self, sample_rate: float):
+        """Derive the frequency-spinbox range from the loaded recording's
+        sample rate. Safe upper bound is 0.95 * Nyquist: a Butterworth
+        bandpass whose high cutoff sits exactly at Nyquist is
+        numerically ill-conditioned in sosfiltfilt, and 0.95 leaves
+        enough margin that every supported filter order stays stable.
 
+        Called once when a data source is first loaded and again
+        whenever it changes. Re-enables the spinboxes now that the
+        range is meaningful, then re-runs the global-filter sync so the
+        top-level "Enable global filtering" checkbox still wins.
+        """
+        if sample_rate is None or sample_rate <= 0:
+            return
+        nyq = 0.5 * float(sample_rate)
+        safe_high = max(1.0, 0.95 * nyq)
+
+        self.low_freq_spin.setRange(0.0, safe_high)
+        self.high_freq_spin.setRange(0.0, safe_high)
+        if hasattr(self, "notch_freq_spin"):
+            self.notch_freq_spin.setRange(0.0, safe_high)
+
+        self.low_freq_spin.setEnabled(True)
+        self.high_freq_spin.setEnabled(True)
+        if hasattr(self, "notch_freq_spin"):
+            self.notch_freq_spin.setEnabled(True)
+
+        # Re-sync the enabled state against the global-filter checkbox.
+        self._on_global_filter_toggled(self.global_filter_checkbox.isChecked())
+        
+        
     # ---- Signal emitters ----
 
     def _on_reset_channel_options(self):
@@ -883,7 +915,7 @@ class TraceViewWidget(QWidget):
         self.set_animation_speed(speed_ms)
 
     def _on_control_filter_changed(self, settings: dict):
-        print(f"[CTRL] filter_changed: {settings}")
+        # print(f"[CTRL] filter_changed: {settings}")
         self.filter_enabled = settings.get('bandpass_enabled', False)
         self.filter_low_freq = settings.get('low_freq', 1.0)
         self.filter_high_freq = settings.get('high_freq', 300.0)
@@ -2090,9 +2122,16 @@ class TraceViewWidget(QWidget):
             self._setup_from_engine()
             if engine.timestamps_loaded:
                 self.control_panel.set_timestamps_available(True)
+            self.control_panel.set_sample_rate(engine.sr)
         else:
             self._data_loaded = False
             self.control_panel.set_timestamps_available(False)
+            # No data: leave the filter spinboxes disabled until a
+            # recording is loaded.
+            self.control_panel.low_freq_spin.setEnabled(False)
+            self.control_panel.high_freq_spin.setEnabled(False)
+            self.control_panel.notch_freq_spin.setEnabled(False)
+        
 
         self._invalidate_cache()
         self.update()

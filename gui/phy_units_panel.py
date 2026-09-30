@@ -389,6 +389,12 @@ class PhyUnitsPanel(QWidget):
         self.selectionChanged.emit([])
 
 
+    def clear_selection(self):
+        """Public alias for _clear_selection, used by MainWindow's
+        reset routine. Emits selectionChanged([]) so downstream
+        subscribers (trace view, main window) clear their state too."""
+        self._clear_selection()
+
     def _on_focus_toggled(self, checked: bool):
         """Focus mode restricts the table to single-selection and
         emits the new state. The panel itself doesn't know how to

@@ -247,6 +247,39 @@ class ChannelOptionsPanel(QWidget):
         self.csd_distance_spin.setEnabled(csd_on)
         self.csd_gain_spin.setEnabled(csd_on)
 
+
+    def set_sample_rate(self, sample_rate: float):
+        """Derive the per-channel filter and CSD spinbox ranges from the
+        loaded recording's sample rate. Safe upper bound is
+        0.95 * Nyquist, matching TraceControlPanel.set_sample_rate.
+
+        Called right before the panel is shown, and again if the data
+        source changes while the panel is open. Re-enables the
+        spinboxes now that the range is meaningful, then re-runs the
+        checkbox-gating sync so each field's enabled state still
+        follows its parent checkbox (Filtered, CSD).
+        """
+        if sample_rate is None or sample_rate <= 0:
+            return
+        nyq = 0.5 * float(sample_rate)
+        safe_high = max(1.0, 0.95 * nyq)
+
+        self.filter_low_spin.setRange(0.0, safe_high)
+        self.filter_high_spin.setRange(0.0, safe_high)
+        if hasattr(self, "csd_low_spin"):
+            self.csd_low_spin.setRange(0.0, safe_high)
+            self.csd_high_spin.setRange(0.0, safe_high)
+
+        self.filter_low_spin.setEnabled(True)
+        self.filter_high_spin.setEnabled(True)
+        if hasattr(self, "csd_low_spin"):
+            self.csd_low_spin.setEnabled(True)
+            self.csd_high_spin.setEnabled(True)
+
+        # Re-sync enabled states against the Filtered / CSD checkboxes.
+        self._update_enabled_states()
+
+        
     # ------------------------------------------------------------------
     # Change handling
     # ------------------------------------------------------------------
