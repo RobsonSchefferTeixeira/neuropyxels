@@ -52,7 +52,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollBar,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QSizePolicy,
     QGroupBox, QFrame, QToolBar, QSlider, QDockWidget, QMainWindow,
-    QMenu, QToolButton, QGridLayout,
+    QMenu, QToolButton, QGridLayout, QAbstractSpinBox
 )
 
 from PyQt6.QtGui import (
@@ -124,12 +124,19 @@ class TraceControlPanel(QWidget):
     performanceChanged = pyqtSignal(dict)   
     globalFilterEnabledChanged = pyqtSignal(bool)
     resetChannelCustomizationsRequested = pyqtSignal()
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Trace Controls")
         self.setMinimumWidth(350)
+        # Nyquist-safe upper bound, set by set_sample_rate. Handlers
+        # clamp against this rather than the widget's own maximum, so
+        # the widget stays permissive and typed values are accepted
+        # then auto-corrected on commit -- same pattern as the ordering
+        # rule between low and high.
+        self._nyquist_safe_max: float | None = None
         self._build_ui()
+    
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -271,24 +278,38 @@ class TraceControlPanel(QWidget):
         self.filter_checkbox.toggled.connect(self._on_filter_toggled)
         bp_row.addWidget(self.filter_checkbox)
 
+
         self.low_freq_spin = QDoubleSpinBox()
         self.low_freq_spin.setRange(0.0, 1e9)
         self.low_freq_spin.setValue(1.0)
         self.low_freq_spin.setSuffix(" Hz")
         self.low_freq_spin.setEnabled(False)
+        self.low_freq_spin.setKeyboardTracking(False)
         self.low_freq_spin.setToolTip("Set to 0 for low-pass only")
-        self.low_freq_spin.valueChanged.connect(self._on_filter_params_changed)
+        self.low_freq_spin.valueChanged.connect(self._on_low_freq_edited)
+        
         bp_row.addWidget(self.low_freq_spin)
-
+        
+        
         self.high_freq_spin = QDoubleSpinBox()
         self.high_freq_spin.setRange(0.0, 1e9)
         self.high_freq_spin.setValue(300.0)
         self.high_freq_spin.setSuffix(" Hz")
         self.high_freq_spin.setEnabled(False)
+        self.high_freq_spin.setKeyboardTracking(False)
         self.high_freq_spin.setToolTip("Set to 0 for high-pass only")
-        self.high_freq_spin.valueChanged.connect(self._on_filter_params_changed)
+        self.high_freq_spin.valueChanged.connect(self._on_high_freq_edited)
+
         bp_row.addWidget(self.high_freq_spin)
+
+        # In _build_ui, right after constructing high_freq_spin:
+        self.high_freq_spin.editingFinished.connect(
+            lambda: print(f"[high-editing-finished] value={self.high_freq_spin.value()}"))
+
+
+        
         bp_row.addStretch()
+        
         filter_layout.addLayout(bp_row)
 
         notch_row = QHBoxLayout()
@@ -297,12 +318,15 @@ class TraceControlPanel(QWidget):
         self.notch_checkbox.toggled.connect(self._on_notch_toggled)
         notch_row.addWidget(self.notch_checkbox)
 
+
         self.notch_freq_spin = QDoubleSpinBox()
         self.notch_freq_spin.setRange(0.0, 1e9)
         self.notch_freq_spin.setValue(50.0)
         self.notch_freq_spin.setSuffix(" Hz")
         self.notch_freq_spin.setEnabled(False)
+        self.notch_freq_spin.setKeyboardTracking(False)
         self.notch_freq_spin.valueChanged.connect(self._on_filter_params_changed)
+
         notch_row.addWidget(self.notch_freq_spin)
         notch_row.addStretch()
         filter_layout.addLayout(notch_row)
@@ -311,8 +335,6 @@ class TraceControlPanel(QWidget):
         self.detrend_checkbox.setEnabled(False)
         self.detrend_checkbox.toggled.connect(self._on_detrend_toggled)
         filter_layout.addWidget(self.detrend_checkbox)
-
-        self._on_global_filter_toggled(self.global_filter_checkbox.isChecked())
 
         self.reset_channel_options_btn = QPushButton("Reset All Channel Customizations")
         self.reset_channel_options_btn.setToolTip(
@@ -394,37 +416,199 @@ class TraceControlPanel(QWidget):
         layout.addWidget(perf_group)
 
 
-        
-    def set_sample_rate(self, sample_rate: float):
-        """Derive the frequency-spinbox range from the loaded recording's
-        sample rate. Safe upper bound is 0.95 * Nyquist: a Butterworth
-        bandpass whose high cutoff sits exactly at Nyquist is
-        numerically ill-conditioned in sosfiltfilt, and 0.95 leaves
-        enough margin that every supported filter order stays stable.
 
-        Called once when a data source is first loaded and again
-        whenever it changes. Re-enables the spinboxes now that the
-        range is meaningful, then re-runs the global-filter sync so the
-        top-level "Enable global filtering" checkbox still wins.
+        # Paired-range priming. Runs first so the two spinboxes start
+        # mutually consistent.
+        self._on_low_freq_edited(self.low_freq_spin.value())
+
+        # Then the enabled-state sync, which reads the global-filter
+        # checkbox and greys out (or enables) the sub-controls.
+        self._on_global_filter_toggled(self.global_filter_checkbox.isChecked())
+
+
+    def _on_low_freq_edited(self, value: float):
+        """Handler for the LOW cutoff spinbox.
+
+        Structure mirrors _on_high_freq_edited:
+
+          1. Clamp the typed value against the Nyquist-safe upper
+             bound. The widget's own maximum is wide, so this is where
+             the real cap is enforced.
+          2. If this spinbox was set to the sentinel (0), unconstrain
+             the paired spinbox and return. For low, the sentinel means
+             "no low cutoff" -- low-pass mode.
+          3. Otherwise, if the edited value would cross the paired
+             spinbox, push the paired spinbox out of the way (not the
+             edited one).
+          4. Refresh the range constraint on the LOW spinbox's max,
+             based on where the high spinbox landed. Never touch the
+             high spinbox's min -- high's min stays at 0 so the
+             sentinel is always reachable.
+        """
+        # ---- 1. Clamp to Nyquist-safe bound ----
+        if (value != 0.0
+                and self._nyquist_safe_max is not None
+                and value > self._nyquist_safe_max):
+            value = self._nyquist_safe_max
+            self.low_freq_spin.blockSignals(True)
+            self.low_freq_spin.setValue(value)
+            self.low_freq_spin.blockSignals(False)
+
+        step = self.high_freq_spin.singleStep()
+        high_value = self.high_freq_spin.value()
+
+        # ---- 2. Sentinel: low = 0 -> low-pass mode ----
+        if value == 0.0:
+            self.low_freq_spin.blockSignals(True)
+            self.low_freq_spin.setMaximum(
+                self._nyquist_safe_max
+                if self._nyquist_safe_max is not None
+                else self.high_freq_spin.maximum()
+            )
+            self.low_freq_spin.blockSignals(False)
+            self._on_filter_params_changed()
+            return
+
+        high_max = (
+            self._nyquist_safe_max
+            if self._nyquist_safe_max is not None
+            else self.high_freq_spin.maximum()
+        )
+        high_is_sentinel = (high_value == 0.0)
+
+        # ---- 3. Ordering: low must stay strictly below high ----
+        if not high_is_sentinel and value >= high_value:
+            new_high = min(value + step, high_max)
+            if new_high <= value:
+                value = max(self.low_freq_spin.minimum(),
+                            new_high - step)
+                self.low_freq_spin.blockSignals(True)
+                self.low_freq_spin.setValue(value)
+                self.low_freq_spin.blockSignals(False)
+            self.high_freq_spin.blockSignals(True)
+            self.high_freq_spin.setValue(new_high)
+            self.high_freq_spin.blockSignals(False)
+
+        # ---- 4. Refresh low's max from the high spinbox's final value ----
+        high_now = self.high_freq_spin.value()
+        self.low_freq_spin.blockSignals(True)
+        if high_now == 0.0:
+            self.low_freq_spin.setMaximum(high_max)
+        else:
+            self.low_freq_spin.setMaximum(
+                min(high_now - step, high_max)
+            )
+        self.low_freq_spin.blockSignals(False)
+
+        self._on_filter_params_changed()
+
+    def _on_high_freq_edited(self, value: float):
+        """Handler for the HIGH cutoff spinbox.
+
+        Structure mirrors _on_low_freq_edited:
+
+          1. Clamp the typed value against the Nyquist-safe upper
+             bound. The widget's own maximum is wide, so this is where
+             the real cap is enforced.
+          2. If this spinbox was set to the sentinel (0), unconstrain
+             the paired spinbox and return. For high, the sentinel
+             means "no high cutoff" -- high-pass mode.
+          3. Otherwise, if the edited value would cross the paired
+             spinbox, push the paired spinbox out of the way (not the
+             edited one).
+          4. Refresh the range constraint on the LOW spinbox's max,
+             based on where the high spinbox landed. Never touch the
+             high spinbox's min.
+        """
+        # ---- 1. Clamp to Nyquist-safe bound ----
+        if (value != 0.0
+                and self._nyquist_safe_max is not None
+                and value > self._nyquist_safe_max):
+            value = self._nyquist_safe_max
+            self.high_freq_spin.blockSignals(True)
+            self.high_freq_spin.setValue(value)
+            self.high_freq_spin.blockSignals(False)
+
+        step = self.low_freq_spin.singleStep()
+
+        # ---- 2. Sentinel: high = 0 -> high-pass mode ----
+        if value == 0.0:
+            self.low_freq_spin.blockSignals(True)
+            self.low_freq_spin.setMaximum(
+                self._nyquist_safe_max
+                if self._nyquist_safe_max is not None
+                else self.high_freq_spin.maximum()
+            )
+            self.low_freq_spin.blockSignals(False)
+            self._on_filter_params_changed()
+            return
+
+        low_value = self.low_freq_spin.value()
+        low_min = self.low_freq_spin.minimum()
+
+        # ---- 3. Ordering: high must stay strictly above low ----
+        if value <= low_value:
+            new_low = max(value - step, low_min)
+            if new_low >= value:
+                value = min(
+                    self._nyquist_safe_max
+                    if self._nyquist_safe_max is not None
+                    else self.high_freq_spin.maximum(),
+                    new_low + step,
+                )
+                self.high_freq_spin.blockSignals(True)
+                self.high_freq_spin.setValue(value)
+                self.high_freq_spin.blockSignals(False)
+            self.low_freq_spin.blockSignals(True)
+            self.low_freq_spin.setValue(new_low)
+            self.low_freq_spin.blockSignals(False)
+
+        # ---- 4. Refresh low's max from the high spinbox's final value ----
+        high_now = self.high_freq_spin.value()
+        self.low_freq_spin.blockSignals(True)
+        if high_now == 0.0:
+            self.low_freq_spin.setMaximum(
+                self._nyquist_safe_max
+                if self._nyquist_safe_max is not None
+                else self.high_freq_spin.maximum()
+            )
+        else:
+            self.low_freq_spin.setMaximum(
+                min(
+                    high_now - step,
+                    self._nyquist_safe_max
+                    if self._nyquist_safe_max is not None
+                    else high_now - step,
+                )
+            )
+        self.low_freq_spin.blockSignals(False)
+
+        self._on_filter_params_changed()
+
+
+    def set_sample_rate(self, sample_rate: float):
+        """Record the Nyquist-safe frequency bound for the current
+        recording and re-prime the paired-range guards.
+
+        Does NOT call setRange/setMaximum on the frequency spinboxes.
+        The widget ranges stay wide (0..1e9) so any typed value is
+        accepted; _on_low_freq_edited / _on_high_freq_edited clamp
+        against self._nyquist_safe_max on commit, which gives the
+        "type anything, snap to Nyquist" behavior.
         """
         if sample_rate is None or sample_rate <= 0:
             return
         nyq = 0.5 * float(sample_rate)
         safe_high = max(1.0, 0.95 * nyq)
+        self._nyquist_safe_max = safe_high
 
-        self.low_freq_spin.setRange(0.0, safe_high)
-        self.high_freq_spin.setRange(0.0, safe_high)
-        if hasattr(self, "notch_freq_spin"):
-            self.notch_freq_spin.setRange(0.0, safe_high)
+        # Notch isn't paired, so it can keep a plain range constraint.
+        self.notch_freq_spin.blockSignals(True)
+        self.notch_freq_spin.setMaximum(safe_high)
+        self.notch_freq_spin.blockSignals(False)
 
-        self.low_freq_spin.setEnabled(True)
-        self.high_freq_spin.setEnabled(True)
-        if hasattr(self, "notch_freq_spin"):
-            self.notch_freq_spin.setEnabled(True)
-
-        # Re-sync the enabled state against the global-filter checkbox.
-        self._on_global_filter_toggled(self.global_filter_checkbox.isChecked())
-        
+        # Re-prime the paired-range guards against the new bound.
+        self._on_low_freq_edited(self.low_freq_spin.value())
         
     # ---- Signal emitters ----
 
@@ -1913,35 +2097,121 @@ class TraceViewWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _apply_filters(self, data: np.ndarray) -> np.ndarray:
-        # print(f"[FILTER] enabled={self.filter_enabled} low={self.filter_low_freq} high={self.filter_high_freq} shape={data.shape}")
+        """Apply the enabled global filters (detrend, bandpass, notch) in
+        that order.
 
-        """Apply all enabled global filters."""
+        Frequency conventions, matching the spinbox behavior:
+          low = 0, high > 0  -> low-pass (high is the cutoff)
+          low > 0, high = 0  -> high-pass (low is the cutoff)
+          low = 0, high = 0  -> no filtering (returns input unchanged)
+          low > 0, high > 0  -> bandpass
+
+        The 0-sentinel convention is intentional and matches the UI: the
+        spinboxes treat 0 as "no cutoff on this side". The UI's paired-
+        range guard prevents ever reaching a state where both are > 0
+        and low >= high, so that case is treated as a defense-in-depth
+        skip here (with a one-line diagnostic) rather than something the
+        user can actually produce.
+        """
         if not self.filter_enabled and not self.notch_enabled and not self.detrend_enabled:
             return data
 
         filtered_data = data.copy()
 
+        # ---- Detrend (remove DC offset) ----
         if self.detrend_enabled:
             from scipy.signal import detrend as scipy_detrend
             filtered_data = scipy_detrend(filtered_data, axis=0)
 
+        # ---- Bandpass / high-pass / low-pass ----
         if self.filter_enabled:
-            nyquist = self.engine.sr / 2
-            low_freq = max(0.0, min(self.filter_low_freq, nyquist - 1))
-            high_freq = max(0.0, min(self.filter_high_freq, nyquist - 1))
-            if low_freq > 0 and high_freq > 0:
-                if low_freq >= high_freq:
-                    low_freq, high_freq = min(low_freq, high_freq), max(low_freq, high_freq)
-                filtered_data = bandpass_filter(filtered_data, self.engine.sr, low_freq, high_freq, order=self.filter_order)
-            elif high_freq > 0:
-                filtered_data = bandpass_filter(filtered_data, self.engine.sr, 0.0, high_freq, order=self.filter_order)
-            elif low_freq > 0:
-                filtered_data = bandpass_filter(filtered_data, self.engine.sr, low_freq, 0.0, order=self.filter_order)
-            else:
-                return filtered_data
+            nyquist = self.engine.sr / 2.0
+            # Safe upper bound: below Nyquist so butter() stays well-
+            # conditioned. Matches the spinbox range set by
+            # TraceControlPanel.set_sample_rate.
+            safe_high = max(1.0, 0.95 * nyquist)
 
+            low = float(self.filter_low_freq)
+            high = float(self.filter_high_freq)
+
+            # Clamp to the valid range. Anything out of range is either
+            # a programmatic caller bypassing the UI or a stale value
+            # left over from before a sample-rate change.
+            low = max(0.0, min(low, safe_high))
+            high = max(0.0, min(high, safe_high))
+
+            try:
+                if low == 0.0 and high == 0.0:
+                    # Both zero: no cutoff on either side. Fall through
+                    # without modifying the signal.
+                    pass
+                elif low == 0.0:
+                    # Low-pass: keep everything below `high`.
+                    sos = butter(
+                        self.filter_order,
+                        high / nyquist,
+                        btype="low",
+                        output="sos",
+                    )
+                    filtered_data = sosfiltfilt(sos, filtered_data, axis=0)
+                elif high == 0.0:
+                    # High-pass: keep everything above `low`.
+                    sos = butter(
+                        self.filter_order,
+                        low / nyquist,
+                        btype="high",
+                        output="sos",
+                    )
+                    filtered_data = sosfiltfilt(sos, filtered_data, axis=0)
+                elif low < high:
+                    # Normal bandpass.
+                    sos = butter(
+                        self.filter_order,
+                        [low / nyquist, high / nyquist],
+                        btype="band",
+                        output="sos",
+                    )
+                    filtered_data = sosfiltfilt(sos, filtered_data, axis=0)
+                else:
+                    # low >= high, both nonzero. The UI prevents this,
+                    # so reaching it means a programmatic misconfiguration
+                    # or a stale value from a previous data source whose
+                    # Nyquist made one of the two bounds unreachable.
+                    # Skip filtering rather than letting butter() raise.
+                    print(
+                        f"[filter] skipping invalid bandpass: "
+                        f"low ({low:.3f}) >= high ({high:.3f}); "
+                        f"nyquist={nyquist:.0f} safe_high={safe_high:.1f}"
+                    )
+            except ValueError as exc:
+                # butter/sosfiltfilt can still raise on edge cases the
+                # explicit checks above didn't catch (e.g. filter_order
+                # too high for the padded segment length). Report and
+                # continue with unfiltered data rather than crashing
+                # the paint loop.
+                print(
+                    f"[filter] bandpass failed: {exc}; "
+                    f"low={low} high={high} order={self.filter_order}"
+                )
+                filtered_data = data.copy()
+
+        # ---- Notch ----
         if self.notch_enabled:
-            filtered_data = notch_filter(filtered_data, self.engine.sr, self.notch_freq, quality_factor=self.notch_q)
+            try:
+                filtered_data = notch_filter(
+                    filtered_data,
+                    self.engine.sr,
+                    self.notch_freq,
+                    quality_factor=self.notch_q,
+                )
+            except ValueError as exc:
+                # notch_filter raises if the frequency is at or above
+                # Nyquist, which can happen if the notch spinbox kept a
+                # stale value across a sample-rate change.
+                print(
+                    f"[filter] notch failed: {exc}; "
+                    f"notch_freq={self.notch_freq} sr={self.engine.sr}"
+                )
 
         return filtered_data
 
@@ -2333,26 +2603,53 @@ class TraceViewWidget(QWidget):
         return data
 
     def _apply_channel_filter(self, raw, low, high):
-        """Per-channel filtered trace: bandpass from the channel's own
-        spinboxes, applied to the source raw signal (never to a globally
-        filtered version)."""
-        if low <= 0 and high <= 0:
+        """Per-channel filtered trace: low-pass, high-pass, or bandpass,
+        chosen by the same 0-sentinel convention as the global filter.
+
+        Applied to the channel's source raw signal. Never applied to a
+        globally filtered version.
+        """
+        nyquist = self.engine.sr / 2.0
+        safe_high = max(1.0, 0.95 * nyquist)
+
+        low = max(0.0, min(float(low), safe_high))
+        high = max(0.0, min(float(high), safe_high))
+
+        if low == 0.0 and high == 0.0:
             return raw
-        nyquist = self.engine.sr / 2
-        low = max(0.0, min(low, nyquist - 1))
-        high = max(0.0, min(high, nyquist - 1))
-        if high > 0 and low >= high:
-            low, high = min(low, high), max(low, high)
+
         try:
-            if low > 0 and high > 0:
-                return bandpass_filter(raw, self.engine.sr, low, high, order=self.filter_order)
-            if high > 0:
-                return bandpass_filter(raw, self.engine.sr, 0.0, high, order=self.filter_order)
-            if low > 0:
-                return bandpass_filter(raw, self.engine.sr, low, 0.0, order=self.filter_order)
-        except Exception as exc:
-            print(f"Per-channel filter failed: {exc}")
-        return raw
+            if low == 0.0:
+                sos = butter(
+                    self.filter_order,
+                    high / nyquist,
+                    btype="low",
+                    output="sos",
+                )
+            elif high == 0.0:
+                sos = butter(
+                    self.filter_order,
+                    low / nyquist,
+                    btype="high",
+                    output="sos",
+                )
+            elif low < high:
+                sos = butter(
+                    self.filter_order,
+                    [low / nyquist, high / nyquist],
+                    btype="band",
+                    output="sos",
+                )
+            else:
+                print(
+                    f"[filter] ch filter skipping invalid band: "
+                    f"low={low:.3f} high={high:.3f}"
+                )
+                return raw
+            return sosfiltfilt(sos, raw, axis=0)
+        except ValueError as exc:
+            print(f"[filter] ch filter failed: {exc}; low={low} high={high}")
+            return raw
 
     def _get_trace_normalization(
         self, channel: int, trace_idx: int, mode: str, draw_y: np.ndarray

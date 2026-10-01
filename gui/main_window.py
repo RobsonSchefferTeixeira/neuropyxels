@@ -418,9 +418,7 @@ class MainWindow(QMainWindow):
         # ---- 6. Clear MainWindow's file/probe bookkeeping ----
         self._settings_path = None
         self._probes = {}
-        print(f"[reset] before: current_probe_key={self._current_probe_key}")
         self._current_probe_key = None
-        print(f"[reset] after: current_probe_key={self._current_probe_key}")
         # ---- 7. Reset the stream picker ----
         self.stream_picker.blockSignals(True)
         self.stream_picker.clear()
@@ -1395,9 +1393,6 @@ class MainWindow(QMainWindow):
         )
 
     def _load_probe_map(self, probe_data: dict):
-        #print(f"[load-map] start; probe_map={self.probe_map!r}")
-        #print(f"[load-map] dock widget={self.probe_map_dock.widget()!r}")
-        #print(f"[load-map] dock visible={self.probe_map_dock.isVisible()}")
 
         # Tear down any previous probe map cleanly before building the new one.
         if self.probe_map is not None:
@@ -1409,22 +1404,17 @@ class MainWindow(QMainWindow):
             self.probe_map = None
 
         self.probe_map = ProbeMapWidget(probe_data)
-        #print(f"[load-map] constructed new map={self.probe_map!r}")
 
         self.probe_map.channelsSelected.connect(self._on_channels_selected)
         self.probe_map_dock.setWidget(self.probe_map)
         self.probe_map_dock.setVisible(True)
-        #print(f"[load-map] after setWidget, dock widget={self.probe_map_dock.widget()!r}")
-        #print(f"[load-map] dock visible now={self.probe_map_dock.isVisible()}")
 
         self.selected_list.clear()
         self._update_analysis_actions_enabled()
         self._push_full_probe_geometry_to_trace_view()
               
     def _push_full_probe_geometry_to_trace_view(self):
-        #print(f"[geo-push] called; key={self._current_probe_key} " f"has_probes={bool(self._probes)} " f"trace_view={self.trace_view is not None}")
         if not self._current_probe_key or not self._probes:
-            print("[geo-push] bailing: no current probe key or no probes")
             return
         
         """Push the entire probe's depth/shank/x geometry into the

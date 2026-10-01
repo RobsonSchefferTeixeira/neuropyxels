@@ -120,18 +120,26 @@ class ChannelOptionsPanel(QWidget):
         self.filtered_checkbox = QCheckBox("Show Filtered")
         self.filtered_checkbox.toggled.connect(self._on_any_changed)
         filt_layout.addWidget(self.filtered_checkbox, 0, 0, 1, 2)
+
+
         filt_layout.addWidget(QLabel("Low (Hz):"), 1, 0)
         self.filter_low_spin = QDoubleSpinBox()
         self.filter_low_spin.setRange(0.0, 15000.0)
         self.filter_low_spin.setSingleStep(1.0)
         self.filter_low_spin.valueChanged.connect(self._on_any_changed)
+        self.filter_low_spin.valueChanged.connect(self._on_filter_low_edited)
         filt_layout.addWidget(self.filter_low_spin, 1, 1)
+                
+        
         filt_layout.addWidget(QLabel("High (Hz):"), 2, 0)
         self.filter_high_spin = QDoubleSpinBox()
         self.filter_high_spin.setRange(0.0, 15000.0)
         self.filter_high_spin.setSingleStep(1.0)
         self.filter_high_spin.valueChanged.connect(self._on_any_changed)
+        self.filter_high_spin.valueChanged.connect(self._on_filter_high_edited)
         filt_layout.addWidget(self.filter_high_spin, 2, 1)
+        
+        
         filt_layout.addWidget(QLabel("Gain:"), 3, 0)
         self.filtered_gain_spin = QDoubleSpinBox()
         self.filtered_gain_spin.setRange(0.01, 1000.0)
@@ -191,6 +199,50 @@ class ChannelOptionsPanel(QWidget):
         csd_layout.addWidget(self.csd_status_label, 5, 0, 1, 2)
         layout.addWidget(csd_group)
 
+        # 1. Paired-range priming: low/high spinboxes start consistent.
+        self._on_filter_low_edited(self.filter_low_spin.value())
+        if hasattr(self, "csd_low_spin"):
+            self._on_csd_low_edited(self.csd_low_spin.value())
+
+        # 2. Enabled-state sync: greys out sub-controls whose parent
+        # checkbox is off (Filtered unchecked → its spinboxes disabled,
+        # etc.).
+        self._update_enabled_states()
+
+
+
+
+    def _on_filter_low_edited(self, value: float):
+        step = self.filter_high_spin.singleStep()
+        new_min = value + step
+        high_max = self.filter_high_spin.maximum()
+        if new_min > high_max:
+            new_min = high_max
+            value = high_max - step
+            self.filter_low_spin.blockSignals(True)
+            self.filter_low_spin.setValue(value)
+            self.filter_low_spin.blockSignals(False)
+        self.filter_high_spin.blockSignals(True)
+        self.filter_high_spin.setMinimum(new_min)
+        self.filter_high_spin.blockSignals(False)
+        self._on_any_changed()
+
+    def _on_filter_high_edited(self, value: float):
+        step = self.filter_low_spin.singleStep()
+        new_max = value - step
+        low_min = self.filter_low_spin.minimum()
+        if new_max < low_min:
+            new_max = low_min
+            value = low_min + step
+            self.filter_high_spin.blockSignals(True)
+            self.filter_high_spin.setValue(value)
+            self.filter_high_spin.blockSignals(False)
+        self.filter_low_spin.blockSignals(True)
+        self.filter_low_spin.setMaximum(new_max)
+        self.filter_low_spin.blockSignals(False)
+        self._on_any_changed()
+
+
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
@@ -247,15 +299,14 @@ class ChannelOptionsPanel(QWidget):
         self.csd_distance_spin.setEnabled(csd_on)
         self.csd_gain_spin.setEnabled(csd_on)
 
-
     def set_sample_rate(self, sample_rate: float):
         """Derive the per-channel filter and CSD spinbox ranges from the
         loaded recording's sample rate. Safe upper bound is
         0.95 * Nyquist, matching TraceControlPanel.set_sample_rate.
 
         Called right before the panel is shown, and again if the data
-        source changes while the panel is open. Re-enables the
-        spinboxes now that the range is meaningful, then re-runs the
+        source changes while the panel is open. Re-primes the paired-
+        range guards against the new upper bound, then re-runs the
         checkbox-gating sync so each field's enabled state still
         follows its parent checkbox (Filtered, CSD).
         """
@@ -266,15 +317,14 @@ class ChannelOptionsPanel(QWidget):
 
         self.filter_low_spin.setRange(0.0, safe_high)
         self.filter_high_spin.setRange(0.0, safe_high)
-        if hasattr(self, "csd_low_spin"):
-            self.csd_low_spin.setRange(0.0, safe_high)
-            self.csd_high_spin.setRange(0.0, safe_high)
+        self.csd_low_spin.setRange(0.0, safe_high)
+        self.csd_high_spin.setRange(0.0, safe_high)
 
-        self.filter_low_spin.setEnabled(True)
-        self.filter_high_spin.setEnabled(True)
-        if hasattr(self, "csd_low_spin"):
-            self.csd_low_spin.setEnabled(True)
-            self.csd_high_spin.setEnabled(True)
+        # Re-prime paired-range guards against the new bound. Runs
+        # before _update_enabled_states so the ranges are already
+        # correct by the time enabled-ness is applied.
+        self._on_filter_low_edited(self.filter_low_spin.value())
+        self._on_csd_low_edited(self.csd_low_spin.value())
 
         # Re-sync enabled states against the Filtered / CSD checkboxes.
         self._update_enabled_states()
