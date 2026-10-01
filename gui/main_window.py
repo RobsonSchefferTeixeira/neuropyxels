@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import numpy as np
-
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
@@ -632,10 +632,7 @@ class MainWindow(QMainWindow):
         drives the trace view's spike raster overlay."""
         dock = QDockWidget("Phy Units", self)
         dock.setObjectName("phy_units_dock")
-        dock.setAllowedAreas(
-            Qt.DockWidgetArea.LeftDockWidgetArea |
-            Qt.DockWidgetArea.RightDockWidgetArea
-        )
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
 
         self.phy_units_panel = PhyUnitsPanel()
         self.phy_units_panel.selectionChanged.connect(self._on_phy_units_selection_changed)
@@ -648,13 +645,13 @@ class MainWindow(QMainWindow):
         self.phy_units_panel.focusNeighborhoodChanged.connect(self._on_focus_neighborhood_size_changed)
         self.phy_units_panel.focusedUnitChanged.connect(self._on_focused_unit_changed)
 
-        self.phy_units_panel.prevSpikeRequested.connect(
-            self._on_prev_spike_requested
-        )
-        self.phy_units_panel.nextSpikeRequested.connect(
-            self._on_next_spike_requested
-        )
+        self.phy_units_panel.reclassifyRequested.connect(self._on_reclassify_requested)
+        self.phy_units_panel.resetClassificationRequested.connect(self._on_reset_classification_requested)
+        self.phy_units_panel.importFromPhyRequested.connect(self._on_import_from_phy_requested)
+        self.phy_units_panel.saveRequested.connect(self._on_save_classification_requested)
 
+        self.phy_units_panel.prevSpikeRequested.connect(self._on_prev_spike_requested)
+        self.phy_units_panel.nextSpikeRequested.connect(self._on_next_spike_requested)
 
         dock.setWidget(self.phy_units_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -665,6 +662,53 @@ class MainWindow(QMainWindow):
         dock.setVisible(False)
         dock.visibilityChanged.connect(self._on_phy_units_visibility_changed)
 
+
+    def _on_reclassify_requested(self, cluster_ids: list, new_class: str):
+        if self.phy_units_panel is None or not cluster_ids:
+            return
+        self.phy_units_panel.apply_reclassification(cluster_ids, new_class)
+        self._schedule_classification_autosave()
+
+    def _on_reset_classification_requested(self, cluster_ids: list):
+        if self.phy_units_panel is None or not cluster_ids:
+            return
+        self.phy_units_panel.reset_classification(cluster_ids)
+        self._schedule_classification_autosave()
+
+    def _on_import_from_phy_requested(self, cluster_ids: list):
+        if self.phy_units_panel is None or not cluster_ids:
+            return
+        self.phy_units_panel.import_from_phy(cluster_ids)
+        self._schedule_classification_autosave()
+
+    def _on_save_classification_requested(self):
+        if self.engine.phy_data is None:
+            return
+        from core.phy_loader import save_reclassified
+        try:
+            path = save_reclassified(
+                self.engine.phy_data, self.engine.phy_data.units
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not write classification file:\n\n{exc}"
+            )
+            return
+        self._update_status(f"Classification saved to {path.name}.")
+
+    def _schedule_classification_autosave(self):
+        """Debounce autosaves: a burst of reclassifications results in
+        one file write ~600 ms after the last change, not one per click."""
+        if not hasattr(self, "_classification_autosave_timer"):
+            from PyQt6.QtCore import QTimer
+            self._classification_autosave_timer = QTimer(self)
+            self._classification_autosave_timer.setSingleShot(True)
+            self._classification_autosave_timer.setInterval(600)
+            self._classification_autosave_timer.timeout.connect(
+                self._on_save_classification_requested
+            )
+        self._classification_autosave_timer.start()
 
     def _on_prev_spike_requested(self):
         self._jump_to_adjacent_spike(direction=-1)
