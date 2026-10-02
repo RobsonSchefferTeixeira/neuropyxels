@@ -44,17 +44,104 @@ to consume a click/keypress (its own hit-test), falling through via
 super() to ThetaEpochTraceViewWidget's handlers, which fall through to
 TraceViewWidget's base pan/zoom/cursor logic if neither overlay claims
 the event.
+
+Shortcut relay
+--------------
+This widget also relays two shortcut families upward so the user can
+curate units without clicking back to the Phy Units panel:
+
+  * Bare E/G/P/U/M/N -> reclassifyShortcutRequested(str), a class name.
+    MainWindow resolves which unit is focused and applies the change.
+  * Bare PageUp / PageDown -> spikeNavigationRequested(-1/+1), the
+    existing signal declared on TraceViewWidget. MainWindow already
+    routes that into _jump_to_adjacent_spike.
+
+Ctrl+PageUp / Ctrl+PageDown are deliberately NOT consumed here -- they
+fall through to TraceViewWidget.keyPressEvent, which handles them as
+zoom in / zoom out.
 """
 
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt, pyqtSignal
+
 from gui.ripple_trace_view import RippleTraceViewWidget
+
+
+# Bare-letter -> class. Same mapping as gui/phy_units_panel.py's
+# _ReclassifyTable. Duplicated here rather than imported so the trace
+# view has no dependency on the panel module.
+_RECLASSIFY_SHORTCUTS: dict[int, str] = {
+    Qt.Key.Key_E: "excellent",
+    Qt.Key.Key_G: "good",
+    Qt.Key.Key_P: "poor",
+    Qt.Key.Key_U: "unsorted",
+    Qt.Key.Key_M: "mua",
+    Qt.Key.Key_N: "noise",
+}
 
 
 class NeuralTraceViewWidget(RippleTraceViewWidget):
     """TraceViewWidget with both ripple-event and theta-epoch
     interactive overlays active simultaneously, via a single linear
     inheritance chain (see module docstring for why NOT multiple
-    inheritance)."""
-    pass
+    inheritance).
 
+    Also relays bare-letter reclassify shortcuts and bare PageUp/Down
+    spike navigation upward -- see module docstring.
+    """
+
+    reclassifyShortcutRequested = pyqtSignal(str)  # new class name
+
+    def keyPressEvent(self, event):
+        # Auto-repeat off for all shortcut handling -- holding a key
+        # must not blow through dozens of units / spikes in a second.
+        if event.isAutoRepeat():
+            super().keyPressEvent(event)
+            return
+
+        mods = event.modifiers()
+        key = event.key()
+
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        meta = bool(mods & Qt.KeyboardModifier.MetaModifier)
+
+        # Ctrl+PageUp / Ctrl+PageDown: pass through to the base class
+        # (zoom in / zoom out). Must be checked before the bare
+        # PageUp/PageDown branch below, or Ctrl-modified presses would
+        # be swallowed as spike navigation.
+        if ctrl and not (alt or shift or meta) and key in (
+            Qt.Key.Key_PageUp, Qt.Key.Key_PageDown
+        ):
+            super().keyPressEvent(event)
+            return
+
+        # Anything with a modifier other than bare Shift is not ours.
+        if alt or ctrl or meta or shift:
+            super().keyPressEvent(event)
+            return
+
+        # Bare PageUp / PageDown: spike navigation of the focused unit
+        # (or the single selected unit if focus mode is off). The
+        # routing decision -- including the "multiple units selected,
+        # show a status message" case -- lives in MainWindow's
+        # _jump_to_adjacent_spike, which this signal already reaches.
+        if key == Qt.Key.Key_PageUp:
+            self.spikeNavigationRequested.emit(-1)
+            event.accept()
+            return
+        if key == Qt.Key.Key_PageDown:
+            self.spikeNavigationRequested.emit(+1)
+            event.accept()
+            return
+
+        # Bare E/G/P/U/M/N: reclassify the focused unit, then advance.
+        class_name = _RECLASSIFY_SHORTCUTS.get(key)
+        if class_name is not None:
+            self.reclassifyShortcutRequested.emit(class_name)
+            event.accept()
+            return
+
+        super().keyPressEvent(event)

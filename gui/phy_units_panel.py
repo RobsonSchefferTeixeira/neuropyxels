@@ -22,7 +22,8 @@ focusNeighborhoodChanged(int)
 focusedUnitChanged(int)
     Emitted when the focused unit changes. -1 when no unit is focused.
 reclassifyRequested(list[int], str)
-    Emitted when the user asks to reclassify the selected units.
+    Emitted when the user asks to reclassify the selected units
+    (via the Reclassify button or the table's context menu).
 resetClassificationRequested(list[int])
     Emitted when the user asks to clear the reclassified column for
     the selected units.
@@ -32,9 +33,26 @@ importFromPhyRequested(list[int])
 saveRequested()
     Emitted when the user clicks "Save classification".
 prevSpikeRequested()
-    Emitted when the user clicks "◄ Prev Spike".
+    Emitted when the user clicks "◄ Prev Spike" or presses PageUp.
 nextSpikeRequested()
-    Emitted when the user clicks "Next Spike ►".
+    Emitted when the user clicks "Next Spike ►" or presses PageDown.
+reclassifyAndAdvanceRequested(list[int], str)
+    Emitted on bare E/G/P/U/M/N: reclassify the focused unit and
+    advance to the next visible one. Fired only when exactly one unit
+    is selected.
+
+Keyboard shortcuts
+------------------
+The shortcuts live on the table (via _ReclassifyTable) so bare letters
+intercept before QAbstractItemView's own keyboard-search behavior.
+The panel itself also handles the same keys as a fallback for when the
+panel -- not the table -- has focus.
+
+  Bare E/G/P/U/M/N   -> reclassifyAndAdvanceRequested
+  Bare PageUp/Down   -> prevSpikeRequested / nextSpikeRequested
+
+Auto-repeat is ignored. Any modifier (Ctrl/Alt/Shift/Meta) disqualifies
+the shortcut, so e.g. Ctrl+PageUp still zooms the trace view.
 """
 
 from __future__ import annotations
@@ -60,6 +78,77 @@ CLASS_COLORS = {
 }
 
 
+# Bare-letter -> class, for the reclassify-and-advance shortcut.
+# Deliberately no modifiers: plain letters match Phy's own mnemonics.
+# The _ReclassifyTable subclass intercepts these at the table level so
+# QAbstractItemView's keyboard-search doesn't eat them first.
+_RECLASSIFY_SHORTCUTS: dict[int, str] = {
+    Qt.Key.Key_E: "excellent",
+    Qt.Key.Key_G: "good",
+    Qt.Key.Key_P: "poor",
+    Qt.Key.Key_U: "unsorted",
+    Qt.Key.Key_M: "mua",
+    Qt.Key.Key_N: "noise",
+}
+
+
+def _is_bare_key(event) -> bool:
+    """True if the event has no Ctrl/Alt/Shift/Meta modifiers. Bare
+    keys are the only ones the shortcut handlers act on; anything with
+    a modifier is left for other widgets (e.g. Ctrl+PageUp -> zoom)."""
+    mods = event.modifiers()
+    disqualifying = (
+        Qt.KeyboardModifier.ControlModifier
+        | Qt.KeyboardModifier.AltModifier
+        | Qt.KeyboardModifier.ShiftModifier
+        | Qt.KeyboardModifier.MetaModifier
+    )
+    return not (mods & disqualifying)
+
+
+class _ReclassifyTable(QTableWidget):
+    """QTableWidget subclass that intercepts bare E/G/P/U/M/N and bare
+    PageUp/PageDown before QAbstractItemView's own key handling. Emits
+    the results as signals rather than reaching up to the parent, so
+    PhyUnitsPanel just wires them to its own public signals.
+
+    Why a subclass rather than an event filter: key events reach the
+    focused widget (the table) first, and QAbstractItemView's default
+    keyPressEvent runs a keyboard-search for printable characters --
+    typing G would jump to the first cell whose text starts with "G".
+    Overriding keyPressEvent here is the only way to consume the
+    printable-letter presses cleanly before that runs.
+    """
+
+    reclassifyShortcutActivated = pyqtSignal(str)   # new class name
+    prevSpikeRequested = pyqtSignal()
+    nextSpikeRequested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            super().keyPressEvent(event)
+            return
+
+        if _is_bare_key(event):
+            key = event.key()
+
+            if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                if key == Qt.Key.Key_PageUp:
+                    self.prevSpikeRequested.emit()
+                else:
+                    self.nextSpikeRequested.emit()
+                event.accept()
+                return
+
+            class_name = _RECLASSIFY_SHORTCUTS.get(key)
+            if class_name is not None:
+                self.reclassifyShortcutActivated.emit(class_name)
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+
 class PhyUnitsPanel(QWidget):
     """Table of Phy units with search, quality filter, multi-select,
     reclassification, and spike navigation."""
@@ -71,17 +160,25 @@ class PhyUnitsPanel(QWidget):
     focusModeChanged = pyqtSignal(bool)
     focusNeighborhoodChanged = pyqtSignal(int)
     focusedUnitChanged = pyqtSignal(int)
-    reclassifyRequested = pyqtSignal(list, str)      # cluster ids, new class
-    resetClassificationRequested = pyqtSignal(list)  # cluster ids
-    importFromPhyRequested = pyqtSignal(list)        # cluster ids
+    reclassifyRequested = pyqtSignal(list, str)              # cluster ids, new class
+    resetClassificationRequested = pyqtSignal(list)          # cluster ids
+    importFromPhyRequested = pyqtSignal(list)                # cluster ids
     saveRequested = pyqtSignal()
     prevSpikeRequested = pyqtSignal()
     nextSpikeRequested = pyqtSignal()
+    reclassifyAndAdvanceRequested = pyqtSignal(list, str)    # cluster ids, new class
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.phy_data: PhyData | None = None
         self._rows: list[Unit] = []
+
+        # The panel itself accepts focus so the shortcut fallback below
+        # fires when the user has clicked a non-table area of the panel
+        # (e.g. the summary label). Without this, focus stays on
+        # whatever had it before, and the shortcut would appear to do
+        # nothing from the user's point of view.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -154,8 +251,8 @@ class PhyUnitsPanel(QWidget):
         self.prev_spike_btn.setDefault(False)
         self.prev_spike_btn.setToolTip(
             "Jump the trace view to the previous spike of the focused "
-            "unit (or the first selected unit if focus mode is off).\n"
-            "Shortcut: Alt+PageUp"
+            "unit (or the single selected unit if focus mode is off).\n"
+            "Shortcut: PageUp"
         )
         self.prev_spike_btn.clicked.connect(self.prevSpikeRequested.emit)
         nav_row.addWidget(self.prev_spike_btn)
@@ -165,8 +262,8 @@ class PhyUnitsPanel(QWidget):
         self.next_spike_btn.setDefault(False)
         self.next_spike_btn.setToolTip(
             "Jump the trace view to the next spike of the focused unit "
-            "(or the first selected unit if focus mode is off).\n"
-            "Shortcut: Alt+PageDown"
+            "(or the single selected unit if focus mode is off).\n"
+            "Shortcut: PageDown"
         )
         self.next_spike_btn.clicked.connect(self.nextSpikeRequested.emit)
         nav_row.addWidget(self.next_spike_btn)
@@ -202,7 +299,9 @@ class PhyUnitsPanel(QWidget):
         self.reclassify_btn.setAutoDefault(False)
         self.reclassify_btn.setToolTip(
             "Change the class of the selected unit(s). Right-click the "
-            "table for the same menu."
+            "table for the same menu.\n"
+            "Shortcuts: E=excellent  G=good  P=poor  "
+            "U=unsorted  M=mua  N=noise"
         )
         self.reclassify_btn.clicked.connect(self._on_reclassify_button_clicked)
         class_row.addWidget(self.reclassify_btn)
@@ -235,7 +334,9 @@ class PhyUnitsPanel(QWidget):
         layout.addLayout(class_row)
 
         # ---- Table ----
-        self.table = QTableWidget(0, 8)
+        # Use _ReclassifyTable so bare-letter shortcuts are intercepted
+        # before QAbstractItemView's keyboard-search behavior.
+        self.table = _ReclassifyTable(0, 8)
         self.table.setHorizontalHeaderLabels([
             "Unit", "Channel", "Depth (µm)", "Class",
             "Reclassified", "n spikes", "FR (Hz)", "Shank",
@@ -253,6 +354,15 @@ class PhyUnitsPanel(QWidget):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
+
+        # Relay the table's shortcut signals to the panel's public ones,
+        # so MainWindow only needs to know about the panel.
+        self.table.reclassifyShortcutActivated.connect(
+            self._on_table_reclassify_shortcut
+        )
+        self.table.prevSpikeRequested.connect(self.prevSpikeRequested.emit)
+        self.table.nextSpikeRequested.connect(self.nextSpikeRequested.emit)
+
         layout.addWidget(self.table, stretch=1)
 
         self.summary_label = QLabel("No Phy folder loaded.")
@@ -274,15 +384,23 @@ class PhyUnitsPanel(QWidget):
             self.summary_label.setText("No Phy folder loaded.")
         else:
             n_total = len(self._rows)
-            n_good = sum(
+            # "good+" counts Phy's own labels only -- the app's
+            # reclassifications are a separate axis and deliberately do
+            # not feed into this number. Same source as the Class
+            # column, the class filter, and "Select all 'good'".
+            n_good_phy = sum(
                 1 for u in self._rows
-                if (u.quality or "").lower() in ("good", "excellent")
+                if (u.group or u.kslabel or "").strip().lower()
+                in ("good", "excellent")
             )
+            n_reclassified = sum(1 for u in self._rows if u.reclassified)
             n_spikes = int(phy_data.spike_times.size)
             src = phy_data.info_source.name if phy_data.info_source else "—"
             self.summary_label.setText(
                 f"{phy_data.folder.name}: {n_total} unit(s), "
-                f"{n_good} good+, {n_spikes} total spikes. "
+                f"{n_good_phy} good+ (Phy), "
+                f"{n_reclassified} reclassified, "
+                f"{n_spikes} total spikes. "
                 f"Loaded from: {src}"
             )
 
@@ -301,7 +419,7 @@ class PhyUnitsPanel(QWidget):
     def apply_reclassification(self, cluster_ids: list[int], new_class: str):
         """Update the in-memory Unit.quality for the given units and
         refresh the table immediately. Does NOT write to disk; the
-        caller decides when to save (via the debounced autosave)."""
+        caller decides when to save."""
         if self.phy_data is None:
             return
         for cid in cluster_ids:
@@ -329,6 +447,38 @@ class PhyUnitsPanel(QWidget):
                 unit.quality = label
                 unit.reclassified = True
         self._populate_table()
+
+    def focus_next_visible_unit(self) -> bool:
+        """Select the next visible row after the currently-selected one,
+        using the table's current sort/filter order. Stops at the last
+        row -- no wrap. Returns True if the selection moved.
+
+        Called by MainWindow after a successful reclassify-and-advance
+        so the bare-letter shortcut behaves like Phy's: label this unit,
+        move on.
+        """
+        current = self.selected_cluster_ids()
+        if not current:
+            if self.table.rowCount() > 0:
+                self.table.selectRow(0)
+                self.selectionChanged.emit(self.selected_cluster_ids())
+                return True
+            return False
+
+        current_cid = current[0]
+        current_row = -1
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == current_cid:
+                current_row = row
+                break
+
+        if current_row < 0 or current_row + 1 >= self.table.rowCount():
+            return False
+
+        self.table.selectRow(current_row + 1)
+        self.selectionChanged.emit(self.selected_cluster_ids())
+        return True
 
     def set_recolor_enabled(self, enabled: bool):
         self.recolor_check.blockSignals(True)
@@ -358,6 +508,47 @@ class PhyUnitsPanel(QWidget):
         self._clear_selection()
 
     # ------------------------------------------------------------------
+    # Shortcut handling
+    # ------------------------------------------------------------------
+
+    def _on_table_reclassify_shortcut(self, class_name: str):
+        """Table emitted a bare-letter shortcut. Only act when exactly
+        one row is selected -- which focus mode guarantees, but we
+        check defensively in case a future change loosens that."""
+        selected = self.selected_cluster_ids()
+        if len(selected) == 1:
+            self.reclassifyAndAdvanceRequested.emit(selected, class_name)
+
+    def keyPressEvent(self, event):
+        """Fallback for when the panel itself (not the table) has
+        focus. Same behavior as the table subclass -- see _ReclassifyTable.
+        """
+        if event.isAutoRepeat():
+            super().keyPressEvent(event)
+            return
+
+        if _is_bare_key(event):
+            key = event.key()
+
+            if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                if key == Qt.Key.Key_PageUp:
+                    self.prevSpikeRequested.emit()
+                else:
+                    self.nextSpikeRequested.emit()
+                event.accept()
+                return
+
+            class_name = _RECLASSIFY_SHORTCUTS.get(key)
+            if class_name is not None:
+                selected = self.selected_cluster_ids()
+                if len(selected) == 1:
+                    self.reclassifyAndAdvanceRequested.emit(selected, class_name)
+                    event.accept()
+                    return
+
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
     # Filtering / population
     # ------------------------------------------------------------------
 
@@ -378,10 +569,18 @@ class PhyUnitsPanel(QWidget):
             if only_selected and u.cluster_id not in prev_selected:
                 return False
             if class_filter != "all":
-                if (u.quality or "").lower() != class_filter.lower():
+                # Filter on Phy's label only -- the dropdown's options
+                # are Phy's vocabulary, and the user is choosing which
+                # of Phy's units to look at, not which of their own
+                # classifications.
+                phy_label = (u.group or u.kslabel or "").lower()
+                if phy_label != class_filter.lower():
                     return False
             if not search:
                 return True
+            # The free-text search is broader: it matches both Phy's
+            # label and the app's classification, plus the other
+            # identifying fields.
             haystack = " ".join(str(x) for x in (
                 u.cluster_id, u.channel, u.quality, u.group, u.kslabel, u.shank
             ) if x is not None).lower()
@@ -393,16 +592,30 @@ class PhyUnitsPanel(QWidget):
         self.table.blockSignals(True)
         self.table.setRowCount(len(visible))
         for row, u in enumerate(visible):
+            
+            
+            # Column 3 (Class)     = Phy's own label, never touched by
+            #                        the app -- falls back to kslabel so
+            #                        uncurated folders still show
+            #                        something.
+            # Column 4 (Reclassified) = the app's classification as text;
+            #                        empty unless the user has actually
+            #                        reclassified this unit.
+            phy_label = (u.group or u.kslabel or "").strip()
+            app_label = (u.quality or "") if u.reclassified else ""
+
             cells = [
                 str(u.cluster_id),
                 "" if u.channel is None else str(u.channel),
                 "" if u.depth is None else f"{u.depth:.0f}",
-                u.quality or "",
-                "✓" if u.reclassified else "",
+                phy_label,
+                app_label,
                 str(u.n_spikes),
                 "" if u.firing_rate is None else f"{u.firing_rate:.2f}",
                 "" if u.shank is None else str(u.shank),
             ]
+
+            
             item_id = None
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -414,9 +627,12 @@ class PhyUnitsPanel(QWidget):
                     item_id = item
             item_id.setData(Qt.ItemDataRole.UserRole, u.cluster_id)
 
-            # Color by class.
-            q = (u.quality or "").lower()
-            color_hex = CLASS_COLORS.get(q)
+            # Row color: the app's class if reclassified, else Phy's
+            # own label. This keeps the visual gradient meaningful on a
+            # fresh load (colored by Phy's verdict) and switches to
+            # reflecting the user's judgments as they curate.
+            color_source = (app_label or phy_label).lower()
+            color_hex = CLASS_COLORS.get(color_source)
             if color_hex is not None:
                 from PyQt6.QtGui import QColor
                 c = QColor(color_hex)
@@ -457,9 +673,14 @@ class PhyUnitsPanel(QWidget):
             )
 
     def _select_all_good(self):
+        """Select every row whose Class column (Phy's own label) is
+        'good' or 'excellent'. Deliberately ignores the app's
+        reclassifications -- this is a starting point for curation, not
+        a reflection of it."""
         self.table.blockSignals(True)
+        self.table.clearSelection()
         for row in range(self.table.rowCount()):
-            q_item = self.table.item(row, 3)
+            q_item = self.table.item(row, 3)   # Class column = Phy label
             if q_item is not None and q_item.text().strip().lower() in ("good", "excellent"):
                 self.table.selectRow(row)
         self.table.blockSignals(False)
@@ -479,7 +700,6 @@ class PhyUnitsPanel(QWidget):
         selected = self.selected_cluster_ids()
         if not selected:
             return
-        # Show a menu anchored below the button.
         menu = QMenu(self)
         for cls in KNOWN_CLASSES:
             action = menu.addAction(cls)

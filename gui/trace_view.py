@@ -3643,14 +3643,33 @@ class TraceViewWidget(QWidget):
             super().keyPressEvent(event)
             return
 
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
-        if alt and event.key() == Qt.Key.Key_PageUp:
-            self.spikeNavigationRequested.emit(-1)
-            event.accept()
-            return
-        if alt and event.key() == Qt.Key.Key_PageDown:
-            self.spikeNavigationRequested.emit(+1)
-            event.accept()
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        meta = bool(event.modifiers() & Qt.KeyboardModifier.MetaModifier)
+
+        # Ctrl+PageUp / Ctrl+PageDown: zoom. Must be checked before the
+        # unmodified branch below, since event.key() is the same for
+        # both. Requires Ctrl to be the ONLY modifier so e.g.
+        # Ctrl+Shift+PageUp isn't accidentally swallowed as zoom.
+        if ctrl and not (alt or shift or meta):
+            if event.key() == Qt.Key.Key_PageUp:
+                self._zoom(2.0)
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_PageDown:
+                self._zoom(0.5)
+                event.accept()
+                return
+
+        # Alt/Shift/Meta-modified keys are not handled here at all --
+        # let them fall through (menu accelerators, subclass handlers,
+        # etc.). Bare PageUp/PageDown are intentionally NOT handled
+        # here either; NeuralTraceViewWidget translates them into
+        # spikeNavigationRequested, and PhyUnitsPanel handles them on
+        # the panel side.
+        if alt or shift or meta:
+            super().keyPressEvent(event)
             return
 
         if event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
@@ -3667,10 +3686,6 @@ class TraceViewWidget(QWidget):
             self._go_to_end()
         elif event.key() == Qt.Key.Key_0:
             self._reset_view()
-        elif event.key() == Qt.Key.Key_PageUp:
-            self._zoom(2.0)
-        elif event.key() == Qt.Key.Key_PageDown:
-            self._zoom(0.5)
         elif event.key() == Qt.Key.Key_Up:
             self._scroll_up()
         elif event.key() == Qt.Key.Key_Down:

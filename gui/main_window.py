@@ -652,6 +652,7 @@ class MainWindow(QMainWindow):
 
         self.phy_units_panel.prevSpikeRequested.connect(self._on_prev_spike_requested)
         self.phy_units_panel.nextSpikeRequested.connect(self._on_next_spike_requested)
+        self.phy_units_panel.reclassifyAndAdvanceRequested.connect(self._on_reclassify_and_advance)
 
         dock.setWidget(self.phy_units_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -668,6 +669,59 @@ class MainWindow(QMainWindow):
             return
         self.phy_units_panel.apply_reclassification(cluster_ids, new_class)
         self._schedule_classification_autosave()
+
+    def _on_reclassify_shortcut_from_trace_view(self, new_class: str):
+        """Trace view relayed a bare-letter reclassify shortcut.
+        Resolve which unit is focused and run the same path as a
+        panel-initiated shortcut. The focus-mode gate lives in
+        _on_reclassify_and_advance -- this method is a pure resolver."""
+        if self.phy_units_panel is None:
+            return
+        focused = self.phy_units_panel.focused_unit_id()
+        if focused < 0:
+            self._update_status(
+                "Reclassify shortcut ignored: no unit selected."
+            )
+            return
+        self._on_reclassify_and_advance([focused], new_class)
+
+    def _on_reclassify_and_advance(self, cluster_ids: list, new_class: str):
+        """Shortcut path: reclassify, save immediately (bypassing the
+        debounced autosave so the disk keeps up with the keyboard),
+        then advance focus to the next visible unit.
+
+        The shortcut is only meaningful in focus mode -- 'the focused
+        unit' is only well-defined then, and the panel's key handler
+        emits a single-element list only when exactly one row is
+        selected, which focus mode guarantees.
+        """
+        if self.phy_units_panel is None:
+            return
+        if not self.phy_units_panel.focus_mode_enabled():
+            self._update_status(
+                "Reclassify shortcut ignored: focus mode is off."
+            )
+            return
+        if not cluster_ids:
+            return
+
+        self.phy_units_panel.apply_reclassification(cluster_ids, new_class)
+
+        # Bypass the debounce: a keyboard-driven curation session writes
+        # on every keystroke. Cancels any pending debounce so it doesn't
+        # fire redundantly a moment later.
+        if hasattr(self, "_classification_autosave_timer"):
+            self._classification_autosave_timer.stop()
+        self._on_save_classification_requested()
+
+        # Advance. focus_next_visible_unit emits selectionChanged,
+        # which _on_phy_units_selection_changed picks up; in focus
+        # mode that also fires focusedUnitChanged, which MainWindow
+        # routes into _apply_focus_neighborhood -- so the trace view
+        # and probe map update automatically.
+        self.phy_units_panel.focus_next_visible_unit()
+
+
 
     def _on_reset_classification_requested(self, cluster_ids: list):
         if self.phy_units_panel is None or not cluster_ids:
@@ -1186,7 +1240,8 @@ class MainWindow(QMainWindow):
             <tr><td><b>Left / Right</b></td><td>Step</td><td>Move 10% of window</td></tr>
             <tr><td><b>Home / End</b></td><td>Jump</td><td>Go to start / end</td></tr>
             <tr><td><b>0</b></td><td>Reset</td><td>Reset view to defaults</td></tr>
-            <tr><td><b>Page Up / Down</b></td><td>Zoom fast</td><td>Zoom 2x / 0.5x</td></tr>
+            <tr><td><b>Ctrl + Page Up / Down</b></td><td>Zoom</td><td>Zoom 2x / 0.5x</td></tr>
+            <tr><td><b>Page Up / Down</b></td><td>Spike nav</td><td>Previous / next spike of the focused unit (or the single selected unit when focus mode is off)</td></tr>
         </table>
 
         <h3>Filter Shortcuts</h3>
@@ -1199,7 +1254,22 @@ class MainWindow(QMainWindow):
 
         <h3>Color Controls</h3>
         <p>Use the Display Settings panel to change trace color, background color, grid color, and line width.</p>
+
+        <h3>Phy Units — Curation Shortcuts</h3>
+        <table border="1" cellpadding="5" cellspacing="0">
+            <tr><th>Key</th><th>Class</th></tr>
+            <tr><td><b>E</b></td><td>excellent</td></tr>
+            <tr><td><b>G</b></td><td>good</td></tr>
+            <tr><td><b>P</b></td><td>poor</td></tr>
+            <tr><td><b>U</b></td><td>unsorted</td></tr>
+            <tr><td><b>M</b></td><td>mua</td></tr>
+            <tr><td><b>N</b></td><td>noise</td></tr>
+        </table>
+        <p>Reclassify the focused unit and advance to the next one.
+        Requires focus mode to be on. Shortcuts work whether the Phy
+        Units panel or the trace view has focus.</p>
         """
+        
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Keyboard Shortcuts")
         msg_box.setTextFormat(Qt.TextFormat.RichText)
@@ -1260,7 +1330,7 @@ class MainWindow(QMainWindow):
         """Build the trace view and add control panels as docks."""
         self.trace_view = TraceViewWidget(self.engine)
         self.trace_view.spikeNavigationRequested.connect(self._jump_to_adjacent_spike)
-
+        self.trace_view.reclassifyShortcutRequested.connect(self._on_reclassify_shortcut_from_trace_view)
         self.setCentralWidget(self.trace_view)
 
         controls_dock = QDockWidget("Trace Controls", self)
