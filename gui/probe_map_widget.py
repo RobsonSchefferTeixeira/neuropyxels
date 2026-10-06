@@ -16,6 +16,28 @@ Design goals (replacing the matplotlib-based ProbeSelector):
   - Dark theme, circular markers, shank coloring, subtle depth grid,
     consistent with Phy2/KS4 conventions.
 
+Channel states
+--------------
+Each electrode is in exactly one of three states, tracked per-index in
+self.state:
+
+    0 = active    (default, clickable to select)
+    1 = selected  (currently being displayed in the trace view)
+    2 = rejected  (explicitly rejected by the user; NOT clickable, and
+                   hidden from every downstream consumer: trace view
+                   drops it, Phy panel hides its units, focus
+                   neighborhoods skip it)
+
+Rejection is driven by a text field in the Probe Map dock, Kilosort-
+style: the user types a list like "[19, 66]" and those channels become
+rejected; removing them from the list un-rejects them. There is no
+per-electrode click gesture for rejection, because the list is the
+single authoritative input.
+
+State 2 used to be a softer "excluded" concept that nothing in the app
+ever invoked; it has been repurposed as the rejection state since no
+callers relied on the old meaning.
+
 This module has NO dependency on matplotlib and no dependency on the
 rest of data_explorer other than the plain dict produced by
 neuropixels_probe_extractor.extract_probes_from_settings(...)[
@@ -29,6 +51,7 @@ Usage
     app = QApplication([])
     widget = ProbeMapWidget(probe_data)
     widget.channelsSelected.connect(lambda chans: print("selected:", chans))
+    widget.channelsRejectedChanged.connect(lambda chans: print("rejected:", chans))
     widget.show()
     app.exec()
 """
@@ -56,7 +79,7 @@ LABEL_COLOR = (255, 255, 255, 255)
 
 COLOR_ACTIVE = QColor("#3a86ff")          # default / unselected channel
 COLOR_SELECTED = QColor("#42d77d")        # selected for viewing
-COLOR_EXCLUDED = QColor("#5a5a5a")        # excluded / rejected
+COLOR_REJECTED = QColor("#2e2e2e")        # explicitly rejected; dim, inert
 COLOR_HOVER_RING = QColor("#ffd23f")      # hover halo
 
 SHANK_PALETTE = [
@@ -83,9 +106,13 @@ class ProbeMapWidget(QWidget):
     -----
     channelsSelected(list[int])
         Whenever the selection set changes, sorted by depth ascending.
+        Never includes rejected channels.
+    channelsRejectedChanged(list[int])
+        Whenever the rejected set changes.
     """
 
     channelsSelected = pyqtSignal(list)
+    channelsRejectedChanged = pyqtSignal(list)
 
     def __init__(self, probe_data: dict, parent=None):
         super().__init__(parent)
@@ -104,7 +131,7 @@ class ProbeMapWidget(QWidget):
 
         n = len(self.channels)
         # Per-channel state, tracked as arrays (not per-artist attributes)
-        self.state = np.zeros(n, dtype=np.uint8)  # 0=active 1=selected 2=excluded
+        self.state = np.zeros(n, dtype=np.uint8)  # 0=active 1=selected 2=rejected
         self._hover_idx: int | None = None
 
         # channel -> row index, for O(1) lookups
@@ -112,7 +139,7 @@ class ProbeMapWidget(QWidget):
 
         self._min_pitch_um = self._min_electrode_pitch_um()
         self.base_font_size = 9  # Default label size
-        
+
         self.setMinimumSize(400, 600)
 
         self._build_ui()
@@ -168,7 +195,7 @@ class ProbeMapWidget(QWidget):
         # ---- Size control bar ----
         size_bar = QHBoxLayout()
         size_bar.addWidget(QLabel("Point Size:"))
-        
+
         # Point size slider
         self.size_slider = QSlider(Qt.Orientation.Horizontal)
         self.size_slider.setMinimum(4)
@@ -179,8 +206,16 @@ class ProbeMapWidget(QWidget):
         self.size_slider.setFixedWidth(150)
         self.size_slider.valueChanged.connect(self._on_size_changed)
         size_bar.addWidget(self.size_slider)
-        
-        # In the size bar, add another slider for labels
+
+        # Size value display
+        self.size_label = QLabel("14")
+        self.size_label.setStyleSheet("color: #b0b0b0; font-size: 11px; min-width: 20px;")
+        size_bar.addWidget(self.size_label)
+        size_bar.addStretch(1)
+
+        layout.addLayout(size_bar)
+
+        # ---- Label size control bar ----
         label_size_bar = QHBoxLayout()
         label_size_bar.addWidget(QLabel("Label Size:"))
 
@@ -200,19 +235,6 @@ class ProbeMapWidget(QWidget):
         label_size_bar.addStretch(1)
 
         layout.addLayout(label_size_bar)
-
-
-            
-        # Size value display
-        self.size_label = QLabel("14")
-        self.size_label.setStyleSheet("color: #b0b0b0; font-size: 11px; min-width: 20px;")
-        size_bar.addWidget(self.size_label)
-        size_bar.addStretch(1)
-        
-        layout.addLayout(size_bar)
-
-        # ---- main plot area ----
-        # ... rest of the code
 
         # ---- main plot area ----
         self.plot_widget = pg.PlotWidget()
@@ -240,22 +262,17 @@ class ProbeMapWidget(QWidget):
 
         self._update_status()
 
-
     def _on_label_size_changed(self, value):
         """Update label base size when slider changes."""
         self.label_size_label.setText(str(value))
         self.base_font_size = value
         self._update_label_visibility()
-            
+
     def _on_size_changed(self, value):
         """Update marker size when slider changes."""
         self.size_label.setText(str(value))
         self.scatter.setSize(value)
-        # Remove this line - it doesn't exist:
-        # self.scatter.setHoverSize(value * 1.4)
-        # The hover size is set during scatter creation and can't be changed later
-        
-        
+
     def _draw_depth_grid(self):
         unique_y = np.unique(self.ycoords)
         # Thin out if there are a huge number of rows (e.g. dense NP2 probes)
@@ -289,7 +306,7 @@ class ProbeMapWidget(QWidget):
             brush=pg.mkBrush(COLOR_ACTIVE),
             hoverable=False,
         )
-        
+
         self.scatter.setZValue(10)
         self.plot_widget.addItem(self.scatter)
 
@@ -305,6 +322,7 @@ class ProbeMapWidget(QWidget):
         if hasattr(self, 'size_slider'):
             return float(self.size_slider.value())
         return 14.0  # Default fallback
+
     # ------------------------------------------------------------------
     # Color / state updates (batched — no per-artist mutation)
     # ------------------------------------------------------------------
@@ -315,16 +333,19 @@ class ProbeMapWidget(QWidget):
         pens = []
         for i in range(len(self.channels)):
             st = self.state[i]
-            if st == 1:
+            if st == 2:
+                # Rejected: dim, inert. Deliberately checked first so a
+                # rejected channel never gets shank-colored or hover-
+                # ringed.
+                color = COLOR_REJECTED
+            elif st == 1:
                 color = COLOR_SELECTED
-            elif st == 2:
-                color = COLOR_EXCLUDED
             elif has_multi_shank:
                 color = SHANK_PALETTE[int(self.shank_ids[i]) % len(SHANK_PALETTE)]
             else:
                 color = COLOR_ACTIVE
 
-            if i == self._hover_idx:
+            if i == self._hover_idx and st != 2:
                 pens.append(pg.mkPen(COLOR_HOVER_RING, width=2))
             else:
                 pens.append(pg.mkPen(None))
@@ -336,72 +357,60 @@ class ProbeMapWidget(QWidget):
 
     def _update_status(self):
         n_sel = int(np.sum(self.state == 1))
-        n_exc = int(np.sum(self.state == 2))
+        n_rej = int(np.sum(self.state == 2))
         total = len(self.channels)
         self.status_label.setText(
-            f"{n_sel} selected  \u00b7  {n_exc} excluded  \u00b7  {total} total"
+            f"{n_sel} selected  \u00b7  {n_rej} rejected  \u00b7  {total} total"
         )
 
     # ------------------------------------------------------------------
     # Interaction: click to select/deselect
     # ------------------------------------------------------------------
 
-
-    # ------------------------------------------------------------------
-    # Interaction: hover-tracks the electrode under the cursor via
-    # sigMouseMoved -> _on_mouse_moved -> pointsAt() (one hit-test per
-    # mouse-move event, cached in self._hover_idx); a click then just
-    # toggles whatever self._hover_idx currently is, rather than
-    # re-running pointsAt() a second time on click. This is why
-    # ScatterPlotItem's own sigClicked/sigHovered aren't used here.
-    # ------------------------------------------------------------------
-
     def _on_mouse_clicked(self, ev):
-        # Only handle left clicks
+        # Only handle left clicks.
         if ev.button() != Qt.MouseButton.LeftButton:
             return
 
-        # If we are currently hovering over a channel, select it
-        if self._hover_idx is not None:
-            idx = self._hover_idx
+        if self._hover_idx is None:
+            return
 
-            if self.state[idx] == 1:
-                self.state[idx] = 0
-            else:
-                self.state[idx] = 1
+        idx = self._hover_idx
 
-            self._update_colors()
-            self._emit_selection()
-
+        # Rejected channels are inert: no state change on left-click.
+        # Rejection is undone by removing the channel from the list in
+        # the Probe Map dock, not by clicking.
+        if self.state[idx] == 2:
             ev.accept()
-            
+            return
+
+        if self.state[idx] == 1:
+            self.state[idx] = 0
+        else:
+            self.state[idx] = 1
+
+        self._update_colors()
+        self._emit_selection()
+        ev.accept()
 
     def _on_scatter_hovered(self, plot_item, points, ev):
-        # Check if points is a numpy array and has elements
         if points is not None and hasattr(points, 'size') and points.size > 0:
             new_hover = points[0].index()
         else:
             new_hover = None
-        
+
         if new_hover != self._hover_idx:
             self._hover_idx = new_hover
             self._update_colors()
 
-
-
     def _on_mouse_moved(self, scene_pos):
         if not self.plot_widget.sceneBoundingRect().contains(scene_pos):
             return
-        
+
         points_at = self.scatter.pointsAt(
             self.view_box.mapSceneToView(scene_pos)
         )
-        
-        # Pass the points to hover handler
         self._on_scatter_hovered(self.scatter, points_at, None)
-
-        
-
 
     def _emit_selection(self):
         selected_channels = self.channels[self.state == 1]
@@ -409,61 +418,66 @@ class ProbeMapWidget(QWidget):
         selected_sorted = selected_channels[order].tolist()
         self.channelsSelected.emit(selected_sorted)
 
+    def _emit_rejected(self):
+        rejected = self.channels[self.state == 2].tolist()
+        self.channelsRejectedChanged.emit(rejected)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def set_selected_channels(self, channels: list[int]):
-        """Programmatically set the selection to exactly `channels`,
-        clearing any previous selection. Used by MainWindow's focus
-        mode to push a neighborhood selection into the probe map
-        without simulating user clicks.
 
-        Channels already in the excluded state (state == 2) are left
-        excluded, not selected -- excluded means "user explicitly
-        rejected this channel", and focus mode shouldn't silently
-        override that. Channels in `channels` that are not excluded
-        get state 1 (selected); everything else not in the list and
-        not excluded gets state 0 (active).
-        """
-        wanted = set(int(c) for c in channels)
+    def set_selected_channels(self, channel_list):
+        """Select exactly the given channels (replacing any current
+        selection). Rejected channels are left rejected and are never
+        added to the selection, even if present in `channel_list`."""
+        wanted = set(int(c) for c in channel_list)
         for ch, idx in self._chan_to_idx.items():
-            if self.state[idx] == 2:
-                # Excluded channels stay excluded; don't touch.
+            if self.state[idx] == 2:   # leave rejected channels alone
                 continue
             self.state[idx] = 1 if ch in wanted else 0
         self._update_colors()
         self._emit_selection()
-        
+
+    def set_rejected(self, channel_list):
+        """Set the rejected set to exactly `channel_list`. Channels
+        entering the rejected set are also removed from the selection,
+        so the two signals stay consistent."""
+        wanted = set(int(c) for c in channel_list)
+        selection_changed = False
+        rejected_changed = False
+
+        for ch, idx in self._chan_to_idx.items():
+            currently_rejected = (self.state[idx] == 2)
+            should_be_rejected = ch in wanted
+
+            if should_be_rejected and not currently_rejected:
+                # Entering rejection: also drop from selection if there.
+                self.state[idx] = 2
+                rejected_changed = True
+                selection_changed = True   # a selected channel may have been removed
+            elif not should_be_rejected and currently_rejected:
+                # Leaving rejection: back to plain active.
+                self.state[idx] = 0
+                rejected_changed = True
+            # else: unchanged.
+
+        self._update_colors()
+        if rejected_changed:
+            self._emit_rejected()
+        if selection_changed:
+            self._emit_selection()
+
+    def get_rejected_channels(self) -> list[int]:
+        return self.channels[self.state == 2].tolist()
+
     def select_all(self):
+        """Select every non-rejected channel."""
         self.state[self.state != 2] = 1
         self._update_colors()
         self._emit_selection()
 
     def clear_selection(self):
         self.state[self.state == 1] = 0
-        self._update_colors()
-        self._emit_selection()
-
-    def set_excluded(self, channel_list):
-        excluded = set(int(c) for c in channel_list)
-        for ch, idx in self._chan_to_idx.items():
-            self.state[idx] = 2 if ch in excluded else (
-                0 if self.state[idx] == 2 else self.state[idx]
-            )
-        self._update_colors()
-
-    def set_selected_channels(self, channel_list):
-        """Select exactly the given channels (replacing any current
-        selection), leaving excluded channels untouched. Used to seed
-        this widget with an externally-provided starting selection --
-        e.g. RippleTriggeredAverageDialog opens a scoped ProbeMapWidget
-        instance pre-populated with whatever channels were already
-        active in the main trace view."""
-        wanted = set(int(c) for c in channel_list)
-        for ch, idx in self._chan_to_idx.items():
-            if self.state[idx] == 2:  # leave excluded channels alone
-                continue
-            self.state[idx] = 1 if ch in wanted else 0
         self._update_colors()
         self._emit_selection()
 
@@ -482,45 +496,41 @@ class ProbeMapWidget(QWidget):
     def _update_label_visibility(self):
         (x0, x1), (y0, y1) = self.view_box.viewRange()
         view_height_um = max(y1 - y0, 1e-6)
-        
+
         # Use slider value for base font size
         base_font_size = self.base_font_size if hasattr(self, 'base_font_size') else 9
         reference_height = 500
         zoom_factor = max(0.5, min(3.0, reference_height / view_height_um))
-        
+
         # Get max from slider if available
         max_label_size = self.label_size_slider.maximum() if hasattr(self, 'label_size_slider') else 30
         font_size = max(4, min(max_label_size, base_font_size * zoom_factor))
 
-
         show_labels = self.labels_checkbox.isChecked()
-        
+
         if not show_labels:
             for item in self._label_items:
                 if item is not None:
                     item.setVisible(False)
             return
-        
+
         visible_mask = (
             (self.xcoords >= x0) & (self.xcoords <= x1)
             & (self.ycoords >= y0) & (self.ycoords <= y1)
         )
         visible_idx = np.where(visible_mask)[0]
-        
-        # Don't cap labels - show all visible ones (pyqtgraph handles performance)
-        # If performance is an issue, keep MAX_LABELS but increase it
+
         MAX_LABELS = 800  # Increased to show all 384 channels
         if len(visible_idx) > MAX_LABELS:
             visible_idx = visible_idx[:MAX_LABELS]
-        
+
         visible_set = set(visible_idx.tolist())
-        
+
         for i in range(len(self.channels)):
             want_visible = i in visible_set
             item = self._label_items[i]
-            
+
             if want_visible and item is None:
-                # Create new label
                 item = pg.TextItem(
                     text=str(int(self.channels[i])),
                     color=LABEL_COLOR,
@@ -534,23 +544,15 @@ class ProbeMapWidget(QWidget):
                 item.setZValue(20)
                 self.plot_widget.addItem(item)
                 self._label_items[i] = item
-                
+
             elif item is not None:
-                # Update visibility and font size
                 item.setVisible(want_visible)
                 if want_visible:
-                    # Update font size - need to create new QFont and set it
                     new_font = QFont()
                     new_font.setPointSizeF(font_size)
                     new_font.setBold(True)
                     item.setFont(new_font)
-                    
-                    # Make sure color is correct
                     item.setColor(QColor(255, 255, 255, 255))
-
-
-
-                    
 
     def _on_toggle_labels(self, _state):
         self._update_label_visibility()

@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QFileDialog, QMessageBox, QStatusBar, QDockWidget,
     QListWidget, QListWidgetItem, QPushButton, QColorDialog, QFrame,
-    QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox, QDialog,
+    QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox, QDialog, QLineEdit
 )
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QIcon, QPixmap
 from gui.probe_map_widget import ProbeMapWidget
@@ -404,6 +404,7 @@ class MainWindow(QMainWindow):
                 # loaded, which reads to the user as "the panel is empty."
                 self.phy_units_panel.quality_combo.setCurrentText("all")
                 self.phy_units_panel.show_only_selected_check.setChecked(False)
+                self.phy_units_panel.set_rejected_channels([])
                 self.phy_units_panel.raster_check.setChecked(True)
                 self.phy_units_panel.recolor_check.setChecked(False)
                 self.phy_units_panel.recolor_window_spin.setValue(1.0)
@@ -423,6 +424,15 @@ class MainWindow(QMainWindow):
         self._settings_path = None
         self._probes = {}
         self._current_probe_key = None
+
+        # Clear rejection state entirely. The text field is cleared
+        # here too so the dock reads as fresh.
+        self._rejected_channels = set()
+        if hasattr(self, "rejected_channels_edit"):
+            self.rejected_channels_edit.blockSignals(True)
+            self.rejected_channels_edit.clear()
+            self.rejected_channels_edit.blockSignals(False)
+
         # ---- 7. Reset the stream picker ----
         self.stream_picker.blockSignals(True)
         self.stream_picker.clear()
@@ -585,33 +595,28 @@ class MainWindow(QMainWindow):
         tv.update()
 
     def _reset_probe_map(self):
-        """Destroy the probe map completely and rebuild the dock's
-        placeholder from scratch.
-
-        Two subtleties:
-          - The previous placeholder widget was destroyed by Qt when the
-            probe map replaced it, so it cannot be reused. We build a
-            fresh one each reset.
-          - deleteLater() alone does not guarantee the old probe map is
-            gone before the dock shows the new widget, and if any other
-            reference exists the widget survives. setParent(None) forces
-            it out of the hierarchy before scheduling deletion.
-        """
+        """Destroy the probe map completely and rebuild the slot's
+        contents from scratch, leaving the container (stream picker +
+        reject field) untouched."""
         old_map = self.probe_map
         self.probe_map = None
 
-        # Build a fresh placeholder.
-        placeholder = QWidget()
-        vlayout = QVBoxLayout(placeholder)
-        label = QLabel(
-            "No probe loaded.\n\nUse File \u2192 Open settings.xml... to load one."
-        )
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #888; font-size: 12px;")
-        vlayout.addWidget(label)
+        # Replace the slot's contents with a fresh placeholder label.
+        # See _load_probe_map for why we use takeAt rather than itemAt,
+        # and why we don't stash the label on self.
+        while self._probe_map_slot_layout.count():
+            item = self._probe_map_slot_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
 
-        # Replace the dock's widget (this orphans the old probe map).
-        self.probe_map_dock.setWidget(placeholder)
+        placeholder = QLabel(
+            "No probe loaded.\n\nUse File \u2192 Open settings.xml to load one."
+        )
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("color: #888; font-size: 12px;")
+        self._probe_map_slot_layout.addWidget(placeholder, stretch=1)
 
         # Explicitly detach and destroy the old probe map.
         if old_map is not None:
@@ -620,12 +625,16 @@ class MainWindow(QMainWindow):
             except (TypeError, RuntimeError):
                 pass
             try:
+                old_map.channelsRejectedChanged.disconnect(self._on_channels_rejected)
+            except (TypeError, RuntimeError):
+                pass
+            try:
                 old_map.setParent(None)
-            except Exception:
+            except RuntimeError:
                 pass
             try:
                 old_map.deleteLater()
-            except Exception:
+            except RuntimeError:
                 pass
 
         self.selected_list.clear()
@@ -918,10 +927,14 @@ class MainWindow(QMainWindow):
 
         center_ch = int(unit.channel)
         n_levels = self.phy_units_panel.focus_neighborhood_size()
-        neighborhood = self.trace_view.compute_focus_neighborhood(
-            center_ch, n_levels
-        )
+        neighborhood = self.trace_view.compute_focus_neighborhood(center_ch, n_levels)
+        if self._rejected_channels:
+            neighborhood = [
+                ch for ch in neighborhood
+                if ch not in self._rejected_channels
+            ]
         if not neighborhood:
+
             self._update_status(
                 f"Focus mode: could not compute neighborhood for "
                 f"unit {unit_id} (CH{center_ch}) -- is the probe "
@@ -1019,6 +1032,11 @@ class MainWindow(QMainWindow):
         neighborhood = self.trace_view.compute_focus_neighborhood(
             center_ch, n_levels
         )
+        if self._rejected_channels:
+            neighborhood = [
+                ch for ch in neighborhood
+                if ch not in self._rejected_channels
+            ]
         if not neighborhood:
             self._update_status(
                 f"Focus mode: could not compute neighborhood for "
@@ -1373,6 +1391,7 @@ class MainWindow(QMainWindow):
         container_layout.setContentsMargins(4, 4, 4, 4)
         container_layout.setSpacing(4)
 
+        # ---- Probe stream picker ----
         stream_row = QHBoxLayout()
         stream_row.addWidget(QLabel("Probe stream:"))
         self.stream_picker = QComboBox()
@@ -1381,12 +1400,62 @@ class MainWindow(QMainWindow):
         stream_row.addWidget(self.stream_picker, stretch=1)
         container_layout.addLayout(stream_row)
 
+        # ---- Rejected channels (Kilosort-style list input) ----
+        # A single text field: the user types "[19, 66]" or "19 66" or
+        # "19,66" and those channels become rejected. Removing them from
+        # the field un-rejects them. The probe map is the display; this
+        # field is the source of truth.
+        #
+        # NOTE: this row lives in the container, NOT inside the probe
+        # map widget, so it survives when the map itself is swapped in
+        # (see _load_probe_map: it replaces the *contents* of the map
+        # slot, not the dock's widget).
+        reject_row = QHBoxLayout()
+        reject_row.addWidget(QLabel("Rejected:"))
+        self.rejected_channels_edit = QLineEdit()
+        self.rejected_channels_edit.setPlaceholderText("e.g. [19, 66]")
+        self.rejected_channels_edit.setToolTip(
+            "Comma- or space-separated list of channels to reject. "
+            "Rejected channels are greyed out on the map, cannot be "
+            "selected, and their units are hidden from the Phy panel. "
+            "Remove a channel from this list to un-reject it."
+        )
+        # Commit on Enter and on focus-out, but not on every keystroke,
+        # so a partially-typed list like "1" while typing "19" doesn't
+        # momentarily reject channel 1.
+        self.rejected_channels_edit.returnPressed.connect(
+            self._commit_rejected_channels
+        )
+        self.rejected_channels_edit.editingFinished.connect(
+            self._commit_rejected_channels
+        )
+        reject_row.addWidget(self.rejected_channels_edit, stretch=1)
+        container_layout.addLayout(reject_row)
+
+        if not hasattr(self, "_rejected_channels"):
+            self._rejected_channels: set[int] = set()
+
+        # ---- Probe map slot ----
+        # A persistent QWidget that lives in the layout and holds
+        # whatever the current "map" is: the placeholder label before a
+        # probe is loaded, or the ProbeMapWidget afterwards. Swapping
+        # what's inside the slot must never touch the dock's own widget,
+        # or the reject row above this line would disappear.
+        self._probe_map_slot = QWidget()
+        self._probe_map_slot_layout = QVBoxLayout(self._probe_map_slot)
+        self._probe_map_slot_layout.setContentsMargins(0, 0, 0, 0)
+        self._probe_map_slot_layout.setSpacing(0)
+
         self._probe_map_placeholder_label = QLabel(
             "No probe loaded.\n\nUse File \u2192 Open settings.xml to load one."
         )
         self._probe_map_placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._probe_map_placeholder_label.setStyleSheet("color: #888; font-size: 12px;")
-        container_layout.addWidget(self._probe_map_placeholder_label, stretch=1)
+        self._probe_map_slot_layout.addWidget(
+            self._probe_map_placeholder_label, stretch=1
+        )
+
+        container_layout.addWidget(self._probe_map_slot, stretch=1)
 
         self._probe_map_container = container
         self._probe_map_container_layout = container_layout
@@ -1511,21 +1580,54 @@ class MainWindow(QMainWindow):
         )
 
     def _load_probe_map(self, probe_data: dict):
-
-        # Tear down any previous probe map cleanly before building the new one.
+        # ---- Teardown of the previous map (if any) ----
+        # Detach and delete the old map. Null the attribute immediately
+        # after deleteLater so nothing else in this method (or a
+        # re-entrant call) can touch a dangling C++ object.
         if self.probe_map is not None:
             try:
                 self.probe_map.channelsSelected.disconnect(self._on_channels_selected)
             except (TypeError, RuntimeError):
                 pass
-            self.probe_map.deleteLater()
+            try:
+                self.probe_map.channelsRejectedChanged.disconnect(self._on_channels_rejected)
+            except (TypeError, RuntimeError):
+                pass
+            old_map = self.probe_map
             self.probe_map = None
+            try:
+                old_map.setParent(None)
+            except RuntimeError:
+                pass
+            old_map.deleteLater()
 
+        # ---- Clear the slot ----
+        # The slot holds exactly one child: either the placeholder label
+        # (before any probe is loaded) or the current probe map. Wipe
+        # whatever's there. Do NOT keep a reference to the placeholder
+        # across calls -- a deleted QLabel's Python wrapper is a trap.
+        while self._probe_map_slot_layout.count():
+            item = self._probe_map_slot_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        # ---- Build the new map, inside the slot ----
         self.probe_map = ProbeMapWidget(probe_data)
-
         self.probe_map.channelsSelected.connect(self._on_channels_selected)
-        self.probe_map_dock.setWidget(self.probe_map)
+        self.probe_map.channelsRejectedChanged.connect(
+            self._on_channels_rejected
+        )
+        self._probe_map_slot_layout.addWidget(self.probe_map, stretch=1)
+
         self.probe_map_dock.setVisible(True)
+
+        # Push the current rejection set into the new widget. The setter
+        # emits channelsRejectedChanged if anything changed, which flows
+        # into _on_channels_rejected and keeps MainWindow's cache in
+        # sync without a second source of truth.
+        self.probe_map.set_rejected(sorted(self._rejected_channels))
 
         self.selected_list.clear()
         self._update_analysis_actions_enabled()
@@ -1854,6 +1956,203 @@ class MainWindow(QMainWindow):
                 self.trace_view.set_spectrogram_channel(channels[0])
 
 
+    # ------------------------------------------------------------------
+    # Rejected channels
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_rejected_channels(text: str) -> list[int]:
+        """Parse a Kilosort-style channel list. Accepts any mix of
+        commas, whitespace, and surrounding brackets:
+
+            "19, 66"
+            "[19, 66]"
+            "19 66"
+            "19,66"
+            ""
+
+        Anything that isn't a non-negative integer is silently
+        ignored, so partial edits mid-typing don't spam errors. The
+        field is a convenience, not a validation surface.
+        """
+        cleaned = text.replace("[", " ").replace("]", " ")
+        cleaned = cleaned.replace(",", " ")
+        result = []
+        for token in cleaned.split():
+            try:
+                value = int(token)
+            except ValueError:
+                continue
+            if value >= 0:
+                result.append(value)
+        # Preserve order, drop duplicates.
+        seen = set()
+        unique = []
+        for v in result:
+            if v not in seen:
+                seen.add(v)
+                unique.append(v)
+        return unique
+
+    def _commit_rejected_channels(self):
+        """Called when the user presses Enter or leaves the field.
+        Parses the field and pushes the resulting set into the probe
+        map (which re-emits channelsRejectedChanged), so there's one
+        path by which rejection propagates through the app."""
+        if self.probe_map is None:
+            return
+
+        new_set = set(self._parse_rejected_channels(
+            self.rejected_channels_edit.text()
+        ))
+
+        # If nothing changed, do nothing (avoids a redundant ripple
+        # when the user tabs through the field without editing).
+        if new_set == self._rejected_channels:
+            return
+
+        self.probe_map.set_rejected(sorted(new_set))
+
+    def _on_channels_rejected(self, rejected: list):
+        """Probe map re-emitted its rejected set. Update our cached
+        copy, propagate to the trace view + Phy panel, and if the
+        currently-focused unit's channel was just rejected, advance
+        focus to the nearest remaining channel on the same shank."""
+        new_rejected = set(int(c) for c in rejected)
+        previously_rejected = set(self._rejected_channels)
+        newly_rejected = new_rejected - previously_rejected
+        self._rejected_channels = new_rejected
+
+        # Sync the text field if the change came from somewhere other
+        # than this field (e.g. reset, or programmatic setup), without
+        # re-triggering the commit handler.
+        formatted = "[" + ", ".join(str(c) for c in sorted(new_rejected)) + "]" if new_rejected else ""
+        if self.rejected_channels_edit.text() != formatted:
+            self.rejected_channels_edit.blockSignals(True)
+            self.rejected_channels_edit.setText(formatted)
+            self.rejected_channels_edit.blockSignals(False)
+
+        # ---- Trace view: drop rejected channels from the display ----
+        if self.trace_view is not None:
+            current = list(self.trace_view.channels)
+            filtered = [ch for ch in current if ch not in new_rejected]
+            if filtered != current:
+                self.trace_view.set_channels(filtered)
+
+        # ---- Phy panel: hide units whose channel was rejected ----
+        if self.phy_units_panel is not None:
+            self.phy_units_panel.set_rejected_channels(sorted(new_rejected))
+
+        # ---- Advance focus if the focused unit's channel was rejected ----
+        if newly_rejected and self.phy_units_panel is not None:
+            focused = self.phy_units_panel.focused_unit_id()
+            if focused >= 0:
+                phy_data = getattr(self.engine, "phy_data", None)
+                unit = phy_data.units.get(focused) if phy_data else None
+                if unit is not None and unit.channel in newly_rejected:
+                    self._advance_focus_off_rejected_channel(
+                        int(unit.channel), new_rejected
+                    )
+
+        self._update_status(
+            f"{len(new_rejected)} channel(s) rejected."
+            if new_rejected else "No channels rejected."
+        )
+
+    def _advance_focus_off_rejected_channel(
+        self, rejected_channel: int, rejected_set: set[int]
+    ):
+        """Move focus to the unit whose channel is the nearest
+        non-rejected channel on the same shank as `rejected_channel`.
+        If nothing suitable remains, clear focus."""
+        if self.phy_units_panel is None or self.engine.phy_data is None:
+            return
+
+        nearest = self._find_nearest_non_rejected_channel(
+            rejected_channel, rejected_set
+        )
+        if nearest is None:
+            self.phy_units_panel.clear_selection()
+            if self.trace_view is not None:
+                self.trace_view.set_raster_units([])
+                self.trace_view.set_channels([])
+            if self.probe_map is not None:
+                self.probe_map.set_selected_channels([])
+            self._update_status(
+                f"CH{rejected_channel} rejected; no other channel on its "
+                f"shank is available, so focus was cleared."
+            )
+            return
+
+        # Prefer a good/excellent unit on that channel; otherwise the
+        # first unit (by cluster id) that lives on it.
+        candidates = [
+            u for u in self.engine.phy_data.units.values()
+            if u.channel == nearest
+        ]
+        if not candidates:
+            self.phy_units_panel.clear_selection()
+            return
+        candidates.sort(
+            key=lambda u: (
+                0 if (u.quality or "").lower() in ("good", "excellent") else 1,
+                u.cluster_id,
+            )
+        )
+        target_unit = candidates[0]
+
+        self.phy_units_panel.focus_unit_by_id(int(target_unit.cluster_id))
+        self._update_status(
+            f"CH{rejected_channel} rejected; focus advanced to unit "
+            f"{target_unit.cluster_id} on CH{nearest}."
+        )
+
+    def _find_nearest_non_rejected_channel(
+        self, from_channel: int, rejected: set[int]
+    ) -> int | None:
+        """Return the channel on the same shank whose depth is closest
+        to `from_channel`'s, excluding anything in `rejected` (and
+        `from_channel` itself). Tie-break: shallower (larger y) wins,
+        on the theory that the trace view shrinks from the bottom when
+        a channel is removed, so re-centering upward feels less
+        jarring. Returns None if no other channel is available.
+        """
+        if not self._current_probe_key or not self._probes:
+            return None
+
+        probe_data = self._probes["probes"][self._current_probe_key]
+        coords = probe_data["coordinates"]
+        channels = list(coords["channels"])
+        ys = list(coords["y"])
+        shank_ids = list(
+            probe_data.get("shanks", {}).get("ids") or [0] * len(channels)
+        )
+
+        if from_channel not in channels:
+            return None
+        idx = channels.index(from_channel)
+        src_y = float(ys[idx])
+        src_shank = int(shank_ids[idx])
+
+        best_ch = None
+        best_key = None   # (dy, -y): smaller is better; -y so larger y wins ties
+        for i, ch in enumerate(channels):
+            ch = int(ch)
+            if ch == from_channel or ch in rejected:
+                continue
+            if int(shank_ids[i]) != src_shank:
+                continue
+            dy = abs(float(ys[i]) - src_y)
+            if dy == 0:
+                # Two electrodes at the exact same depth on the same
+                # shank; skip so the "nearest different" channel wins.
+                continue
+            key = (dy, -float(ys[i]))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_ch = ch
+
+        return best_ch
 
     def get_selected_channels(self) -> list[int]:
         """Public accessor for whatever consumes the selection next."""

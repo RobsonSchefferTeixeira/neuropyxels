@@ -210,7 +210,7 @@ class PhyUnitsPanel(QWidget):
         super().__init__(parent)
         self.phy_data: PhyData | None = None
         self._rows: list[Unit] = []
-
+        self._rejected_channels: set[int] = set()
         # The panel itself accepts focus so the shortcut fallback below
         # fires when the user has clicked a non-table area of the panel
         # (e.g. the summary label). Without this, focus stays on
@@ -555,6 +555,33 @@ class PhyUnitsPanel(QWidget):
     def clear_selection(self):
         self._clear_selection()
 
+    def set_rejected_channels(self, channels: list[int]):
+        """Update the set of rejected channels. Units whose channel is
+        rejected are hidden from the table entirely. If the currently
+        focused unit's channel is rejected, MainWindow will follow up
+        with an explicit focus advance -- this method does not touch
+        focus itself; it just enforces the display filter."""
+        self._rejected_channels = set(int(c) for c in channels)
+        self._populate_table()
+
+    def focus_unit_by_id(self, cluster_id: int):
+        """Select the row for `cluster_id` (if visible) and fire the
+        same signals a manual click would. Used by MainWindow to move
+        focus after a channel rejection."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            if item.data(Qt.ItemDataRole.UserRole) == int(cluster_id):
+                self.table.blockSignals(True)
+                self.table.clearSelection()
+                self.table.selectRow(row)
+                self.table.blockSignals(False)
+                self.selectionChanged.emit(self.selected_cluster_ids())
+                if self.focus_check.isChecked():
+                    self.focusedUnitChanged.emit(int(cluster_id))
+                self.table.setFocus()
+                return
     # ------------------------------------------------------------------
     # Shortcut handling
     # ------------------------------------------------------------------
@@ -628,6 +655,10 @@ class PhyUnitsPanel(QWidget):
         prev_selected = set(self.selected_cluster_ids())
 
         def matches(u: Unit) -> bool:
+            # Units on a rejected channel are hidden outright. Checked
+            # first so they don't sneak into any other filter's result.
+            if u.channel is not None and u.channel in self._rejected_channels:
+                return False
             if only_selected and u.cluster_id not in prev_selected:
                 return False
             if class_filter != "all":
