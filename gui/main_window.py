@@ -398,7 +398,11 @@ class MainWindow(QMainWindow):
                 self.phy_units_panel.set_focus_mode(False)
                 self.phy_units_panel.clear_selection()
                 self.phy_units_panel.search_edit.clear()
-                self.phy_units_panel.quality_combo.setCurrentIndex(0)
+                # Filter back to "all" -- setCurrentIndex(0) would select
+                # KNOWN_CLASSES[0] ("excellent"), hiding every unit whose
+                # Phy label isn't "excellent" the next time a folder is
+                # loaded, which reads to the user as "the panel is empty."
+                self.phy_units_panel.quality_combo.setCurrentText("all")
                 self.phy_units_panel.show_only_selected_check.setChecked(False)
                 self.phy_units_panel.raster_check.setChecked(True)
                 self.phy_units_panel.recolor_check.setChecked(False)

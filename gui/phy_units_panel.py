@@ -112,42 +112,80 @@ class _ReclassifyTable(QTableWidget):
     the results as signals rather than reaching up to the parent, so
     PhyUnitsPanel just wires them to its own public signals.
 
-    Why a subclass rather than an event filter: key events reach the
-    focused widget (the table) first, and QAbstractItemView's default
-    keyPressEvent runs a keyboard-search for printable characters --
-    typing G would jump to the first cell whose text starts with "G".
-    Overriding keyPressEvent here is the only way to consume the
-    printable-letter presses cleanly before that runs.
+    Two QAbstractItemView behaviors make the override necessary:
+
+      * keyPressEvent runs a type-to-search on any printable character,
+        moving the current index to the first cell whose text starts
+        with that letter. Without an override, pressing G would jump
+        the selection instead of reclassifying.
+
+      * keyPressEvent also handles PageUp/PageDown as "move the current
+        cell one page up/down". Without an override, holding PageDown
+        would walk the selection down the table rather than advancing
+        through the focused unit's spikes once per press.
+
+    keyboardSearch is additionally stubbed to a no-op as a second line
+    of defense: even if some input-method path or Qt version delivers a
+    printable key to the view outside the normal keyPressEvent flow,
+    nothing should be searching by letter here.
+
+    Auto-repeat is swallowed for our keys: holding a letter or PageUp/
+    PageDown must not fire the shortcut more than once per physical
+    press. Crucially, the repeat event is consumed rather than passed
+    to super(), because passing it would re-trigger the very behaviors
+    this class exists to prevent.
     """
 
     reclassifyShortcutActivated = pyqtSignal(str)   # new class name
     prevSpikeRequested = pyqtSignal()
     nextSpikeRequested = pyqtSignal()
 
+    def keyboardSearch(self, search: str):
+        """Disable QAbstractItemView's type-to-search. Bare letters are
+        reclassify shortcuts, not search terms."""
+        pass
+
     def keyPressEvent(self, event):
-        if event.isAutoRepeat():
+        key = event.key()
+
+        # Decide first whether this is one of our keys, so the
+        # auto-repeat path can swallow repeats without falling through
+        # to QAbstractItemView's default cell-navigation.
+        is_ours = False
+        class_name: str | None = None
+        if _is_bare_key(event):
+            if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                is_ours = True
+            else:
+                class_name = _RECLASSIFY_SHORTCUTS.get(key)
+                if class_name is not None:
+                    is_ours = True
+
+        if not is_ours:
             super().keyPressEvent(event)
             return
 
-        if _is_bare_key(event):
-            key = event.key()
+        if event.isAutoRepeat():
+            # Swallow: don't fire again, and don't pass to super() --
+            # passing would let QAbstractItemView move the current cell
+            # on PageUp/PageDown repeats or run a keyboard search on
+            # letter repeats.
+            event.accept()
+            return
 
-            if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
-                if key == Qt.Key.Key_PageUp:
-                    self.prevSpikeRequested.emit()
-                else:
-                    self.nextSpikeRequested.emit()
-                event.accept()
-                return
+        if key == Qt.Key.Key_PageUp:
+            self.prevSpikeRequested.emit()
+            event.accept()
+            return
+        if key == Qt.Key.Key_PageDown:
+            self.nextSpikeRequested.emit()
+            event.accept()
+            return
 
-            class_name = _RECLASSIFY_SHORTCUTS.get(key)
-            if class_name is not None:
-                self.reclassifyShortcutActivated.emit(class_name)
-                event.accept()
-                return
-
-        super().keyPressEvent(event)
-
+        # class_name is non-None here (checked above).
+        print(f"[shortcut] key={key} class={class_name!r}")
+        self.reclassifyShortcutActivated.emit(class_name)
+        event.accept()
 
 class PhyUnitsPanel(QWidget):
     """Table of Phy units with search, quality filter, multi-select,
@@ -404,6 +442,15 @@ class PhyUnitsPanel(QWidget):
                 f"Loaded from: {src}"
             )
 
+        # Give the table keyboard focus so the very first shortcut
+        # press lands here rather than being delivered to whatever had
+        # focus before (typically the trace view). Without this, the
+        # first keystroke after loading a folder goes somewhere else
+        # and the user has to click a row before shortcuts work.
+        if phy_data is not None and self.table.rowCount() > 0:
+            self.table.setFocus()
+
+
     def selected_cluster_ids(self) -> list[int]:
         ids = []
         for row in range(self.table.rowCount()):
@@ -478,6 +525,7 @@ class PhyUnitsPanel(QWidget):
 
         self.table.selectRow(current_row + 1)
         self.selectionChanged.emit(self.selected_cluster_ids())
+        self.table.setFocus()
         return True
 
     def set_recolor_enabled(self, enabled: bool):
@@ -521,33 +569,47 @@ class PhyUnitsPanel(QWidget):
 
     def keyPressEvent(self, event):
         """Fallback for when the panel itself (not the table) has
-        focus. Same behavior as the table subclass -- see _ReclassifyTable.
-        """
-        if event.isAutoRepeat():
+        focus. Same behavior as _ReclassifyTable.keyPressEvent, with the
+        same auto-repeat handling: repeats of our keys are swallowed,
+        not passed to super(), so nothing downstream interprets them as
+        cell navigation or keyboard search."""
+        key = event.key()
+
+        is_ours = False
+        class_name: str | None = None
+        if _is_bare_key(event):
+            if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                is_ours = True
+            else:
+                class_name = _RECLASSIFY_SHORTCUTS.get(key)
+                if class_name is not None:
+                    is_ours = True
+
+        if not is_ours:
             super().keyPressEvent(event)
             return
 
-        if _is_bare_key(event):
-            key = event.key()
+        if event.isAutoRepeat():
+            event.accept()
+            return
 
-            if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
-                if key == Qt.Key.Key_PageUp:
-                    self.prevSpikeRequested.emit()
-                else:
-                    self.nextSpikeRequested.emit()
-                event.accept()
-                return
+        if key == Qt.Key.Key_PageUp:
+            self.prevSpikeRequested.emit()
+            event.accept()
+            return
+        if key == Qt.Key.Key_PageDown:
+            self.nextSpikeRequested.emit()
+            event.accept()
+            return
 
-            class_name = _RECLASSIFY_SHORTCUTS.get(key)
-            if class_name is not None:
-                selected = self.selected_cluster_ids()
-                if len(selected) == 1:
-                    self.reclassifyAndAdvanceRequested.emit(selected, class_name)
-                    event.accept()
-                    return
-
-        super().keyPressEvent(event)
-
+        selected = self.selected_cluster_ids()
+        if len(selected) == 1:
+            self.reclassifyAndAdvanceRequested.emit(selected, class_name)
+            event.accept()
+            return
+        # Not exactly one unit selected -- accept and do nothing so the
+        # event doesn't fall through to something less appropriate.
+        event.accept()
     # ------------------------------------------------------------------
     # Filtering / population
     # ------------------------------------------------------------------
@@ -753,9 +815,9 @@ class PhyUnitsPanel(QWidget):
 
     def _on_focus_toggled(self, checked: bool):
         if checked:
-            self.table.setSelectionMode(
-                QAbstractItemView.SelectionMode.SingleSelection
-            )
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setFocus() 
+
             selected = self.selected_cluster_ids()
             if len(selected) > 1:
                 self.table.blockSignals(True)
@@ -773,9 +835,7 @@ class PhyUnitsPanel(QWidget):
             elif len(selected) == 1:
                 self.selectionChanged.emit(selected)
         else:
-            self.table.setSelectionMode(
-                QAbstractItemView.SelectionMode.ExtendedSelection
-            )
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.focusModeChanged.emit(bool(checked))
         if checked:
             selected = self.selected_cluster_ids()
