@@ -64,25 +64,35 @@ class ChannelOptionsPanel(QWidget):
     closed = pyqtSignal()
 
     def __init__(self, channel: int, options: ChannelOptions, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool) 
+        super().__init__(parent, Qt.WindowType.Tool)
         self.channel = int(channel)
         self.setWindowTitle(f"CH{self.channel}")
         self.setMinimumWidth(260)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
-        self._options = ChannelOptions(
-            show_raw=options.show_raw,
-            show_filtered=options.show_filtered,
-            filter_low=options.filter_low,
-            filter_high=options.filter_high,
-            show_csd=options.show_csd,
-            csd_low=options.csd_low,
-            csd_high=options.csd_high,
-            csd_distance=options.csd_distance,
-        )
+        # Copy EVERY field. A hand-enumerated copy silently dropped the
+        # gain fields, which then defaulted to 1.0 on every reopen.
+        # dataclasses.replace() also means future fields added to
+        # ChannelOptions are carried through automatically.
+        import dataclasses
+        self._options = dataclasses.replace(options)
 
         self._build_ui()
+
+        # Load the saved values into the widgets FIRST. Any paired-range
+        # priming must run AFTER this, because the range handlers end by
+        # calling _on_any_changed(), which reads every widget back into
+        # self._options -- running them before _sync_from_options would
+        # clobber the saved state with the widgets' fresh-construction
+        # defaults (which is exactly the "reopening looks like a fresh
+        # opening" bug).
         self._sync_from_options()
+
+        # Now safe to prime the paired-range handlers: widgets hold the
+        # saved values, so _on_any_changed() inside them is a no-op on
+        # every field that wasn't touched.
+        self._on_filter_low_edited(self.filter_low_spin.value())
+        self._on_csd_low_edited(self.csd_low_spin.value())
 
     # ------------------------------------------------------------------
     # UI
@@ -162,15 +172,22 @@ class ChannelOptionsPanel(QWidget):
         self.csd_low_spin.setRange(0.0, 15000.0)
         self.csd_low_spin.setSingleStep(1.0)
         self.csd_low_spin.setToolTip("0 = compute CSD directly from raw")
+
+
         self.csd_low_spin.valueChanged.connect(self._on_any_changed)
+        self.csd_low_spin.valueChanged.connect(self._on_csd_low_edited)
         csd_layout.addWidget(self.csd_low_spin, 1, 1)
         csd_layout.addWidget(QLabel("Band high (Hz):"), 2, 0)
         self.csd_high_spin = QDoubleSpinBox()
         self.csd_high_spin.setRange(0.0, 15000.0)
         self.csd_high_spin.setSingleStep(1.0)
         self.csd_high_spin.setToolTip("0 = compute CSD directly from raw")
+        self.csd_high_spin.valueChanged.connect(self._on_csd_high_edited)
         self.csd_high_spin.valueChanged.connect(self._on_any_changed)
         csd_layout.addWidget(self.csd_high_spin, 2, 1)
+
+
+
         csd_layout.addWidget(QLabel("Distance (µm):"), 3, 0)
         self.csd_distance_spin = QDoubleSpinBox()
         self.csd_distance_spin.setRange(1.0, 500.0)
@@ -200,14 +217,14 @@ class ChannelOptionsPanel(QWidget):
         layout.addWidget(csd_group)
 
         # 1. Paired-range priming: low/high spinboxes start consistent.
-        self._on_filter_low_edited(self.filter_low_spin.value())
-        if hasattr(self, "csd_low_spin"):
-            self._on_csd_low_edited(self.csd_low_spin.value())
+        #self._on_filter_low_edited(self.filter_low_spin.value())
+        #if hasattr(self, "csd_low_spin"):
+        #    self._on_csd_low_edited(self.csd_low_spin.value())
 
         # 2. Enabled-state sync: greys out sub-controls whose parent
         # checkbox is off (Filtered unchecked → its spinboxes disabled,
         # etc.).
-        self._update_enabled_states()
+        #self._update_enabled_states()
 
 
 
@@ -242,7 +259,46 @@ class ChannelOptionsPanel(QWidget):
         self.filter_low_spin.blockSignals(False)
         self._on_any_changed()
 
+    def _on_csd_low_edited(self, value: float):
+        """CSD band low. 0 is a valid sentinel meaning 'no low cutoff';
+        the low < high ordering is only enforced when both sides are
+        nonzero. Ranges are never mutated here -- only values are
+        adjusted when they'd violate the ordering -- so both spinboxes
+        stay able to reach 0 at any time, which is essential since 0
+        disables the band (see
+        PhaseAmplitudeAnalyzer.compute_csd_with_options)."""
+        step = self.csd_low_spin.singleStep()
+        high_value = self.csd_high_spin.value()
 
+        if value > 0 and high_value > 0 and value >= high_value:
+            new_value = max(0.0, high_value - step)
+            self.csd_low_spin.blockSignals(True)
+            self.csd_low_spin.setValue(new_value)
+            self.csd_low_spin.blockSignals(False)
+
+        self._on_any_changed()
+
+    def _on_csd_high_edited(self, value: float):
+        """CSD band high. Mirror of _on_csd_low_edited."""
+        step = self.csd_high_spin.singleStep()
+        low_value = self.csd_low_spin.value()
+
+        if value > 0 and low_value > 0 and value <= low_value:
+            new_value = low_value + step
+            high_max = self.csd_high_spin.maximum()
+            if new_value > high_max:
+                # Can't push high above low's current value -- pull low
+                # down instead. This never forces low to a nonzero value.
+                new_value = high_max
+                new_low = max(0.0, new_value - step)
+                self.csd_low_spin.blockSignals(True)
+                self.csd_low_spin.setValue(new_low)
+                self.csd_low_spin.blockSignals(False)
+            self.csd_high_spin.blockSignals(True)
+            self.csd_high_spin.setValue(new_value)
+            self.csd_high_spin.blockSignals(False)
+
+        self._on_any_changed()
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
@@ -370,12 +426,20 @@ class ChannelOptionsPanel(QWidget):
 
     def hideEvent(self, event):
         """Remove the filter when hidden so we don't leak it across
-        open/close cycles."""
+        open/close cycles, and commit the panel's current state back to
+        whoever owns it -- so nothing is lost if any individual edit
+        path failed to emit optionsChanged (e.g. a value set
+        programmatically during construction, or a future widget added
+        without wiring up its signal)."""
         super().hideEvent(event)
         from PyQt6.QtWidgets import QApplication
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+        # Re-read every widget into _options, then emit. This is the
+        # same work _on_any_changed does; calling it here is cheap and
+        # makes close a guaranteed save point.
+        self._on_any_changed()
         self.closed.emit()
 
     def eventFilter(self, obj, event):
