@@ -1,0 +1,13 @@
+# Core numerics
+numpy>=1.24
+scipy>=1.10
+
+# Qt GUI
+PyQt6>=6.5
+pyqtgraph>=0.13
+
+# Plotting / colormaps (used for spectrogram and PSD colormaps)
+matplotlib>=3.7
+
+# Parallel wavelet transform
+joblib>=1.2
