@@ -55,6 +55,10 @@ import numpy as np
 # more likely to be a user mistake than an exotic valid case.
 SUPPORTED_DTYPES = ("int16", "int32", "float32")
 
+# Fields a Kilosort chanMap JSON is expected to contain. Used by
+# _is_kilosort_chanmap to distinguish it from a native ProbeDefinition
+# JSON without relying on the filename.
+_KILOSORT_CHANMAP_KEYS = ("chanMap", "xc", "yc", "kcoords")
 
 @dataclass
 class ProbeDefinition:
@@ -238,10 +242,26 @@ class ProbeDefinition:
 
     @classmethod
     def load_json(cls, path: str | Path) -> "ProbeDefinition":
+        """Load a probe description from JSON.
+
+        Two formats are accepted transparently:
+
+          - Native ProbeDefinition JSON (written by save_json).
+          - Kilosort chanMap JSON (chanMap / xc / yc / kcoords),
+            which is auto-detected and translated. Name defaults to
+            the filename stem; sample_rate, dtype, and bit_volts
+            default to Neuropixels-standard values the user can edit
+            in the dialog before accepting.
+        """
         path = Path(path)
         with open(path, "r") as f:
             data = json.load(f)
 
+        # ---- Kilosort chanMap? ----
+        if cls._is_kilosort_chanmap(data):
+            return cls._from_kilosort_chanmap(data, name=path.stem)
+
+        # ---- Native ProbeDefinition ----
         coords = data.get("coordinates", {})
         shanks = data.get("shanks", {})
 
@@ -258,7 +278,45 @@ class ProbeDefinition:
             y=[float(v) for v in coords.get("y", [])],
             shank_ids=[int(s) for s in shanks.get("ids", [])],
         )
+    
+    @classmethod
+    def load_json_with_source(
+        cls, path: str | Path
+    ) -> tuple["ProbeDefinition", str]:
+        """Same as load_json, but also returns which schema the file
+        used: 'definition' (native ProbeDefinition JSON) or
+        'kilosort_chanmap' (Kilosort chanMap JSON, translated).
 
+        Callers that want to add extra friction when a value had to be
+        defaulted rather than read -- e.g. forcing the user to confirm
+        the sample rate for a chanMap, which doesn't carry one -- use
+        this variant. Callers that just want the definition call
+        load_json instead.
+        """
+        path = Path(path)
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        if cls._is_kilosort_chanmap(data):
+            return cls._from_kilosort_chanmap(data, name=path.stem), "kilosort_chanmap"
+
+        coords = data.get("coordinates", {})
+        shanks = data.get("shanks", {})
+
+        definition = cls(
+            name=str(data.get("name", "CustomProbe")),
+            n_channels=int(data.get("n_channels", 0)),
+            sample_rate=float(data.get("sample_rate", 30000.0)),
+            dtype=str(data.get("dtype", "int16")),
+            bit_volts=float(data.get("bit_volts", 1.0)),
+            probe_type=str(data.get("probe_type", "Custom")),
+            serial_number=str(data.get("serial_number", "")),
+            channels=[int(c) for c in coords.get("channels", [])],
+            x=[float(v) for v in coords.get("x", [])],
+            y=[float(v) for v in coords.get("y", [])],
+            shank_ids=[int(s) for s in shanks.get("ids", [])],
+        )
+        return definition, "definition"
     # ------------------------------------------------------------------
     # Open Ephys settings.xml I/O
     # ------------------------------------------------------------------
@@ -335,7 +393,136 @@ class ProbeDefinition:
             shank_ids=[int(s) for s in shanks.get("ids", [])],
         )
 
+    # ------------------------------------------------------------------
+    # Kilosort chanMap import
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_kilosort_chanmap(data: dict) -> bool:
+        """True if `data` (a parsed JSON dict) looks like a Kilosort
+        chanMap rather than a native ProbeDefinition.
+
+        Detection is by presence of all four required chanMap keys. A
+        native ProbeDefinition has none of them -- its arrays live
+        under `coordinates` and `shanks` with different key names -- so
+        the two formats never overlap and this check is unambiguous.
+        """
+        return all(k in data for k in _KILOSORT_CHANMAP_KEYS)
+
+    @classmethod
+    def _from_kilosort_chanmap(
+        cls, data: dict, name: str | None = None
+    ) -> "ProbeDefinition":
+        """Translate a Kilosort chanMap dict into a ProbeDefinition.
+
+        Kilosort chanMap layout (all arrays indexed by electrode, in
+        the order the dat file rows are stored):
+
+            chanMap : int[n]   hardware channel index per electrode
+            xc      : float[n] x-position in µm
+            yc      : float[n] y-position in µm
+            kcoords : int[n]   shank id per electrode
+            n_chan  : int      number of channels
+
+        Everything not present in the chanMap schema is filled with
+        Neuropixels-standard defaults the user can edit in the
+        ProbeDefinitionDialog before accepting:
+
+            sample_rate : 30000.0 Hz
+            dtype       : int16
+            bit_volts   : 1.0
+            probe_type  : "Kilosort chanMap"
+        """
+        chan_map = list(data["chanMap"])
+        xc = list(data["xc"])
+        yc = list(data["yc"])
+        kcoords = list(data["kcoords"])
+
+        n = len(chan_map)
+        if not (len(xc) == len(yc) == len(kcoords) == n):
+            raise ValueError(
+                f"Kilosort chanMap has mismatched array lengths: "
+                f"chanMap={len(chan_map)}, xc={len(xc)}, "
+                f"yc={len(yc)}, kcoords={len(kcoords)}"
+            )
+
+        declared_n = data.get("n_chan")
+        if declared_n is not None and int(declared_n) != n:
+            raise ValueError(
+                f"Kilosort chanMap declares n_chan={declared_n} but "
+                f"contains {n} entries in chanMap"
+            )
+
+        # Normalize shank ids: if the set of distinct values is exactly
+        # {1..N} (contiguous, starting at 1), shift down to 0-indexed.
+        # Arbitrary non-contiguous ids (e.g. 10, 20, 30 for interleaved
+        # probes) are left alone.
+        distinct = sorted(set(int(k) for k in kcoords))
+        if distinct and distinct[0] == 1 and distinct == list(
+            range(1, len(distinct) + 1)
+        ):
+            shank_ids = [int(k) - 1 for k in kcoords]
+        else:
+            shank_ids = [int(k) for k in kcoords]
+
+        if not name:
+            name = "KilosortProbe"
+
+        return cls(
+            name=str(name),
+            n_channels=int(n),
+            sample_rate=30000.0,
+            dtype="int16",
+            bit_volts=1.0,
+            probe_type="Kilosort chanMap",
+            serial_number="",
+            channels=[int(c) for c in chan_map],
+            x=[float(v) for v in xc],
+            y=[float(v) for v in yc],
+            shank_ids=shank_ids,
+        )
+
+    @classmethod
+    def load_json_with_source(
+        cls, path: str | Path
+    ) -> tuple["ProbeDefinition", str]:
+        """Same as load_json, but also returns which schema the file
+        used: 'definition' (native ProbeDefinition JSON) or
+        'kilosort_chanmap' (Kilosort chanMap JSON, translated).
+
+        Callers that want to add extra friction when a value had to be
+        defaulted rather than read -- e.g. forcing the user to confirm
+        the sample rate for a chanMap, which doesn't carry one -- use
+        this variant.
+        """
+        path = Path(path)
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        if cls._is_kilosort_chanmap(data):
+            return (
+                cls._from_kilosort_chanmap(data, name=path.stem),
+                "kilosort_chanmap",
+            )
+
+        coords = data.get("coordinates", {})
+        shanks = data.get("shanks", {})
+
+        definition = cls(
+            name=str(data.get("name", "CustomProbe")),
+            n_channels=int(data.get("n_channels", 0)),
+            sample_rate=float(data.get("sample_rate", 30000.0)),
+            dtype=str(data.get("dtype", "int16")),
+            bit_volts=float(data.get("bit_volts", 1.0)),
+            probe_type=str(data.get("probe_type", "Custom")),
+            serial_number=str(data.get("serial_number", "")),
+            channels=[int(c) for c in coords.get("channels", [])],
+            x=[float(v) for v in coords.get("x", [])],
+            y=[float(v) for v in coords.get("y", [])],
+            shank_ids=[int(s) for s in shanks.get("ids", [])],
+        )
+        return definition, "definition"
+    
 def dat_implied_duration_seconds(dat_path: str | Path, n_channels: int, dtype: str) -> float:
     """Return the recording duration (in seconds) implied by a dat file
     of the given channel count and dtype, assuming a sample rate of 1 Hz

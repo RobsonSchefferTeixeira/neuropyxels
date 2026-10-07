@@ -1865,13 +1865,55 @@ class MainWindow(QMainWindow):
         if checked:
             self.phy_units_dock.raise_()
 
+    def _register_probe_definition(self, defn: ProbeDefinition) -> bool:
+        """Register a ProbeDefinition as the app's single active probe,
+        populating the stream picker and the probe map. Returns True on
+        success, False if the definition couldn't be converted to a
+        probe dict.
+
+        This is the shared first half of the "load a probe" operation:
+        _on_open_probe_definition and _on_load_probe_definition both
+        call it, then optionally follow up with a dat load. Extracted
+        so a caller that only wants the probe -- without immediately
+        loading a dat -- can stop right here.
+        """
+        try:
+            probe_data = defn.to_probe_data_dict()
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid definition", str(exc))
+            return False
+
+        stream_key = f"{defn.name}-custom"
+        self._probes = {"record_path": "", "probes": {stream_key: probe_data}}
+        self._settings_path = None
+
+        self.stream_picker.blockSignals(True)
+        self.stream_picker.clear()
+        self.stream_picker.addItem(stream_key)
+        self.stream_picker.setEnabled(True)
+        self.stream_picker.blockSignals(False)
+
+        self._current_probe_key = stream_key
+        self._load_probe_map(probe_data)
+
+        self._update_analysis_actions_enabled()
+        if hasattr(self, "trace_style_panel"):
+            self.trace_style_panel.update_channels()
+
+        return True
+    
     def _on_load_probe_definition(self):
-        """Load a saved ProbeDefinition JSON, open it in the editor so
-        the user can inspect/modify it, then -- if accepted -- ask for
-        a continuous.dat and load it against the definition. This is
-        the same downstream path as _on_open_probe_definition; the only
-        difference is that the editor is pre-populated from a JSON file
-        instead of starting with a default linear layout.
+        """Load a saved probe JSON, open it in the editor so the user
+        can inspect/modify it, and register the resulting definition
+        as the active probe. Does NOT ask for a dat -- the user picks
+        that up separately via File -> Neural Data -> Open Data, which
+        keeps each File menu entry doing exactly one thing.
+
+        Accepts both native ProbeDefinition JSON and Kilosort chanMap
+        JSON (auto-detected). For a chanMap, the sample-rate
+        confirmation gate is armed in the editor, because chanMaps
+        don't carry a sample rate and the assumed 30000 Hz default has
+        to be verified by the user.
         """
         from PyQt6.QtWidgets import QFileDialog
 
@@ -1883,7 +1925,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            defn = ProbeDefinition.load_json(json_str)
+            defn, source_kind = ProbeDefinition.load_json_with_source(json_str)
         except Exception as exc:
             QMessageBox.critical(
                 self, "Failed to load probe definition",
@@ -1891,23 +1933,29 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Hand the loaded definition to the editor. The editor will
-        # validate on open, show any problems inline, and only allow
-        # accepting a valid definition.
-        dialog = ProbeDefinitionDialog(self, initial=defn)
+        is_chanmap = (source_kind == "kilosort_chanmap")
+
+        dialog = ProbeDefinitionDialog(
+            self,
+            initial=defn,
+            require_sample_rate_confirmation=is_chanmap,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.definition is None:
             return
 
         defn = dialog.definition
 
-        dat_str, _ = QFileDialog.getOpenFileName(
-            self, f"Open continuous.dat for '{defn.name}'", "",
-            "DAT files (*.dat);;All files (*)"
-        )
-        if not dat_str:
+        if not self._register_probe_definition(defn):
             return
 
-        self.load_data_file_with_definition(defn, Path(dat_str))
+        # Registering succeeds even without a dat. Loading one is a
+        # separate step the user does through Neural Data -> Open Data.
+        # A probe with no dat yet still shows the probe map and enables
+        # the probe-related menu items that only need geometry.
+        self._update_status(
+            f"Probe '{defn.name}' loaded. Use File → Neural Data → "
+            f"Open Data to load the corresponding continuous.dat."
+        )
 
     def _on_open_eeg_edf(self):
         """Placeholder. The EEG Data menu is disabled for now; this
@@ -1927,7 +1975,15 @@ class MainWindow(QMainWindow):
 
     def _on_open_probe_definition(self):
         """Open the definition editor, then use the resulting definition
-        with a dat the user picks immediately after."""
+        with a dat the user picks immediately after.
+
+        Keeps the "editor then dat" flow, because this path is the
+        deliberate "build a probe and immediately try it" workflow --
+        the user is expected to have the dat ready. The JSON-load path
+        (File -> Probe -> Load Probe Definition) is the one that stops
+        after registering, since the user may already have a dat loaded
+        or may want to load it later.
+        """
         dialog = ProbeDefinitionDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.definition is None:
             return
@@ -1939,43 +1995,34 @@ class MainWindow(QMainWindow):
             "DAT files (*.dat);;All files (*)"
         )
         if not path_str:
+            # Register the probe anyway. The user cancelled the dat
+            # picker, but they clearly wanted this probe; the map and
+            # menu items can come alive now, and the dat can be loaded
+            # later via Neural Data -> Open Data.
+            self._register_probe_definition(defn)
+            self._update_status(
+                f"Probe '{defn.name}' loaded. Use File → Neural Data → "
+                f"Open Data to load the corresponding continuous.dat."
+            )
             return
 
         self.load_data_file_with_definition(defn, Path(path_str))
 
     def load_data_file_with_definition(self, defn: ProbeDefinition, path: Path):
         """Load a raw continuous.dat against a hand-authored (or
-        imported) probe definition, bypassing the settings.xml machinery
-        entirely.
+        imported) probe definition, bypassing the settings.xml
+        machinery entirely.
 
-        The definition is wrapped into the exact dict shape that
-        extract_probes_from_settings produces, then the rest of the app
-        runs unchanged.
+        Registers the probe first (via _register_probe_definition),
+        then loads the dat. If the dat load fails, the probe stays
+        registered -- the map and menu items remain usable, and the
+        user can retry with a different file.
         """
-        try:
-            probe_data = defn.to_probe_data_dict()
-        except ValueError as exc:
-            QMessageBox.critical(self, "Invalid definition", str(exc))
+        if not self._register_probe_definition(defn):
             return
 
-        # Register the definition as a single-stream probe set, exactly
-        # as if it had come from a settings.xml. This makes it
-        # selectable in the stream picker and drives every downstream
-        # consumer without special-casing.
-        stream_key = f"{defn.name}-custom"
-        self._probes = {"record_path": "", "probes": {stream_key: probe_data}}
-        self._settings_path = None
+        probe_data = defn.to_probe_data_dict()  # already validated above
 
-        self.stream_picker.blockSignals(True)
-        self.stream_picker.clear()
-        self.stream_picker.addItem(stream_key)
-        self.stream_picker.setEnabled(True)
-        self.stream_picker.blockSignals(False)
-
-        self._current_probe_key = stream_key
-        self._load_probe_map(probe_data)
-
-        # Now load the dat itself against the definition.
         new_engine = TraceEngine(
             n_channels=int(defn.n_channels),
             sample_rate=float(defn.sample_rate),
@@ -1986,7 +2033,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(
                 self, "Failed to load data",
-                f"Could not load {path.name} against definition '{defn.name}':\n\n{exc}"
+                f"Could not load {path.name} against definition "
+                f"'{defn.name}':\n\n{exc}"
             )
             return
 
@@ -2002,27 +2050,34 @@ class MainWindow(QMainWindow):
         self.trace_view.set_data_source(self.engine)
         self.trace_view.clear_theta_epochs()
 
-        # Register the FULL probe geometry immediately so CSD, depth
-        # sorting, and everything else is ready the moment the user
-        # picks channels on the (freshly built) probe map. No selection
-        # is carried over -- this is a new probe the user has never
-        # selected channels on.
-        depths = dict(zip(probe_data["coordinates"]["channels"], probe_data["coordinates"]["y"]))
-        xcoords = dict(zip(probe_data["coordinates"]["channels"], probe_data["coordinates"]["x"]))
-        shank_ids = probe_data.get("shanks", {}).get("ids") or [0] * len(probe_data["coordinates"]["channels"])
-        shank_map = dict(zip(probe_data["coordinates"]["channels"], shank_ids))
+        # Push the full probe geometry so CSD, depth sorting, and focus
+        # neighborhoods are ready as soon as channels are picked.
+        depths = dict(zip(
+            probe_data["coordinates"]["channels"],
+            probe_data["coordinates"]["y"],
+        ))
+        xcoords = dict(zip(
+            probe_data["coordinates"]["channels"],
+            probe_data["coordinates"]["x"],
+        ))
+        shank_ids = (
+            probe_data.get("shanks", {}).get("ids")
+            or [0] * len(probe_data["coordinates"]["channels"])
+        )
+        shank_map = dict(zip(
+            probe_data["coordinates"]["channels"], shank_ids
+        ))
         self.trace_view.set_full_probe_geometry(depths, shank_map, xcoords)
 
         self._update_analysis_actions_enabled()
-        if hasattr(self, 'trace_style_panel'):
+        if hasattr(self, "trace_style_panel"):
             self.trace_style_panel.update_channels()
 
         self._update_status(
             f"Loaded {path.name} against custom definition '{defn.name}'  —  "
-            f"{new_engine.total_duration:.1f}s, {new_engine.n_channels} channels "
-            f"@ {new_engine.sr:.0f} Hz ({defn.dtype})"
+            f"{new_engine.total_duration:.1f}s, {new_engine.n_channels} "
+            f"channels @ {new_engine.sr:.0f} Hz ({defn.dtype})"
         )
-
 
 
     def _on_open_timestamps(self):

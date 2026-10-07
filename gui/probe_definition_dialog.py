@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QFileDialog, QMessageBox, QWidget,
+    QCheckBox,
 )
 
 from core.probe_definition import ProbeDefinition, SUPPORTED_DTYPES
@@ -34,13 +35,30 @@ class ProbeDefinitionDialog(QDialog):
     """Modal editor. On exec() == Accepted, `self.definition` is set to
     a validated ProbeDefinition."""
 
-    def __init__(self, parent=None, initial: ProbeDefinition | None = None):
+    def __init__(
+        self,
+        parent=None,
+        initial: ProbeDefinition | None = None,
+        require_sample_rate_confirmation: bool = False,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Probe Definition")
         self.setModal(True)
         self.resize(760, 720)
 
         self.definition: ProbeDefinition | None = None
+
+        # When True, the user must check a confirmation checkbox before
+        # the "Use this definition" button becomes enabled. Set by the
+        # JSON-loading path when the file was a Kilosort chanMap, whose
+        # format carries no sample rate and therefore relies on the
+        # 30000 Hz default -- a value the user has to verify, because
+        # a wrong sample rate silently corrupts every time-based
+        # analysis downstream.
+        self._require_sample_rate_confirmation = bool(
+            require_sample_rate_confirmation
+        )
+        self._sample_rate_confirmed = False
 
         self._build_ui()
 
@@ -88,6 +106,46 @@ class ProbeDefinitionDialog(QDialog):
         self.sample_rate_spin.setSuffix(" Hz")
         grid.addWidget(QLabel("Sample rate:"), 0, 4)
         grid.addWidget(self.sample_rate_spin, 0, 5)
+
+        # Confirmation checkbox. Only shown when the loaded file didn't
+        # declare a sample rate (Kilosort chanMap). Hidden otherwise so
+        # a hand-built probe and a native ProbeDefinition JSON load
+        # without extra friction.
+        self.sample_rate_confirmed_checkbox = QCheckBox(
+            "Correct"
+        )
+        self.sample_rate_confirmed_checkbox.setToolTip(
+            "The loaded file does not contain a sample rate, so 30000 Hz "
+            "is being assumed. Verify this matches the recording before "
+            "using the definition -- a wrong sample rate will silently "
+            "corrupt every time-based analysis (filters, ripples, "
+            "timestamps, phase-amplitude coupling, ripple-triggered "
+            "average)."
+        )
+        self.sample_rate_confirmed_checkbox.toggled.connect(
+            self._on_sample_rate_confirmed_toggled
+        )
+        self.sample_rate_confirmed_checkbox.setVisible(
+            self._require_sample_rate_confirmation
+        )
+
+        # Wrap the spinbox and checkbox in a horizontal container so
+        # they share one grid cell. Without this, they'd be two
+        # separate widgets in adjacent cells, and the checkbox would
+        # sit in whatever column Qt happens to place it in.
+        sample_rate_cell = QWidget()
+        sample_rate_cell_layout = QHBoxLayout(sample_rate_cell)
+        sample_rate_cell_layout.setContentsMargins(0, 0, 0, 0)
+        sample_rate_cell_layout.setSpacing(6)
+        sample_rate_cell_layout.addWidget(self.sample_rate_spin)
+        sample_rate_cell_layout.addWidget(self.sample_rate_confirmed_checkbox)
+        sample_rate_cell_layout.addStretch(1)
+
+        # Replace the plain spinbox placement with the wrapped cell.
+        # (The earlier addWidget(self.sample_rate_spin, 0, 5) is
+        # removed here to avoid adding it twice.)
+        grid.addWidget(sample_rate_cell, 0, 5)
+
 
         self.dtype_combo = QComboBox()
         self.dtype_combo.addItems(list(SUPPORTED_DTYPES))
@@ -310,14 +368,38 @@ class ProbeDefinitionDialog(QDialog):
     def _refresh_validation(self):
         defn = self._definition_from_ui()
         problems = defn.validate()
+
+        # A Kilosort chanMap import has no declared sample rate, so the
+        # 30000 Hz default has to be actively confirmed before the
+        # definition is usable. This gate applies on top of the normal
+        # validation -- an otherwise-valid definition stays disabled
+        # until the checkbox is ticked.
+        confirmation_pending = (
+            self._require_sample_rate_confirmation
+            and not self._sample_rate_confirmed
+        )
+
         if problems:
             self.validation_label.setText("⚠  " + "\n⚠  ".join(problems))
             self.validation_label.setStyleSheet("color: #e57373; font-size: 11px;")
+            self.ok_btn.setEnabled(False)
+        elif confirmation_pending:
+            self.validation_label.setText(
+                "⚠  Confirm the sample rate before using this definition "
+                "(the loaded file does not contain one)."
+            )
+            self.validation_label.setStyleSheet(
+                "color: #ffb74d; font-size: 11px;"
+            )
             self.ok_btn.setEnabled(False)
         else:
             self.validation_label.setText("✓  Definition looks valid.")
             self.validation_label.setStyleSheet("color: #4caf50; font-size: 11px;")
             self.ok_btn.setEnabled(True)
+
+    def _on_sample_rate_confirmed_toggled(self, checked: bool):
+        self._sample_rate_confirmed = bool(checked)
+        self._refresh_validation()
 
     # ------------------------------------------------------------------
     # Import / export
@@ -330,11 +412,29 @@ class ProbeDefinitionDialog(QDialog):
         if not path_str:
             return
         try:
-            defn = ProbeDefinition.load_json(path_str)
+            defn, source_kind = ProbeDefinition.load_json_with_source(path_str)
         except Exception as exc:
             QMessageBox.critical(self, "Failed to load", f"Could not read {path_str}:\n\n{exc}")
             return
+
+        is_chanmap = (source_kind == "kilosort_chanmap")
+        self._set_sample_rate_confirmation_required(is_chanmap)
+
         self._load_definition_into_ui(defn)
+
+    def _set_sample_rate_confirmation_required(self, required: bool):
+        """Turn the confirmation gate on or off. Called by the JSON
+        loader depending on which schema the file used; also clears any
+        previous confirmation when the gate is (re)armed, so a
+        confirmation from a previous file doesn't silently apply to a
+        newly-loaded one."""
+        self._require_sample_rate_confirmation = bool(required)
+        self._sample_rate_confirmed = False
+        self.sample_rate_confirmed_checkbox.blockSignals(True)
+        self.sample_rate_confirmed_checkbox.setChecked(False)
+        self.sample_rate_confirmed_checkbox.blockSignals(False)
+        self.sample_rate_confirmed_checkbox.setVisible(bool(required))
+        self._refresh_validation()
 
     def _on_load_settings_xml(self):
         path_str, _ = QFileDialog.getOpenFileName(
@@ -359,6 +459,7 @@ class ProbeDefinitionDialog(QDialog):
         first_key = next(iter(probes["probes"]))
         probe_data = probes["probes"][first_key]
         defn = ProbeDefinition.load_from_probe_data_dict(probe_data, name=first_key)
+        self._set_sample_rate_confirmation_required(False)
         self._load_definition_into_ui(defn)
 
     def _on_save_json(self):
