@@ -54,8 +54,7 @@ class ColorButton(QPushButton):
 
     colorChanged = pyqtSignal(QColor)
 
-    def __init__(self, color: str = "#3498db", parent: QWidget | None = None,
-                 label: str = ""):
+    def __init__(self, color: str = "#3498db", parent: QWidget | None = None, label: str = ""):
         super().__init__(parent)
         self._color = QColor(color)
         self._label = label
@@ -1130,46 +1129,111 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
 
-        open_settings_action = QAction("Open &settings.xml", self)
+        # ------------------------------------------------------------------
+        # Probe
+        # ------------------------------------------------------------------
+        # Everything that describes the physical electrode array: either
+        # an Open Ephys settings.xml (which carries acquisition metadata
+        # plus electrode coordinates), or a hand-authored ProbeDefinition
+        # for recordings that have no settings.xml.
+        probe_menu = file_menu.addMenu("&Probe")
+
+        open_settings_action = QAction("Open settings.xml", self)
         open_settings_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_settings_action.setToolTip(
+            "Parse an Open Ephys settings.xml to obtain probe geometry, "
+            "sample rate, and channel count. Also populates the probe "
+            "stream picker if the file contains more than one stream."
+        )
         open_settings_action.triggered.connect(self._on_open_settings)
-        file_menu.addAction(open_settings_action)
+        probe_menu.addAction(open_settings_action)
 
-        open_data_action = QAction("Open &Data (continuous.dat)", self)
-        open_data_action.triggered.connect(self._on_open_data)
-        file_menu.addAction(open_data_action)
+        probe_menu.addSeparator()
 
-        open_definition_action = QAction("New Probe &Definition", self)
+        open_definition_action = QAction("New Probe Definition…", self)
         open_definition_action.setToolTip(
-            "Build a probe description by hand (or import one), then use "
-            "it with a raw continuous.dat that has no settings.xml."
+            "Build a probe description by hand (or import one from an "
+            "existing settings.xml or JSON), then use it with a raw "
+            "continuous.dat that has no settings.xml of its own."
         )
         open_definition_action.triggered.connect(self._on_open_probe_definition)
-        file_menu.addAction(open_definition_action)
+        probe_menu.addAction(open_definition_action)
 
-        open_timestamps_action = QAction("Open Timestamps (timestamps.npy)", self)
-        open_timestamps_action.triggered.connect(self._on_open_timestamps)
-        file_menu.addAction(open_timestamps_action)
+        load_definition_action = QAction("Load Probe Definition (JSON)…", self)
+        load_definition_action.setToolTip(
+            "Load a previously-saved ProbeDefinition JSON and use it "
+            "immediately with a continuous.dat, skipping the editor."
+        )
+        load_definition_action.triggered.connect(self._on_load_probe_definition)
+        probe_menu.addAction(load_definition_action)
 
+        # ------------------------------------------------------------------
+        # Neural Data
+        # ------------------------------------------------------------------
+        # Everything that describes one recording: the raw .dat itself,
+        # the Phy/Kilosort sorted output on top of it, and the optional
+        # timestamps file that gives its samples real-world time values.
+        neural_menu = file_menu.addMenu("&Neural Data")
 
-        open_phy_action = QAction("Open &Kilosort/Phy Output", self)
+        open_data_action = QAction("Open Data (continuous.dat)", self)
+        open_data_action.setToolTip(
+            "Load a raw Neuropixels continuous.dat. Channel count and "
+            "sample rate are taken from the currently-loaded probe "
+            "stream, or from the app defaults if none is loaded."
+        )
+        open_data_action.triggered.connect(self._on_open_data)
+        neural_menu.addAction(open_data_action)
+
+        neural_menu.addSeparator()
+
+        open_phy_action = QAction("Open Kilosort/Phy Output", self)
         open_phy_action.setToolTip(
             "Load a Kilosort4 / Phy output folder to overlay sorted "
-            "units as a spike raster on the trace view."
+            "units as a spike raster on the trace view. Requires a "
+            "continuous.dat to be loaded first: Phy spike times are "
+            "sample indices into that recording."
         )
         open_phy_action.triggered.connect(self._on_open_phy_folder)
-        file_menu.addAction(open_phy_action)
+        neural_menu.addAction(open_phy_action)
 
+        open_timestamps_action = QAction("Open Timestamps (timestamps.npy)", self)
+        open_timestamps_action.setToolTip(
+            "Load a timestamps.npy file. When present, the trace view "
+            "can label its time axis with real timestamp values instead "
+            "of elapsed seconds; sample indexing is unaffected."
+        )
+        open_timestamps_action.triggered.connect(self._on_open_timestamps)
+        neural_menu.addAction(open_timestamps_action)
 
+        # ------------------------------------------------------------------
+        # EEG Data (placeholder)
+        # ------------------------------------------------------------------
+        # Not yet implemented. Entries are disabled rather than showing a
+        # "not implemented" popup on click -- the structure is visible
+        # now, and the tooltips explain what will eventually live here.
+        eeg_menu = file_menu.addMenu("&EEG Data")
 
-        file_menu.addSeparator()
+        open_edf_action = QAction("Open EDF / Montage", self)
+        open_edf_action.setToolTip(
+            "Not yet implemented. Will load an EDF file and derive an "
+            "electrode montage from its channel labels."
+        )
+        open_edf_action.setEnabled(False)
+        open_edf_action.triggered.connect(self._on_open_eeg_edf)
+        eeg_menu.addAction(open_edf_action)
 
-        quit_action = QAction("&Quit", self)
-        quit_action.setShortcut(QKeySequence.StandardKey.Quit)
-        quit_action.triggered.connect(self.close)
-        file_menu.addAction(quit_action)
+        load_montage_action = QAction("Load Custom Montage (JSON)", self)
+        load_montage_action.setToolTip(
+            "Not yet implemented. Will load a user-provided montage "
+            "description for EEG data that has no usable EDF header."
+        )
+        load_montage_action.setEnabled(False)
+        load_montage_action.triggered.connect(self._on_load_custom_montage)
+        eeg_menu.addAction(load_montage_action)
 
-
+        # ------------------------------------------------------------------
+        # App lifecycle
+        # ------------------------------------------------------------------
         file_menu.addSeparator()
 
         reset_action = QAction("&Reset Application", self)
@@ -1180,6 +1244,16 @@ class MainWindow(QMainWindow):
         )
         reset_action.triggered.connect(self._on_reset)
         file_menu.addAction(reset_action)
+
+        file_menu.addSeparator()
+
+        quit_action = QAction("&Quit", self)
+        quit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+    
+
 
         
         analysis_menu = menubar.addMenu("&Analysis")
@@ -1790,6 +1864,66 @@ class MainWindow(QMainWindow):
         self.phy_units_dock.setFloating(True)
         if checked:
             self.phy_units_dock.raise_()
+
+    def _on_load_probe_definition(self):
+        """Load a saved ProbeDefinition JSON, open it in the editor so
+        the user can inspect/modify it, then -- if accepted -- ask for
+        a continuous.dat and load it against the definition. This is
+        the same downstream path as _on_open_probe_definition; the only
+        difference is that the editor is pre-populated from a JSON file
+        instead of starting with a default linear layout.
+        """
+        from PyQt6.QtWidgets import QFileDialog
+
+        json_str, _ = QFileDialog.getOpenFileName(
+            self, "Load Probe Definition (JSON)", "",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not json_str:
+            return
+
+        try:
+            defn = ProbeDefinition.load_json(json_str)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Failed to load probe definition",
+                f"Could not read {json_str}:\n\n{exc}"
+            )
+            return
+
+        # Hand the loaded definition to the editor. The editor will
+        # validate on open, show any problems inline, and only allow
+        # accepting a valid definition.
+        dialog = ProbeDefinitionDialog(self, initial=defn)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.definition is None:
+            return
+
+        defn = dialog.definition
+
+        dat_str, _ = QFileDialog.getOpenFileName(
+            self, f"Open continuous.dat for '{defn.name}'", "",
+            "DAT files (*.dat);;All files (*)"
+        )
+        if not dat_str:
+            return
+
+        self.load_data_file_with_definition(defn, Path(dat_str))
+
+    def _on_open_eeg_edf(self):
+        """Placeholder. The EEG Data menu is disabled for now; this
+        handler exists so the eventual implementation has a home."""
+        QMessageBox.information(
+            self, "Not yet implemented",
+            "EEG/EDF loading is planned but not yet available."
+        )
+
+    def _on_load_custom_montage(self):
+        """Placeholder, same as _on_open_eeg_edf."""
+        QMessageBox.information(
+            self, "Not yet implemented",
+            "Loading a custom EEG montage is planned but not yet "
+            "available."
+        )
 
     def _on_open_probe_definition(self):
         """Open the definition editor, then use the resulting definition
