@@ -1974,39 +1974,23 @@ class MainWindow(QMainWindow):
         )
 
     def _on_open_probe_definition(self):
-        """Open the definition editor, then use the resulting definition
-        with a dat the user picks immediately after.
-
-        Keeps the "editor then dat" flow, because this path is the
-        deliberate "build a probe and immediately try it" workflow --
-        the user is expected to have the dat ready. The JSON-load path
-        (File -> Probe -> Load Probe Definition) is the one that stops
-        after registering, since the user may already have a dat loaded
-        or may want to load it later.
+        """Open the definition editor and register the resulting
+        definition as the active probe. Does NOT ask for a dat -- the
+        user loads that separately via File -> Neural Data -> Open
+        Data, keeping each File menu entry doing exactly one thing.
         """
         dialog = ProbeDefinitionDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.definition is None:
             return
 
         defn = dialog.definition
-
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, f"Open continuous.dat for '{defn.name}'", "",
-            "DAT files (*.dat);;All files (*)"
-        )
-        if not path_str:
-            # Register the probe anyway. The user cancelled the dat
-            # picker, but they clearly wanted this probe; the map and
-            # menu items can come alive now, and the dat can be loaded
-            # later via Neural Data -> Open Data.
-            self._register_probe_definition(defn)
-            self._update_status(
-                f"Probe '{defn.name}' loaded. Use File → Neural Data → "
-                f"Open Data to load the corresponding continuous.dat."
-            )
+        if not self._register_probe_definition(defn):
             return
 
-        self.load_data_file_with_definition(defn, Path(path_str))
+        self._update_status(
+            f"Probe '{defn.name}' loaded. Use File → Neural Data → "
+            f"Open Data to load the corresponding continuous.dat."
+        )
 
     def load_data_file_with_definition(self, defn: ProbeDefinition, path: Path):
         """Load a raw continuous.dat against a hand-authored (or

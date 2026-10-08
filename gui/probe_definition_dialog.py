@@ -62,12 +62,17 @@ class ProbeDefinitionDialog(QDialog):
 
         self._build_ui()
 
-        # Seed with a sensible linear layout so the user has something
-        # concrete to edit rather than an empty table.
         if initial is not None:
             self._load_definition_into_ui(initial)
         else:
-            self._generate_linear_layout()
+            # Fresh dialog: leave everything empty. The user enters a
+            # channel count and either hits Enter (to get that many
+            # blank rows via _on_n_channels_editing_finished) or clicks
+            # "Generate linear layout" (to get a computed regular
+            # geometry). Nothing is prefilled, so the dialog never
+            # suggests a probe shape the user hasn't asked for.
+            self._clear_table()
+            self._refresh_validation()
 
     # ------------------------------------------------------------------
     # UI scaffolding
@@ -94,17 +99,27 @@ class ProbeDefinitionDialog(QDialog):
         grid.addWidget(self.name_edit, 0, 1)
 
         self.n_channels_spin = QSpinBox()
-        self.n_channels_spin.setRange(1, 100000)
-        self.n_channels_spin.setValue(384)
+        self.n_channels_spin.setRange(0, 100000)
+        # Special value text: 0 renders as an empty field, so a fresh
+        # dialog doesn't suggest a channel count the user hasn't chosen.
+        self.n_channels_spin.setSpecialValueText("")
+        self.n_channels_spin.setValue(0)
+        # editingFinished fires on Enter and on focus-out; see
+        # _on_n_channels_editing_finished for what it does.
+        self.n_channels_spin.editingFinished.connect(self._on_n_channels_editing_finished)
+        
         grid.addWidget(QLabel("n_channels:"), 0, 2)
         grid.addWidget(self.n_channels_spin, 0, 3)
 
         self.sample_rate_spin = QDoubleSpinBox()
-        self.sample_rate_spin.setRange(1.0, 1e6)
+        self.sample_rate_spin.setRange(0.0, 1e6)
         self.sample_rate_spin.setDecimals(1)
-        self.sample_rate_spin.setValue(30000.0)
+        self.sample_rate_spin.setSpecialValueText("")
+        self.sample_rate_spin.setValue(0.0)
         self.sample_rate_spin.setSuffix(" Hz")
         grid.addWidget(QLabel("Sample rate:"), 0, 4)
+
+
         grid.addWidget(self.sample_rate_spin, 0, 5)
 
         # Confirmation checkbox. Only shown when the loaded file didn't
@@ -167,6 +182,18 @@ class ProbeDefinitionDialog(QDialog):
         self.probe_type_edit = QLineEdit("Custom")
         grid.addWidget(QLabel("Probe type:"), 1, 4)
         grid.addWidget(self.probe_type_edit, 1, 5)
+
+        # Every meta field that feeds ProbeDefinition.validate() must
+        # re-trigger validation on change, or the validation label and
+        # OK button go stale the moment the user edits a field rather
+        # than a table cell. The table itself is already wired via
+        # itemChanged in _build_electrode_table.
+        self.name_edit.textChanged.connect(self._refresh_validation)
+        self.n_channels_spin.valueChanged.connect(self._refresh_validation)
+        self.sample_rate_spin.valueChanged.connect(self._refresh_validation)
+        self.dtype_combo.currentTextChanged.connect(self._refresh_validation)
+        self.bit_volts_spin.valueChanged.connect(self._refresh_validation)
+        self.probe_type_edit.textChanged.connect(self._refresh_validation)
 
         return group
 
@@ -277,9 +304,17 @@ class ProbeDefinitionDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _generate_linear_layout(self):
+        n = self.n_channels_spin.value()
+        if n <= 0:
+            QMessageBox.warning(
+                self, "Enter a channel count",
+                "Set the number of channels before generating a layout."
+            )
+            return
+
         try:
             defn = ProbeDefinition.linear_layout(
-                n_channels=self.n_channels_spin.value(),
+                n_channels=n,
                 sample_rate=self.sample_rate_spin.value(),
                 dtype=self.dtype_combo.currentText(),
                 n_shanks=self.n_shanks_spin.value(),
@@ -293,6 +328,65 @@ class ProbeDefinitionDialog(QDialog):
         defn.bit_volts = self.bit_volts_spin.value()
         defn.probe_type = self.probe_type_edit.text().strip() or "Custom"
         self._load_definition_into_ui(defn)
+
+
+    def _clear_table(self):
+        """Empty the electrode table. Used when a fresh dialog opens."""
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+        finally:
+            self.table.blockSignals(False)
+
+    def _on_n_channels_editing_finished(self):
+        """Handler for n_channels_spin.editingFinished -- fires when
+        the user presses Enter or moves focus away from the field.
+
+        If the value is positive, resize the electrode table to that
+        many rows, PRESERVING any cells the user has already filled in.
+        New rows get a sequential Channel number, a default Shank of
+        "0", and blank X/Y cells for the user to fill in.
+
+        If the value is 0 (empty field), do nothing -- the user is
+        either about to type a number or has explicitly cleared it.
+        """
+        value = self.n_channels_spin.value()
+        if value <= 0:
+            self._clear_table()   # TODO: test this
+            return
+        self._resize_table_blank(value)
+
+    def _resize_table_blank(self, n: int):
+        """Resize the electrode table to exactly `n` rows, preserving
+        the content of rows that already exist. Rows added to reach `n`
+        get a sequential Channel number, blank X/Y, and Shank "0"; rows
+        dropped past index `n-1` are discarded.
+
+        Blank X/Y is intentional -- this is the skeleton case, where
+        the user has declared a channel count but hasn't yet said where
+        the electrodes are. Use "Generate linear layout" for a computed
+        regular geometry instead.
+        """
+        current = self.table.rowCount()
+        if current == n:
+            return
+
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(n)
+            for row in range(current, n):
+                # Channel: sequential, so the definition has a valid
+                # channel list immediately. X/Y: blank (user fills in).
+                # Shank: "0" (the common single-shank default, saves
+                # typing 0 in every row for a whole-probe layout).
+                self.table.setItem(row, 0, QTableWidgetItem(str(row)))
+                self.table.setItem(row, 1, QTableWidgetItem(""))
+                self.table.setItem(row, 2, QTableWidgetItem(""))
+                self.table.setItem(row, 3, QTableWidgetItem("0"))
+        finally:
+            self.table.blockSignals(False)
+
+        self._refresh_validation()
 
     def _load_definition_into_ui(self, defn: ProbeDefinition):
         # Block signals while populating so the itemChanged handler
