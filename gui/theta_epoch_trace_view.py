@@ -43,6 +43,13 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         self._theta_handle_radius = 7.0
         self._theta_handle_hit_radius = 12.0
 
+        # ---- Undo stack ----
+        # One snapshot per user gesture (see _theta_push_undo_snapshot).
+        # Restoring = pop and replace. Depth-capped so a long editing
+        # session doesn't grow memory without bound.
+        self._theta_undo_stack: list[list[ThetaEpoch]] = []
+        self._theta_undo_max = 50
+
         # "Add new window" (click-drag creation) state. Armed via
         # arm_theta_creation() (called by ThetaEpochDialog's "Add Theta
         # Epoch" button); the NEXT left-button press/drag on a channel
@@ -62,7 +69,41 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
     # ------------------------------------------------------------------
     # Theta epoch API
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
 
+    def _theta_push_undo_snapshot(self):
+        """Snapshot the current epoch list BEFORE an edit is applied,
+        so restoring the snapshot reverts that edit. Called once per
+        user gesture (drag start, delete, split, merge, create), not
+        per mouse-move -- undo granularity matches what a user thinks
+        of as 'one edit'."""
+        import copy
+        snapshot = [copy.deepcopy(e) for e in self.theta_epochs]
+        self._theta_undo_stack.append(snapshot)
+        if len(self._theta_undo_stack) > self._theta_undo_max:
+            self._theta_undo_stack.pop(0)
+
+    def _theta_undo(self) -> bool:
+        """Restore the previous epoch list. Returns True if an undo
+        actually happened (i.e. the stack wasn't empty)."""
+        if not self._theta_undo_stack:
+            return False
+        previous = self._theta_undo_stack.pop()
+        self.theta_epochs = previous
+        # Clear any transient edit state -- the epochs the drag was
+        # operating on no longer exist.
+        self._theta_selected_epoch = None
+        self._theta_drag_epoch = None
+        self._theta_drag_side = None
+        self._theta_merge_candidate = None
+        self._theta_merge_candidates.clear()
+        self.unsetCursor()
+        self.thetaEpochsChanged.emit(self.theta_epochs)
+        self.update()
+        return True
+    
     def set_theta_epochs(
         self,
         epochs: list[ThetaEpoch] | None,
@@ -104,7 +145,9 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         i = self._theta_selected_epoch
         if i is None or not (0 <= i < len(self.theta_epochs)):
             return False
+        self._theta_push_undo_snapshot()
         self.theta_epochs.pop(i)
+
         self._theta_selected_epoch = None
         self._theta_drag_epoch = None
         self._theta_drag_side = None
@@ -190,6 +233,8 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         if split_sample - epoch.start_sample < min_w or epoch.end_sample - split_sample < min_w:
             return False
 
+        self._theta_push_undo_snapshot()   # <-- add
+
         first = ThetaEpoch(
             channel=epoch.channel,
             start_sample=epoch.start_sample,
@@ -243,6 +288,12 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         self._theta_merge_candidate = None
         self._theta_merge_candidates.clear()
         self._theta_selected_epoch = None
+        self._theta_creating_armed = False          # <-- add
+        self._theta_creating_channel = None         # <-- add
+        self._theta_creating_start_sample = None    # <-- add
+        self._theta_creating_end_sample = None      # <-- add
+        self._theta_undo_stack.clear()              # <-- add
+        self.unsetCursor()                          # <-- add
         self.update()
 
     # ------------------------------------------------------------------
@@ -531,6 +582,7 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         channels = {e.channel for e in selected}
         if len(channels) != 1:
             return
+        self._theta_push_undo_snapshot() 
 
         start = min(e.start_sample for e in selected)
         end = max(e.end_sample for e in selected)
@@ -605,6 +657,10 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
                 self._theta_drag_original_end = epoch.end_sample
                 self._theta_merge_candidate = None
                 self._theta_merge_candidates.clear()
+                self._theta_merge_candidate = None
+                self._theta_merge_candidates.clear()
+                self._theta_push_undo_snapshot()   # <-- add
+                self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
                 self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
                 self.update()
                 event.accept()
@@ -640,6 +696,16 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         return None
 
     def keyPressEvent(self, event):
+        # Ctrl+Z: undo the last epoch edit. Checked before Delete so a
+        # user who habitually holds Ctrl doesn't accidentally delete.
+        if (
+            event.key() == Qt.Key.Key_Z
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            if self._theta_undo():
+                event.accept()
+                return
+
         if event.key() == Qt.Key.Key_Delete and self.delete_selected_theta_epoch():
             event.accept()
             return
@@ -705,6 +771,7 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
 
             lo, hi = min(start_sample, end_sample), max(start_sample, end_sample)
             if hi - lo >= self._theta_min_epoch_samples:
+                self._theta_push_undo_snapshot()
                 new_epoch = ThetaEpoch(
                     channel=channel,
                     start_sample=lo,
