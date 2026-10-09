@@ -117,3 +117,24 @@ def import_theta_epochs_from_csv(
             ))
     epochs.sort(key=lambda e: (e.channel, e.start_sample))
     return epochs
+
+def export_theta_epochs_per_channel(
+    epochs_by_channel: dict[int, Sequence[ThetaEpoch]],
+    sample_rate: float,
+    sample_offset: int,
+    output_dir: str | Path,
+    filename_template: str = "theta_epochs_channel{channel}.csv",
+) -> list[Path]:
+    """One CSV per channel, mirroring ripple_export.export_ripples_per_channel.
+    Channels with zero epochs still get a header-only file."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[Path] = []
+    for channel, epochs in epochs_by_channel.items():
+        path = output_dir / filename_template.format(channel=channel)
+        export_theta_epochs_to_csv(
+            epochs, sample_rate, sample_offset, path,
+        )
+        written.append(path)
+    return written

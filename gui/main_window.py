@@ -44,6 +44,8 @@ from gui.probe_definition_dialog import ProbeDefinitionDialog
 from gui.psd_dialog import PsdDialog
 from gui.phy_units_panel import PhyUnitsPanel
 from core.phy_loader import load_phy_folder, PhyLoadError
+from gui.theta_cycle_dialog import ThetaCycleDialog
+
 
 class ColorButton(QPushButton):
 
@@ -334,6 +336,7 @@ class MainWindow(QMainWindow):
         self._open_theta_dialogs: list[ThetaEpochDialog] = []
         self._open_psd_dialogs: list[PsdDialog] = []
         self.phy_units_panel: PhyUnitsPanel | None = None
+        self._open_theta_cycle_dialogs: list[ThetaCycleDialog] = []
 
         self._build_menu()
         self._build_trace_view()
@@ -371,6 +374,7 @@ class MainWindow(QMainWindow):
             "_open_ripple_dialogs",
             "_open_theta_dialogs",
             "_open_psd_dialogs",
+            "_open_theta_cycle_dialogs",
         ):
             dlg_list = getattr(self, dlg_list_name, None)
             if dlg_list:
@@ -590,6 +594,13 @@ class MainWindow(QMainWindow):
         # If the fixed-scale reference attributes don't exist on your
         # version yet, drop the two lines above -- they're harmless
         # either way when guarded with hasattr elsewhere.
+
+        tv.theta_cycles = []
+        tv._theta_cycle_selected = None
+        tv._theta_cycle_undo_stack = []
+        tv._cycle_trace_cache = {}
+        tv._cycle_trace_cache_key = None
+
 
         tv.update()
 
@@ -1121,6 +1132,38 @@ class MainWindow(QMainWindow):
         self.ripple_detection_action.setEnabled(ready)
         self.theta_epoch_action.setEnabled(ready)
         self.psd_action.setEnabled(ready)
+        self.theta_cycle_action.setEnabled(ready)
+
+
+    def _on_open_theta_cycle(self):
+        if self.probe_map is None or not self._current_probe_key:
+            QMessageBox.warning(
+                self, "No probe loaded",
+                "Load a probe first to provide channel geometry."
+            )
+            return
+        if not self.engine.data_loaded:
+            QMessageBox.warning(self, "No data loaded",
+                                "Load a continuous.dat file first.")
+            return
+
+        probe_data = self._probes["probes"][self._current_probe_key]
+        selected = self.probe_map.get_selected_channels()
+        dialog = ThetaCycleDialog(
+            probe_data, self.engine, self.trace_view,
+            initial_channels=selected, parent=self,
+        )
+        self._open_theta_cycle_dialogs.append(dialog)
+        dialog.finished.connect(
+            lambda _res, d=dialog: self._on_theta_cycle_dialog_closed(d)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_theta_cycle_dialog_closed(self, dialog):
+        if dialog in self._open_theta_cycle_dialogs:
+            self._open_theta_cycle_dialogs.remove(dialog)
     # ------------------------------------------------------------------
     # UI scaffolding
     # ------------------------------------------------------------------
@@ -1284,6 +1327,14 @@ class MainWindow(QMainWindow):
         self.theta_epoch_action.setEnabled(False)
         self.theta_epoch_action.triggered.connect(self._on_open_theta_epoch)
         analysis_menu.addAction(self.theta_epoch_action)
+
+
+        self.theta_cycle_action = QAction("Theta Cycle Detection", self)
+        self.theta_cycle_action.setEnabled(False)
+        self.theta_cycle_action.triggered.connect(self._on_open_theta_cycle)
+        analysis_menu.addAction(self.theta_cycle_action)
+
+
 
         view_menu = menubar.addMenu("&View")
 
@@ -1794,10 +1845,13 @@ class MainWindow(QMainWindow):
             dialog.close()
         for dialog in list(self._open_psd_dialogs):
             dialog.close()
-            
+        for dialog in list(self._open_theta_cycle_dialogs):
+            dialog.close()
+
         self.engine = new_engine
         self.trace_view.set_data_source(self.engine)
-        
+        self.trace_view.clear_theta_cycles()
+
         # Spike rasters belong to the old recording. Clear them and
         # blank the units panel until a new Phy folder is loaded.
         self.trace_view.set_raster_units([])
@@ -2029,10 +2083,15 @@ class MainWindow(QMainWindow):
             dialog.close()
         for dialog in list(self._open_ripple_dialogs):
             dialog.close()
+        for dialog in list(self._open_theta_cycle_dialogs):
+            dialog.close()
+
+
 
         self.engine = new_engine
         self.trace_view.set_data_source(self.engine)
         self.trace_view.clear_theta_epochs()
+        
 
         # Push the full probe geometry so CSD, depth sorting, and focus
         # neighborhoods are ready as soon as channels are picked.

@@ -43,10 +43,10 @@ from PyQt6.QtCore import Qt, pyqtSignal, QRectF
 from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QCursor, QPainterPath
 
 from core.ripple_detector import RippleEvent
-from gui.theta_epoch_trace_view import ThetaEpochTraceViewWidget
+#from gui.theta_epoch_trace_view import ThetaEpochTraceViewWidget
+from gui.theta_cycle_trace_view import ThetaCycleTraceViewWidget
 
-
-class RippleTraceViewWidget(ThetaEpochTraceViewWidget):
+class RippleTraceViewWidget(ThetaCycleTraceViewWidget):
     """TraceViewWidget with an interactive ripple-event overlay."""
 
     rippleEventsChanged = pyqtSignal(object)  # list[RippleEvent]

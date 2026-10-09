@@ -288,12 +288,12 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
         self._theta_merge_candidate = None
         self._theta_merge_candidates.clear()
         self._theta_selected_epoch = None
-        self._theta_creating_armed = False          # <-- add
-        self._theta_creating_channel = None         # <-- add
-        self._theta_creating_start_sample = None    # <-- add
-        self._theta_creating_end_sample = None      # <-- add
-        self._theta_undo_stack.clear()              # <-- add
-        self.unsetCursor()                          # <-- add
+        self._theta_creating_armed = False          
+        self._theta_creating_channel = None         
+        self._theta_creating_start_sample = None    
+        self._theta_creating_end_sample = None      
+        self._theta_undo_stack.clear()              
+        self.unsetCursor()                        
         self.update()
 
     # ------------------------------------------------------------------

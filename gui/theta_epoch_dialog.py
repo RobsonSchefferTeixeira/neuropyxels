@@ -219,6 +219,13 @@ class ThetaEpochDialog(QDialog):
         self.export_btn.setEnabled(False)
         btn_row.addWidget(self.export_btn)
 
+        self.export_all_btn = QPushButton("Export All Channels...")
+        self.export_all_btn.setAutoDefault(False)
+        self.export_all_btn.setDefault(False)
+        self.export_all_btn.clicked.connect(self._on_export_all_clicked)
+        self.export_all_btn.setEnabled(False)
+        btn_row.addWidget(self.export_all_btn)
+
         self.load_btn = QPushButton("Load CSV...")
         self.load_btn.setAutoDefault(False)
         self.load_btn.setDefault(False)
@@ -336,6 +343,11 @@ class ThetaEpochDialog(QDialog):
         self.add_epoch_btn.toggled.connect(self._on_add_epoch_toggled)
         grid.addWidget(self.add_epoch_btn, 5, 2, 1, 2)
         return grid
+    
+    def _refresh_export_buttons(self):
+        has = bool(self.epochs)
+        self.export_btn.setEnabled(has)
+        self.export_all_btn.setEnabled(has)
 
     def _on_detect_clicked(self):
         if not self.engine.data_loaded:
@@ -428,14 +440,16 @@ class ThetaEpochDialog(QDialog):
         self._sample_offset = int(info.get("sample_offset", 0))
         self.start_spin.setValue(self._detection_start_time)
         self._populate_table()
-        self.export_btn.setEnabled(bool(self.epochs))
+        # self.export_btn.setEnabled(bool(self.epochs))
+        self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
         self.status_label.setText(f"Found {len(self.epochs)} theta epochs.")
 
     def set_epochs_from_trace(self, epochs: list[ThetaEpoch]):
         self.epochs = sorted(list(epochs), key=lambda e: (e.channel, e.start_sample))
         self._populate_table()
-        self.export_btn.setEnabled(bool(self.epochs))
+        # self.export_btn.setEnabled(bool(self.epochs))
+        self._refresh_export_buttons()
         self.status_label.setText(f"{len(self.epochs)} theta epochs.")
         # A successful creation (or split, or drag/merge) coming back
         # from the trace view means creation mode -- if it was armed --
@@ -476,7 +490,8 @@ class ThetaEpochDialog(QDialog):
             return
         self.epochs.pop(row)
         self._populate_table()
-        self.export_btn.setEnabled(bool(self.epochs))
+        #self.export_btn.setEnabled(bool(self.epochs))
+        self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
         self.status_label.setText(f"{len(self.epochs)} theta epochs.")
 
@@ -556,7 +571,8 @@ class ThetaEpochDialog(QDialog):
         self._sample_offset = 0
         self._detection_start_time = 0.0
         self._populate_table()
-        self.export_btn.setEnabled(bool(self.epochs))
+        #self.export_btn.setEnabled(bool(self.epochs))
+        self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
         self.status_label.setText(f"Loaded {len(self.epochs)} theta epoch(s) from {path_str}.")
 
@@ -567,3 +583,28 @@ class ThetaEpochDialog(QDialog):
         if self.trace_view is not None and self.add_epoch_btn.isChecked():
             self.trace_view.cancel_theta_creation()
         super().closeEvent(event)
+
+    def _on_export_all_clicked(self):
+        if not self.epochs:
+            return
+        dir_str = QFileDialog.getExistingDirectory(
+            self, "Export All Channels To Folder"
+        )
+        if not dir_str:
+            return
+
+        # Group the flat list by channel right before export.
+        grouped: dict[int, list] = {}
+        for ep in self.epochs:
+            grouped.setdefault(ep.channel, []).append(ep)
+
+        from core.theta_epoch_export import export_theta_epochs_per_channel
+        try:
+            written = export_theta_epochs_per_channel(
+                grouped, self.engine.sr, self._sample_offset, dir_str,
+            )
+            self.status_label.setText(
+                f"Exported {len(written)} file(s) to {dir_str}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
