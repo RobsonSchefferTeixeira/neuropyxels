@@ -747,6 +747,7 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
                 return
 
             self._theta_cancel_drag()
+            self.thetaEpochsChanged.emit(self.theta_epochs)
             event.accept()
             return
 
