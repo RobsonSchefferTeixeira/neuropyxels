@@ -361,19 +361,96 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
                     path.lineTo(float(xi), float(yi))
             painter.drawPath(path)
 
+
+            # Draw a green highlight over the selected cycle's span, on top
+            # of the full filtered trace. This is the visual equivalent of the
+            # epoch overlay's "selected epoch" outline -- a local highlight,
+            # not a global recolor, so the rest of the trace stays soft orange
+            # and the user's eye goes straight to the highlighted cycle.
+            if self._theta_cycle_selected is not None:
+                sel = self.theta_cycles[self._theta_cycle_selected]
+                if sel.channel == channel:
+                    sel_lo = max(int(sel.zero_crossing_start), int(start_idx))
+                    sel_hi = min(int(sel.peak2), int(end_idx))
+                    if sel_hi > sel_lo:
+                        # Slice the filtered trace and the x pixel positions
+                        # over exactly the selected cycle's span.
+                        lo_local = sel_lo - int(start_idx)
+                        hi_local = sel_hi - int(start_idx)
+                        if 0 <= lo_local < hi_local <= filtered.size:
+                            xs_sel = x[lo_local:hi_local]
+                            ys_sel = y[lo_local:hi_local]
+                            finite_sel = finite_mask[lo_local:hi_local]
+
+                            painter.save()
+                            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                            hi_pen = QPen(CYCLE_SELECTED_COLOR,
+                                        self.theta_cycle_trace_width + 1.0)
+                            hi_pen.setCosmetic(True)
+                            painter.setPen(hi_pen)
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+                            sel_path = QPainterPath()
+                            started_sel = False
+                            for xi, yi, ok in zip(xs_sel, ys_sel, finite_sel):
+                                if not ok:
+                                    started_sel = False
+                                    continue
+                                if not started_sel:
+                                    sel_path.moveTo(float(xi), float(yi))
+                                    started_sel = True
+                                else:
+                                    sel_path.lineTo(float(xi), float(yi))
+                            painter.drawPath(sel_path)
+                            painter.restore()
+
+
+
+
             # Now the landmark circles. For each cycle, draw 6 circles
             # at the (x, y) that the filtered trace passes through at
             # each landmark sample.
-            for global_idx, cycle in indexed_cycles:
+            #
+            # Cycles are drawn unselected-first, selected-last, so a
+            # selected cycle's markers land on top of any markers it
+            # shares with an adjacent cycle (zc_end/peak2 of cycle N
+            # coincide with zc_start/peak1 of cycle N+1). Without this,
+            # the seam markers would be drawn in the following cycle's
+            # color even while the earlier cycle is selected, and the
+            # selected cycle would appear to be missing its last two
+            # markers.
+            sorted_cycles = sorted(
+                indexed_cycles,
+                key=lambda pair: (pair[0] == self._theta_cycle_selected),
+            )
+            for global_idx, cycle in sorted_cycles:
                 selected = (global_idx == self._theta_cycle_selected)
                 color = CYCLE_SELECTED_COLOR if selected else CYCLE_TRACE_COLOR
                 painter.setBrush(QBrush(color))
                 painter.setPen(QPen(CYCLE_MARKER_BORDER, 1.0))
                 r = self._cycle_marker_radius
 
-                for sample in self._cycle_unique_landmarks(global_idx):
+
+                # All 6 landmarks are drawn for every cycle, even though
+                # zc_end/peak2 of cycle N coincide with zc_start/peak1
+                # of cycle N+1. The overlap is intentional: when the
+                # user selects a cycle, all 6 of its markers turn green,
+                # including the two that sit on top of the next cycle's
+                # opening markers. The click-resolution rule (see
+                # _cycle_marker_at) decides which cycle a click selects
+                # at those overlaps -- always the later one, so the
+                # highlighted 6 stay consistent with the selected cycle.
+                for sample in (
+                    cycle.zero_crossing_start,
+                    cycle.peak1,
+                    cycle.zero_crossing_mid,
+                    cycle.valley,
+                    cycle.zero_crossing_end,
+                    cycle.peak2,
+                ):
                     if sample < start_idx or sample >= end_idx:
                         continue
+
                     try:
                         local = int(sample) - int(start_idx)
                         if local < 0 or local >= filtered.size:
@@ -397,46 +474,7 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
     # ------------------------------------------------------------------
     # Mouse / key handling
     # ------------------------------------------------------------------
-    def _cycle_unique_landmarks(self, cycle_index: int) -> list[int]:
-        """Return the landmarks of cycle `cycle_index` that are NOT shared
-        with the following cycle.
-
-        Because zc_end and peak2 of cycle N coincide (or nearly coincide)
-        with zc_start and peak1 of cycle N+1, drawing all six markers for
-        every cycle produces four duplicate markers at the seams between
-        adjacent cycles. Ownership rule: the later cycle owns the shared
-        markers, so each cycle draws only
-        [zc_start, peak1, zc_mid, valley]. The last cycle has no
-        successor, so it draws all six.
-        """
-        cycle = self.theta_cycles[cycle_index]
-        unique = [
-            cycle.zero_crossing_start,
-            cycle.peak1,
-            cycle.zero_crossing_mid,
-            cycle.valley,
-        ]
-
-        # Does a later cycle on the same channel start where this one ends?
-        shares_end = False
-        for other_idx, other in enumerate(self.theta_cycles):
-            if other_idx == cycle_index:
-                continue
-            if other.channel != cycle.channel:
-                continue
-            # Same channel, and the other cycle's start crossing is close
-            # to this cycle's end crossing -> shared markers.
-            if abs(other.zero_crossing_start - cycle.zero_crossing_end) <= 2:
-                shares_end = True
-                break
-
-        if not shares_end:
-            # No successor: this cycle draws its own closing markers too.
-            unique.append(cycle.zero_crossing_end)
-            unique.append(cycle.peak2)
-
-        return unique
-
+    
     def mousePressEvent(self, event):
         if (
             self.show_theta_cycles
@@ -463,11 +501,18 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
 
     def _cycle_marker_at(self, pos) -> int | None:
         """Return the index of the cycle whose nearest landmark circle
-        contains `pos`, or None."""
-        best_idx = None
-        best_dist2 = self._cycle_marker_hit_radius ** 2
+        contains `pos`, or None.
 
-        for i, cycle in enumerate(self.theta_cycles):
+        Iterates cycles in REVERSE order so that, when a marker position
+        is shared between cycle N (as zc_end/peak2) and cycle N+1 (as
+        zc_start/peak1), the LATER cycle wins. This is the "never go
+        backwards" selection rule: clicking a shared marker selects the
+        cycle that starts there, not the one that ends there.
+        """
+        hit_radius2 = self._cycle_marker_hit_radius ** 2
+
+        for i in range(len(self.theta_cycles) - 1, -1, -1):
+            cycle = self.theta_cycles[i]
             geom = self._cycle_channel_geometry(cycle.channel)
             if geom is None:
                 continue
@@ -486,7 +531,14 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
                 self.start_time, self.start_time + self.window_duration
             )
 
-            for sample in self._cycle_unique_landmarks(i):
+            for sample in (
+                cycle.zero_crossing_start,
+                cycle.peak1,
+                cycle.zero_crossing_mid,
+                cycle.valley,
+                cycle.zero_crossing_end,
+                cycle.peak2,
+            ):
                 if sample < start_idx or sample >= end_idx:
                     continue
                 local = int(sample) - int(start_idx)
@@ -500,12 +552,10 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
 
                 dx = pos.x() - xi
                 dy = pos.y() - yi
-                dist2 = dx * dx + dy * dy
-                if dist2 <= best_dist2:
-                    best_dist2 = dist2
-                    best_idx = i
+                if dx * dx + dy * dy <= hit_radius2:
+                    return i
 
-        return best_idx
+        return None
 
     def keyPressEvent(self, event):
         # Ctrl+Z: undo the last cycle deletion. Handled here (before
