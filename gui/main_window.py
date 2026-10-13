@@ -2146,6 +2146,26 @@ class MainWindow(QMainWindow):
                 self.trace_view._invalidate_cache()
                 self.trace_view._update_time_labels()
                 self.trace_view.update()
+
+                # Repopulate any open analysis dialogs that display
+                # time values derived from the engine's time base, so
+                # a timestamps file loaded AFTER a detection (or after
+                # a CSV load) is reflected on their tables immediately.
+                for dialog in self._open_theta_dialogs:
+                    try:
+                        dialog._populate_table()
+                    except Exception:
+                        pass
+                for dialog in self._open_theta_cycle_dialogs:
+                    try:
+                        dialog._populate_table()
+                    except Exception:
+                        pass
+                for dialog in self._open_ripple_dialogs:
+                    try:
+                        dialog._populate_summary_table()
+                    except Exception:
+                        pass
             else:
                 QMessageBox.warning(
                     self, "Invalid timestamps",

@@ -239,11 +239,15 @@ class ThetaEpochDialog(QDialog):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels([
-            "Channel", "Start (s)", "End (s)", "Duration (ms)",
-            "Mean Ratio", "Peak Ratio", "Theta Power"
+            "Channel",
+            "start_smp", "end_smp", "duration_smp",
+            "start_s", "end_s", "duration_s",
+            "mean_ratio", "peak_ratio",
+            "mean_theta_power", "mean_delta_power",
         ])
+
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -502,87 +506,68 @@ class ThetaEpochDialog(QDialog):
             return
         super().keyPressEvent(event)
 
-    def _sample_to_display_time(self, sample: int) -> float:
-        # Always sample/sr math -- never engine.timestamps -- so the
-        # table shows the same values whether or not timestamps.npy is
-        # loaded.
-        return self._detection_start_time + int(sample) / float(self.engine.sr)
 
     def _populate_table(self):
+        """Populate the table with the pooled epoch list. Sample
+        columns show in-memory (slice-relative) values offset into
+        absolute dat-file indices; time columns are recomputed from
+        the current engine every time this runs, so a timestamps file
+        loaded after detection is reflected on repopulation."""
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(len(self.epochs))
             self.table.clearSelection()
             self.delete_btn.setEnabled(False)
+
+            def t_abs(smp):
+                return float(self.engine.sample_to_time(smp))
+
             for row, epoch in enumerate(self.epochs):
-                start_time = self._sample_to_display_time(epoch.start_sample)
-                end_time = self._sample_to_display_time(epoch.end_sample)
+                start_smp = int(epoch.start_sample) + int(self._sample_offset)
+                end_smp = int(epoch.end_sample) + int(self._sample_offset)
+                dur_smp = end_smp - start_smp + 1
+
                 values = [
-                    str(epoch.channel), f"{start_time:.3f}", f"{end_time:.3f}",
-                    f"{epoch.duration_ms:.1f}", f"{epoch.mean_ratio:.3f}",
-                    f"{epoch.peak_ratio:.3f}", f"{epoch.mean_theta_power:.4f}",
+                    str(epoch.channel),
+                    str(start_smp),
+                    str(end_smp),
+                    str(dur_smp),
+                    f"{t_abs(start_smp):.3f}",
+                    f"{t_abs(end_smp):.3f}",
+                    f"{dur_smp / float(self.engine.sr):.3f}",
+                    f"{epoch.mean_ratio:.3f}",
+                    f"{epoch.peak_ratio:.3f}",
+                    f"{epoch.mean_theta_power:.4f}",
+                    f"{epoch.mean_delta_power:.4f}",
                 ]
                 for col, value in enumerate(values):
-                    self.table.setItem(row, col, QTableWidgetItem(value))
+                    item = QTableWidgetItem(value)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                        | Qt.AlignmentFlag.AlignVCenter
+                    )
+                    self.table.setItem(row, col, item)
         finally:
             self.table.blockSignals(False)
 
     def _on_export_clicked(self):
         if not self.epochs:
             return
-        path_str, _ = QFileDialog.getSaveFileName(self, "Export Theta Epochs", "", "CSV files (*.csv);;All files (*)")
-        if not path_str:
-            return
-        from core.theta_epoch_export import export_theta_epochs_to_csv
-        export_theta_epochs_to_csv(self.epochs, self.engine.sr, self._sample_offset, path_str)
-        self.status_label.setText(f"Exported to {path_str}")
-
-    def _on_load_clicked(self):
-        if not self.engine.data_loaded:
-            QMessageBox.warning(self, "No data loaded", "Load continuous.dat first.")
-            return
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, "Load Theta Epochs", "", "CSV files (*.csv);;All files (*)"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Export Theta Epochs",
+            "theta_epochs.csv",
+            "CSV files (*.csv);;All files (*)",
         )
         if not path_str:
             return
-
-        from core.theta_epoch_export import import_theta_epochs_from_csv
+        from core.theta_epoch_export import export_theta_epochs_to_csv
         try:
-            # Loaded CSVs store absolute (recording-global) sample
-            # positions -- see import_theta_epochs_from_csv's docstring.
-            # Interpreting them with sample_offset=0 means "start_sample"/
-            # "end_sample" on the loaded ThetaEpoch objects are themselves
-            # absolute recording-sample indices, matching how a freshly
-            # detected epoch would look if detection had been run from
-            # the very start of the recording (sample_offset=0). This is
-            # the only choice that doesn't depend on guessing what the
-            # dialog's current time-range fields should be.
-            epochs = import_theta_epochs_from_csv(path_str, sample_offset=0)
+            export_theta_epochs_to_csv(
+                self.epochs, self._sample_offset, self.engine, path_str,
+            )
+            self.status_label.setText(f"Exported to {path_str}")
         except Exception as exc:
-            QMessageBox.critical(self, "Failed to load", f"Could not read {path_str}:\n\n{exc}")
-            return
-
-        if not epochs:
-            QMessageBox.information(self, "No epochs found", f"{path_str} contains no theta epochs.")
-            return
-
-        self.epochs = epochs
-        self._sample_offset = 0
-        self._detection_start_time = 0.0
-        self._populate_table()
-        #self.export_btn.setEnabled(bool(self.epochs))
-        self._refresh_export_buttons()
-        self.epochsChanged.emit(self.epochs)
-        self.status_label.setText(f"Loaded {len(self.epochs)} theta epoch(s) from {path_str}.")
-
-    def closeEvent(self, event):
-        if self._detect_thread is not None and self._detect_thread.isRunning():
-            self._detect_thread.request_cancel()
-            self._detect_thread.wait(2000)
-        if self.trace_view is not None and self.add_epoch_btn.isChecked():
-            self.trace_view.cancel_theta_creation()
-        super().closeEvent(event)
+            QMessageBox.critical(self, "Export failed", str(exc))
 
     def _on_export_all_clicked(self):
         if not self.epochs:
@@ -592,19 +577,66 @@ class ThetaEpochDialog(QDialog):
         )
         if not dir_str:
             return
-
-        # Group the flat list by channel right before export.
         grouped: dict[int, list] = {}
         for ep in self.epochs:
             grouped.setdefault(ep.channel, []).append(ep)
-
         from core.theta_epoch_export import export_theta_epochs_per_channel
         try:
             written = export_theta_epochs_per_channel(
-                grouped, self.engine.sr, self._sample_offset, dir_str,
+                grouped, self._sample_offset, self.engine, dir_str,
             )
             self.status_label.setText(
                 f"Exported {len(written)} file(s) to {dir_str}"
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
+
+    def _on_load_clicked(self):
+        if not self.engine.data_loaded:
+            QMessageBox.warning(self, "No data loaded",
+                                "Load continuous.dat first.")
+            return
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Load Theta Epochs", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not path_str:
+            return
+
+        from core.theta_epoch_export import import_theta_epochs_from_csv
+        try:
+            # CSVs store absolute sample indices. The dialog expects
+            # slice-relative values in memory, so subtract the current
+            # _sample_offset to convert back. If the dialog has no
+            # detection window yet (offset 0), the epochs remain
+            # absolute -- that's the correct behavior for a fresh
+            # session, since the epoch's absolute position is what the
+            # trace view needs.
+            epochs = import_theta_epochs_from_csv(
+                path_str, sample_offset=self._sample_offset,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to load",
+                                 f"Could not read {path_str}:\n\n{exc}")
+            return
+
+        if not epochs:
+            QMessageBox.information(self, "No epochs found",
+                                    f"{path_str} contains no theta epochs.")
+            return
+
+        self.epochs = epochs
+        self._populate_table()
+        self._refresh_export_buttons()
+        self.epochsChanged.emit(self.epochs)
+        self.status_label.setText(
+            f"Loaded {len(self.epochs)} theta epoch(s) from {path_str}."
+        )
+
+    def closeEvent(self, event):
+        if self._detect_thread is not None and self._detect_thread.isRunning():
+            self._detect_thread.request_cancel()
+            self._detect_thread.wait(2000)
+        if self.trace_view is not None and self.add_epoch_btn.isChecked():
+            self.trace_view.cancel_theta_creation()
+        super().closeEvent(event)
+

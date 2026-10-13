@@ -34,7 +34,7 @@ from core.theta_cycle_detector import (
     ThetaCycleDetector, ThetaCycleParams, ThetaCycle,
 )
 from core.theta_cycle_export import (
-    export_cycles_to_csv, export_cycles_per_channel, read_cycles_from_csv,
+    export_cycles_to_csv, read_cycles_from_csv,
 )
 from core.trace_engine import TraceEngine
 from gui.theta_cycle_trace_view import ThetaCycleTraceViewWidget
@@ -126,7 +126,6 @@ class ThetaCycleDialog(QDialog):
         self.cycles_by_channel: dict[int, list[ThetaCycle]] = {}
         self._selected_channel: int | None = None
         self._selected_index: int | None = None
-        self._sample_offset = 0
 
         self._build_ui()
         self._sync_time_range_from_engine()
@@ -161,24 +160,16 @@ class ThetaCycleDialog(QDialog):
         btn_row.addWidget(self.progress_label, stretch=1)
         layout.addLayout(btn_row)
 
-        # ---- Channel selector + table ----
-        sel_row = QHBoxLayout()
-        sel_row.addWidget(QLabel("Channel:"))
-        self.channel_combo = QComboBox()
-        self.channel_combo.setMinimumWidth(120)
-        self.channel_combo.setEnabled(False)
-        self.channel_combo.currentIndexChanged.connect(
-            self._on_channel_dropdown_changed
-        )
-        sel_row.addWidget(self.channel_combo)
-        sel_row.addStretch(1)
-        layout.addLayout(sel_row)
-
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 18)
         self.table.setHorizontalHeaderLabels([
-            "#", "Start (s)", "Peak1 (s)", "Valley (s)", "End (s)",
-            "Duration (ms)", "Amp (µV)", "θ/δ", "fast/θ",
+            "Channel",
+            "zc_start_smp", "peak1_smp", "zc_mid_smp", "valley_smp",
+            "zc_end_smp", "peak2_smp", "duration_smp",
+            "zc_start_s", "peak1_s", "zc_mid_s", "valley_s", "zc_end_s",
+            "peak2_s", "duration_s",
+            "amp", "θ/δ", "fast/θ",
         ])
+
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
@@ -218,16 +209,14 @@ class ThetaCycleDialog(QDialog):
         layout.addLayout(nav_row)
 
         # ---- Export / load ----
+        # One export button, matching the theta epoch dialog: everything
+        # goes into a single CSV, with a channel column inside. No
+        # per-channel split, no channel suffix in the filename.
         io_row = QHBoxLayout()
-        self.export_this_btn = QPushButton("Export This Channel...")
-        self.export_this_btn.setAutoDefault(False)
-        self.export_this_btn.clicked.connect(self._on_export_this_clicked)
-        io_row.addWidget(self.export_this_btn)
-
-        self.export_all_btn = QPushButton("Export All Channels...")
-        self.export_all_btn.setAutoDefault(False)
-        self.export_all_btn.clicked.connect(self._on_export_all_clicked)
-        io_row.addWidget(self.export_all_btn)
+        self.export_btn = QPushButton("Export CSV...")
+        self.export_btn.setAutoDefault(False)
+        self.export_btn.clicked.connect(self._on_export_clicked)
+        io_row.addWidget(self.export_btn)
 
         self.load_btn = QPushButton("Load CSV...")
         self.load_btn.setAutoDefault(False)
@@ -436,7 +425,6 @@ class ThetaCycleDialog(QDialog):
         self.progress_label.setText("")
         self.status_label.setText("Running detection...")
 
-        self._sample_offset = int(self.start_spin.value() * self.engine.sr)
 
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
@@ -463,60 +451,57 @@ class ThetaCycleDialog(QDialog):
         self.detect_btn.setText("Detect Theta Cycles")
         self.progress_label.setText("")
         self.cycles_by_channel = results
-        self._refresh_channel_dropdown()
-        # Pick the first channel that actually has cycles.
-        first_with_cycles = next(
-            (ch for ch, cyc in results.items() if cyc), None,
-        )
-        if first_with_cycles is not None:
-            idx = self.channel_combo.findData(first_with_cycles)
-            if idx >= 0:
-                self.channel_combo.setCurrentIndex(idx)
+        self._populate_table()
         self._push_flat_cycles_to_trace()
         total = sum(len(v) for v in results.values())
+        n_ch = sum(1 for v in results.values() if v)
         self.status_label.setText(
-            f"Detected {total} cycle(s) across {len(results)} channel(s)."
+            f"Detected {total} cycle(s) across {n_ch} channel(s)."
         )
 
     # ------------------------------------------------------------------
     # Channel dropdown + table
     # ------------------------------------------------------------------
 
-    def _refresh_channel_dropdown(self):
-        self.channel_combo.blockSignals(True)
-        current = self.channel_combo.currentData()
-        self.channel_combo.clear()
-        for ch in sorted(self.cycles_by_channel.keys()):
-            n = len(self.cycles_by_channel[ch])
-            self.channel_combo.addItem(f"CH{ch} ({n})", ch)
-        if current is not None:
-            idx = self.channel_combo.findData(current)
-            if idx >= 0:
-                self.channel_combo.setCurrentIndex(idx)
-        self.channel_combo.setEnabled(self.channel_combo.count() > 0)
-        self.channel_combo.blockSignals(False)
-
-    def _on_channel_dropdown_changed(self, _index: int):
-        ch = self.channel_combo.currentData()
-        self._selected_channel = ch if ch is not None else None
-        self._populate_table()
 
     def _populate_table(self):
+        """Populate the pooled table. Time columns are derived from
+        the current engine's time base every time this runs, so a
+        timestamps file loaded after detection (or after a CSV load)
+        is reflected on the next repopulation without any explicit
+        'recompute' step."""
+        flat = self._flat_cycles()
         self.table.blockSignals(True)
         try:
-            if self._selected_channel is None:
-                self.table.setRowCount(0)
-                return
-            cycles = self.cycles_by_channel.get(self._selected_channel, [])
-            self.table.setRowCount(len(cycles))
-            for row, c in enumerate(cycles):
+            self.table.setRowCount(len(flat))
+            for row, c in enumerate(flat):
+                zc_start = int(c.zero_crossing_start)
+                peak1 = int(c.peak1)
+                zc_mid = int(c.zero_crossing_mid)
+                valley = int(c.valley)
+                zc_end = int(c.zero_crossing_end)
+                peak2 = int(c.peak2)
+                dur_smp = zc_end - zc_start
+
+                def t(smp):
+                    return float(self.engine.sample_to_time(smp))
+
                 vals = [
-                    str(row),
-                    f"{c.zero_crossing_start / self.engine.sr:.3f}",
-                    f"{c.peak1 / self.engine.sr:.3f}",
-                    f"{c.valley / self.engine.sr:.3f}",
-                    f"{c.zero_crossing_end / self.engine.sr:.3f}",
-                    f"{c.duration_ms:.1f}",
+                    str(c.channel),
+                    str(zc_start),
+                    str(peak1),
+                    str(zc_mid),
+                    str(valley),
+                    str(zc_end),
+                    str(peak2),
+                    str(dur_smp),
+                    f"{t(zc_start):.3f}",
+                    f"{t(peak1):.3f}",
+                    f"{t(zc_mid):.3f}",
+                    f"{t(valley):.3f}",
+                    f"{t(zc_end):.3f}",
+                    f"{t(peak2):.3f}",
+                    f"{dur_smp / float(self.engine.sr):.3f}",
                     f"{c.amplitude:.3g}",
                     "" if c.theta_delta_ratio is None
                         else f"{c.theta_delta_ratio:.3f}",
@@ -524,7 +509,13 @@ class ThetaCycleDialog(QDialog):
                         else f"{c.fast_theta_ratio:.3f}",
                 ]
                 for col, v in enumerate(vals):
-                    self.table.setItem(row, col, QTableWidgetItem(v))
+                    item = QTableWidgetItem(v)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                        | Qt.AlignmentFlag.AlignVCenter
+                    )
+                    self.table.setItem(row, col, item)
+            self.table.clearSelection()
         finally:
             self.table.blockSignals(False)
 
@@ -546,22 +537,18 @@ class ThetaCycleDialog(QDialog):
             return
         row = rows[0].row()
         self._selected_index = row
-        # Find the corresponding index in the trace view's flat list.
-        ch = self._selected_channel
-        if ch is None:
-            return
-        cycles = self.cycles_by_channel.get(ch, [])
-        if not (0 <= row < len(cycles)):
-            return
-        target = cycles[row]
+
         flat = self._flat_cycles()
-        for i, c in enumerate(flat):
-            if c is target:
-                self.trace_view.set_theta_cycle_selected(i)
-                self.cycleSelected.emit(i)
-                break
-        # Auto-add the channel to the trace view if not visible.
-        self._ensure_channel_visible(ch)
+        if not (0 <= row < len(flat)):
+            return
+        target = flat[row]
+
+        self.trace_view.set_theta_cycle_selected(row)
+        self.cycleSelected.emit(row)
+
+        # Auto-add the channel to the trace view if not already displayed,
+        # same as the ripple dialog does.
+        self._ensure_channel_visible(target.channel)
 
     def _ensure_channel_visible(self, channel: int):
         if channel not in self.trace_view.channels:
@@ -572,42 +559,29 @@ class ThetaCycleDialog(QDialog):
             self.trace_view.update()
 
     def set_selected_cycle(self, flat_index: int):
-        """Slot for trace_view.thetaCycleSelected -- a cycle was clicked
-        on the trace view. Update the table's selection to match."""
+        """Slot for trace_view.thetaCycleSelected -- a cycle was clicked on
+        the trace view. Row index in the table equals flat_index, so
+        selection is a direct lookup."""
         flat = self._flat_cycles()
         if not (0 <= flat_index < len(flat)):
             return
-        target = flat[flat_index]
-        self._selected_channel = target.channel
-        idx = self.channel_combo.findData(target.channel)
-        if idx >= 0 and self.channel_combo.currentIndex() != idx:
-            self.channel_combo.blockSignals(True)
-            self.channel_combo.setCurrentIndex(idx)
-            self.channel_combo.blockSignals(False)
-            self._populate_table()
-        cycles = self.cycles_by_channel.get(target.channel, [])
-        for row, c in enumerate(cycles):
-            if c is target:
-                self.table.blockSignals(True)
-                self.table.selectRow(row)
-                self.table.blockSignals(False)
-                break
+        self.table.blockSignals(True)
+        self.table.selectRow(flat_index)
+        self.table.blockSignals(False)
+        self._selected_index = flat_index
 
     def set_cycles_from_trace(self, cycles: list):
         """Slot for trace_view.thetaCyclesChanged -- a cycle was deleted
         or an undo happened on the trace view. Regroup into
-        cycles_by_channel and refresh the table + dropdown."""
+        cycles_by_channel and refresh the table."""
         regrouped: dict[int, list[ThetaCycle]] = {}
         for c in cycles:
             regrouped.setdefault(c.channel, []).append(c)
-        # Keep channels that had cycles but now have none, so the
-        # dropdown doesn't silently drop them.
         for ch in list(self.cycles_by_channel.keys()):
             regrouped.setdefault(ch, [])
         for ch in regrouped:
             regrouped[ch].sort(key=lambda c: c.zero_crossing_start)
         self.cycles_by_channel = regrouped
-        self._refresh_channel_dropdown()
         self._populate_table()
 
     # ------------------------------------------------------------------
@@ -615,31 +589,35 @@ class ThetaCycleDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _step_cycle(self, direction: int):
-        if self._selected_channel is None:
-            QMessageBox.information(
-                self, "No channel selected",
-                "Pick a channel from the dropdown first.",
-            )
+        flat = self._flat_cycles()
+        if not flat:
             return
-        cycles = self.cycles_by_channel.get(self._selected_channel, [])
-        if not cycles:
-            return
-        self._ensure_channel_visible(self._selected_channel)
 
-        # Target based on the current view center.
-        sr = self.engine.sr
-        center_time = self.trace_view.start_time + self.trace_view.window_duration / 2
-        center_sample = int(center_time * sr)
+        # Determine the current position.
+        if self._selected_index is not None and 0 <= self._selected_index < len(flat):
+            current_cycle = flat[self._selected_index]
+            current_ch = current_cycle.channel
+            current_zc = current_cycle.zero_crossing_start
+        else:
+            current_ch = flat[0].channel
+            current_zc = 0
+
+        # Cycles on the same channel, ordered by zc_start.
+        same_ch = [c for c in flat if c.channel == current_ch]
+        if not same_ch:
+            return
 
         if direction > 0:
-            candidates = [c for c in cycles if c.zero_crossing_start > center_sample]
-            target = candidates[0] if candidates else cycles[-1]
+            candidates = [c for c in same_ch if c.zero_crossing_start > current_zc]
+            target = candidates[0] if candidates else same_ch[-1]
         else:
-            candidates = [c for c in cycles if c.zero_crossing_start < center_sample]
-            target = candidates[-1] if candidates else cycles[0]
+            candidates = [c for c in same_ch if c.zero_crossing_start < current_zc]
+            target = candidates[-1] if candidates else same_ch[0]
+
+        self._ensure_channel_visible(target.channel)
 
         # Center the view on the target's peak1.
-        peak_time = target.peak1 / sr
+        peak_time = target.peak1 / self.engine.sr
         window = max(0.05, self.nav_window_spin.value())
         new_start = max(0.0, peak_time - window / 2)
 
@@ -650,56 +628,44 @@ class ThetaCycleDialog(QDialog):
         self.trace_view._invalidate_cache()
         self.trace_view.update()
 
-        # Highlight it in both table and overlay.
-        flat = self._flat_cycles()
+        # Select it in table + overlay.
         for i, c in enumerate(flat):
             if c is target:
                 self.trace_view.set_theta_cycle_selected(i)
                 self.cycleSelected.emit(i)
+                self.table.blockSignals(True)
+                self.table.selectRow(i)
+                self.table.blockSignals(False)
+                self._selected_index = i
                 break
-        self.set_selected_cycle(flat.index(target))
-
     # ------------------------------------------------------------------
     # Export / import
     # ------------------------------------------------------------------
-
-    def _on_export_this_clicked(self):
-        if self._selected_channel is None:
-            QMessageBox.information(self, "No channel selected",
-                                    "Pick a channel first.")
+    def _on_export_clicked(self):
+        """Write every cycle from every channel into a single CSV.
+        Cycles are stored with absolute sample indices in memory, so
+        no offset is applied here. The engine supplies the time base
+        for the *_s columns."""
+        if not self.cycles_by_channel or not any(self.cycles_by_channel.values()):
+            QMessageBox.information(
+                self, "Nothing to export",
+                "Run detection (or load a CSV) first."
+            )
             return
-        cycles = self.cycles_by_channel.get(self._selected_channel, [])
+
         path_str, _ = QFileDialog.getSaveFileName(
             self, "Export Theta Cycles",
-            f"theta_cycles_channel{self._selected_channel}.csv",
+            "theta_cycles.csv",
             "CSV files (*.csv);;All files (*)",
         )
         if not path_str:
             return
-        try:
-            export_cycles_to_csv(cycles, self._sample_offset, path_str)
-            self.status_label.setText(
-                f"Exported {len(cycles)} cycle(s) to {path_str}"
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
 
-    def _on_export_all_clicked(self):
-        if not self.cycles_by_channel:
-            QMessageBox.information(self, "Nothing to export",
-                                    "Run detection first.")
-            return
-        dir_str = QFileDialog.getExistingDirectory(
-            self, "Export All Channels To Folder"
-        )
-        if not dir_str:
-            return
+        flat = self._flat_cycles()
         try:
-            written = export_cycles_per_channel(
-                self.cycles_by_channel, self._sample_offset, dir_str,
-            )
+            export_cycles_to_csv(flat, self.engine, path_str)
             self.status_label.setText(
-                f"Exported {len(written)} file(s) to {dir_str}"
+                f"Exported {len(flat)} cycle(s) to {path_str}"
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
@@ -723,17 +689,21 @@ class ThetaCycleDialog(QDialog):
             QMessageBox.information(self, "No cycles found",
                                     f"{path_str} contains no cycles.")
             return
-        # Merge into cycles_by_channel.
+        # CSV sample indices are already absolute; merge as-is.
         for c in cycles:
             self.cycles_by_channel.setdefault(c.channel, []).append(c)
         for ch in self.cycles_by_channel:
-            self.cycles_by_channel[ch].sort(key=lambda c: c.zero_crossing_start)
-        self._refresh_channel_dropdown()
+            self.cycles_by_channel[ch].sort(
+                key=lambda c: c.zero_crossing_start
+            )
         self._populate_table()
         self._push_flat_cycles_to_trace()
         self.status_label.setText(
             f"Loaded {len(cycles)} cycle(s) from {path_str}."
         )
+
+
+        
 
     # ------------------------------------------------------------------
     # Cleanup
