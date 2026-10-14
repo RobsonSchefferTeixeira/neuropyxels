@@ -48,24 +48,23 @@ class _DetectThread(QThread):
     failed = pyqtSignal(str)
     progress = pyqtSignal(int, int)
 
-    def __init__(self, channels, raw_data, sample_rate, start_time,
-                 end_time, params, parent=None):
+    def __init__(self, channels, raw_data, sample_rate, start_idx, end_idx, params, parent=None):
         super().__init__(parent)
         self.channels = channels
         self.raw_data = raw_data
         self.sample_rate = float(sample_rate)
-        self.start_time = float(start_time)
-        self.end_time = float(end_time)
+        # Sample indices, already resolved by the dialog against the
+        # engine's current time base. See theta_epoch_dialog for the
+        # same pattern.
+        self.start_idx = int(start_idx)
+        self.end_idx = int(end_idx)
         self.params = params
         self.detector = ThetaCycleDetector()
 
     def run(self):
         try:
-            start_idx = max(0, int(self.start_time * self.sample_rate))
-            end_idx = min(
-                self.raw_data.shape[0],
-                int(self.end_time * self.sample_rate),
-            )
+            start_idx = max(0, self.start_idx)
+            end_idx = min(self.raw_data.shape[0], self.end_idx)
             if start_idx >= end_idx:
                 raise ValueError("Invalid time range for detection.")
 
@@ -346,11 +345,29 @@ class ThetaCycleDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _sync_time_range_from_engine(self):
-        if self.engine.data_loaded:
-            self.start_spin.setRange(0.0, self.engine.total_duration)
-            self.end_spin.setRange(0.01, self.engine.total_duration)
-            self.end_spin.setValue(min(10.0, self.engine.total_duration))
+        """Spinbox bounds follow the engine's current time base: clock
+        values when a timestamps.npy is loaded, elapsed seconds
+        otherwise. Called from __init__ and by MainWindow whenever the
+        timestamps state changes after the dialog was opened."""
+        if not self.engine.data_loaded:
+            return
+        t_min, t_max = self.engine.get_time_range()
+        self.start_spin.blockSignals(True)
+        self.end_spin.blockSignals(True)
+        self.start_spin.setRange(t_min, t_max)
+        self.end_spin.setRange(t_min + 1e-3, t_max)
+        span = t_max - t_min
+        self.start_spin.setValue(t_min)
+        self.end_spin.setValue(t_min + min(10.0, max(0.0, span)))
+        self.start_spin.blockSignals(False)
+        self.end_spin.blockSignals(False)
 
+    def on_engine_time_base_changed(self):
+        """Called by MainWindow when a timestamps.npy is loaded after
+        the dialog opened. Re-syncs spinbox bounds and repopulates the
+        table so *_s columns reflect the new time base."""
+        self._sync_time_range_from_engine()
+        self._populate_table()
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
@@ -426,11 +443,14 @@ class ThetaCycleDialog(QDialog):
         self.status_label.setText("Running detection...")
 
 
+        start_idx = self.engine.timestamp_to_sample(self.start_spin.value())
+        end_idx = self.engine.timestamp_to_sample(self.end_spin.value())
+
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
-            self.start_spin.value(), self.end_spin.value(),
-            params, parent=self,
+            start_idx, end_idx, params, parent=self,
         )
+
         self._detect_thread.progress.connect(self._on_progress)
         self._detect_thread.finished_ok.connect(self._on_detect_finished)
         self._detect_thread.failed.connect(self._on_detect_failed)
@@ -616,10 +636,14 @@ class ThetaCycleDialog(QDialog):
 
         self._ensure_channel_visible(target.channel)
 
-        # Center the view on the target's peak1.
-        peak_time = target.peak1 / self.engine.sr
+        # Center the view on the target's peak1. The trace view's
+        # start_time is in the engine's current time base (clock if
+        # timestamps loaded), so use sample_to_time rather than
+        # sample / sr.
+        peak_time = float(self.engine.sample_to_time(int(target.peak1)))
         window = max(0.05, self.nav_window_spin.value())
-        new_start = max(0.0, peak_time - window / 2)
+        t_min, t_max = self.engine.get_time_range()
+        new_start = max(t_min, peak_time - window / 2)
 
         self.trace_view.window_duration = window
         self.trace_view.start_time = new_start

@@ -33,8 +33,8 @@ class _DetectThread(QThread):
         channels: list[int],
         raw_data,
         sample_rate: float,
-        start_time: float,
-        end_time: float,
+        start_idx: int,
+        end_idx: int,
         params: ThetaEpochParams,
         filter_settings=None,
         parent=None,
@@ -43,8 +43,12 @@ class _DetectThread(QThread):
         self.channels = channels
         self.raw_data = raw_data
         self.sample_rate = float(sample_rate)
-        self.start_time = float(start_time)
-        self.end_time = float(end_time)
+        # Absolute sample indices, not times. The dialog converts the
+        # spinbox's time-base values to samples (timestamp-aware) before
+        # spawning the thread, so the thread never has to guess which
+        # time basis the caller is working in.
+        self.start_idx = int(start_idx)
+        self.end_idx = int(end_idx)
         self.params = params
         self.filter_settings = dict(filter_settings or {})
         self.detector = ThetaEpochDetector()
@@ -57,17 +61,23 @@ class _DetectThread(QThread):
     def cancel_requested(self):
         return self._cancel_requested
 
-    def _time_to_indices(self):
-        # Always sample-indexed (sample = round(time * sample_rate)),
-        # regardless of whether a timestamps.npy is loaded on the
-        # engine. Theta epoch detection/positioning must be identical
-        # whether or not the user has loaded timestamps -- timestamps
-        # are purely a display concern elsewhere, never load-bearing
-        # for indexing here.
-        start_idx = max(0, int(np.floor(self.start_time * self.sample_rate)))
-        end_idx = min(self.raw_data.shape[0], int(np.ceil(self.end_time * self.sample_rate)))
-        return start_idx, end_idx, start_idx / self.sample_rate, max(start_idx, end_idx - 1) / self.sample_rate
 
+
+    def _time_to_indices(self):
+        """The dialog has already resolved the analysis window to
+        absolute sample indices. Clip to the recording and return them
+        along with their elapsed-time equivalents (used only for the
+        info dict's start_time/end_time fields, which the dialog
+        consumes for display)."""
+        start_idx = max(0, self.start_idx)
+        end_idx = min(self.raw_data.shape[0], self.end_idx)
+        return (
+            start_idx,
+            end_idx,
+            start_idx / self.sample_rate,
+            max(start_idx, end_idx - 1) / self.sample_rate,
+        )
+    
     def _apply_trace_view_filters(self, signal: np.ndarray) -> np.ndarray:
         """Apply the same trace-view preprocessing that was active when detection started."""
         settings = self.filter_settings
@@ -161,39 +171,76 @@ class ThetaEpochDialog(QDialog):
         self.epochs: list[ThetaEpoch] = []
         self._detection_start_time = 0.0
         self._sample_offset = 0
-        self._available_min_time, self._available_max_time = self._get_available_time_range()
+        self._available_min_time = 0.0
+        self._available_max_time = 0.0
 
         self._build_ui()
 
         if initial_channels:
             self.channel_edit.setText(",".join(str(c) for c in initial_channels))
 
+        self._sync_time_range_from_engine()
         self._set_default_range()
 
     def _get_available_time_range(self):
-        # Sample-indexed only (0 to total_duration via sample_rate),
-        # regardless of whether timestamps.npy is loaded -- see
-        # _DetectThread._time_to_indices for why.
-        return 0.0, float(getattr(self.engine, "total_duration", 0.0))
-
+        """Return (t_min, t_max) in the current time base. When a
+        timestamps.npy is loaded this is [first_timestamp, last_timestamp];
+        otherwise it is [0, total_duration]. The spinboxes and the
+        range-info label use this so they stay consistent with the
+        trace view's axis."""
+        if not self.engine.data_loaded:
+            return 0.0, 0.0
+        return self.engine.get_time_range()
+    
     def _set_default_range(self):
-        """Initial analysis window: 0-10s (clamped to whatever's
-        actually available for short recordings), NOT the full
-        recording -- "Full available range" is an explicit opt-in via
-        its own button, not the dialog's default."""
-        default_end = min(10.0, self._available_max_time) if self._available_max_time > 0 else 10.0
+        """Initial analysis window: 10 seconds from the start of the
+        available range (clamped for short recordings). The spinbox
+        min/max have already been set by _sync_time_range_from_engine,
+        so here we only need to pick reasonable values inside them."""
+        span = self._available_max_time - self._available_min_time
+        default_end = self._available_min_time + min(10.0, max(0.0, span))
         self.start_spin.setValue(self._available_min_time)
         self.end_spin.setValue(default_end)
         self.range_info_label.setText(
-            f"Available: {self._available_min_time:.3f} \u2013 {self._available_max_time:.3f} s"
+            f"Available: {self._available_min_time:.3f} \u2013 "
+            f"{self._available_max_time:.3f} s"
         )
 
+    def _sync_time_range_from_engine(self):
+        """Refresh the spinbox min/max and the available-range label
+        from the engine's current time base. Called from __init__ and
+        again by MainWindow whenever a timestamps.npy is loaded after
+        the dialog was opened."""
+        self._available_min_time, self._available_max_time = \
+            self._get_available_time_range()
+        if self._available_max_time <= self._available_min_time:
+            return
+        self.start_spin.blockSignals(True)
+        self.end_spin.blockSignals(True)
+        self.start_spin.setRange(self._available_min_time, self._available_max_time)
+        self.end_spin.setRange(
+            self._available_min_time + 1e-3, self._available_max_time
+        )
+        self.start_spin.blockSignals(False)
+        self.end_spin.blockSignals(False)
+        self.range_info_label.setText(
+            f"Available: {self._available_min_time:.3f} \u2013 "
+            f"{self._available_max_time:.3f} s"
+        )
+
+    def on_engine_time_base_changed(self):
+        """Called by MainWindow when a timestamps.npy is loaded (or
+        replaced) after the dialog opened. Re-syncs the spinbox bounds
+        to the new time base and repopulates the table so *_s columns
+        reflect the new values. Sample columns are untouched."""
+        self._sync_time_range_from_engine()
+        self._populate_table()
+        
     def _set_full_available_range(self):
+        self._available_min_time, self._available_max_time = self._get_available_time_range()
         self.start_spin.setValue(self._available_min_time)
         self.end_spin.setValue(self._available_max_time)
-        self.range_info_label.setText(
-            f"Available: {self._available_min_time:.3f} – {self._available_max_time:.3f} s"
-        )
+
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -399,11 +446,23 @@ class ThetaEpochDialog(QDialog):
                 "detrend": bool(getattr(self.trace_view, "detrend_enabled", False)),
             }
 
+        # Convert the spinbox values (which are in the engine's current
+        # time base -- clock if timestamps are loaded, elapsed
+        # otherwise) to absolute sample indices here, once, so both the
+        # thread's slicing and the offset we record for later use agree.
+        start_idx = self.engine.timestamp_to_sample(self.start_spin.value())
+        end_idx = self.engine.timestamp_to_sample(self.end_spin.value())
+        # Record the offset up-front so a mid-detection dialog close
+        # still leaves the value in a sane state for any pending
+        # export / display.
+        self._sample_offset = int(start_idx)
+
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
-            self.start_spin.value(), self.end_spin.value(), params,
+            start_idx, end_idx, params,
             filter_settings=filter_settings, parent=self,
         )
+
         self._detect_thread.progress.connect(self._on_detection_progress)
         self._detect_thread.finished_ok.connect(self._on_detect_finished)
         self._detect_thread.failed.connect(self._on_detect_failed)

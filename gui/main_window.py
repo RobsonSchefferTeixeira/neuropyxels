@@ -2146,19 +2146,27 @@ class MainWindow(QMainWindow):
                 self.trace_view._invalidate_cache()
                 self.trace_view._update_time_labels()
                 self.trace_view.update()
+                # import pdb
+                # pdb.set_trace()
 
                 # Repopulate any open analysis dialogs that display
                 # time values derived from the engine's time base, so
                 # a timestamps file loaded AFTER a detection (or after
                 # a CSV load) is reflected on their tables immediately.
+                # Notify every open dialog that the engine's time base
+                # changed. Dialogs that display time values (epochs,
+                # cycles) re-sync their spinbox bounds and repopulate
+                # their tables, so both the *_s columns and the
+                # available-range labels follow the timestamps file
+                # without the user having to reopen the dialog.
                 for dialog in self._open_theta_dialogs:
                     try:
-                        dialog._populate_table()
+                        dialog.on_engine_time_base_changed()
                     except Exception:
                         pass
                 for dialog in self._open_theta_cycle_dialogs:
                     try:
-                        dialog._populate_table()
+                        dialog.on_engine_time_base_changed()
                     except Exception:
                         pass
                 for dialog in self._open_ripple_dialogs:

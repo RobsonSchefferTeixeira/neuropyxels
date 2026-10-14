@@ -375,12 +375,12 @@ class RippleTraceViewWidget(ThetaCycleTraceViewWidget):
     def _ripple_context_for(self, channel: int) -> dict | None:
         return self._ripple_render_context.get(channel)
 
+
     def _ripple_event_time(self, event: RippleEvent, sample: int) -> float:
         ctx = self._ripple_context_for(event.channel)
         sample_offset = int(ctx.get("sample_offset", 0)) if ctx else 0
-        sample_rate = float(ctx.get("sample_rate", self.engine.sr)) if ctx else self.engine.sr
         global_sample = sample_offset + int(sample)
-        return global_sample / float(sample_rate)
+        return float(self.engine.sample_to_time(global_sample))
 
     def _ripple_time_to_x(self, time: float) -> float:
         plot_left, plot_right, _ = self._get_plot_bounds()

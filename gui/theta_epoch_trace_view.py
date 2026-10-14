@@ -113,11 +113,21 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
     ):
         self.theta_epochs = list(epochs or [])
         self.theta_detection_start_time = float(detection_start_time)
+
+        # Prefer an explicit offset when the caller supplies one --
+        # MainWindow passes the dialog's _sample_offset, which the
+        # dialog computed via engine.timestamp_to_sample and is
+        # therefore correct under either time base. Only fall back to
+        # computing from detection_start_time * sr when no offset was
+        # given, and even then use timestamp_to_sample rather than a
+        # naive multiply so a timestamps-loaded engine doesn't produce
+        # a bogus offset.
         if detection_sample_offset is None:
-            detection_sample_offset = int(
-                round(self.theta_detection_start_time * self.engine.sr)
+            detection_sample_offset = self.engine.timestamp_to_sample(
+                self.theta_detection_start_time
             )
         self.theta_detection_sample_offset = int(detection_sample_offset)
+
         if min_merge_gap_ms is not None:
             self.set_theta_merge_gap(min_merge_gap_ms, update=False)
         self._theta_drag_epoch = None
@@ -299,15 +309,21 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
     # ------------------------------------------------------------------
     # Coordinate helpers
     # ------------------------------------------------------------------
-
     def _theta_epoch_time(self, sample: int) -> float:
-        """Convert a relative detection-window sample to recording time.
+        """Convert a sample index to recording time, using the same
+        time base as the rest of the trace view.
 
-        Always pure sample/sr math -- never engine.timestamps -- so
-        epoch identity and on-screen position are identical whether or
-        not the user has loaded a timestamps.npy file.
+        The epoch's sample fields are stored slice-relative to
+        ``theta_detection_sample_offset``; adding that back gives the
+        absolute dat-file index, and ``engine.sample_to_time`` maps
+        it to clock time if timestamps are loaded, else elapsed
+        seconds. Either way the epoch lands at the same x position the
+        trace view would draw any other sample at -- which is the only
+        way the overlay stays aligned with the axis.
         """
-        return self.theta_detection_start_time + int(sample) / float(self.engine.sr)
+        absolute_sample = int(sample) + int(self.theta_detection_sample_offset)
+        return float(self.engine.sample_to_time(absolute_sample))
+    
 
     def _theta_time_to_x(self, time: float) -> float:
         plot_left, plot_right, _ = self._get_plot_bounds()
@@ -376,14 +392,25 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
 
     def _theta_x_to_sample(self, x: float) -> int:
         """Convert a screen x to a sample index relative to the
-        detection window, always via plain sample/sr math (see
-        _theta_epoch_time)."""
+        detection window, using the same time base the axis uses.
+
+        Inverse of _theta_epoch_time: go x -> time, time -> absolute
+        sample (via the engine's timestamp-aware conversion), then
+        subtract the detection offset to get back to the slice-relative
+        basis the epoch objects store.
+        """
         plot_left, plot_right, _ = self._get_plot_bounds()
         ratio = (x - plot_left) / max(1.0, plot_right - plot_left)
         time = self.start_time + ratio * self.window_duration
 
-        global_sample = int(round(time * self.engine.sr))
-        return int(global_sample - self.theta_detection_sample_offset)
+        if self.engine.timestamps_loaded and self.engine.timestamps is not None:
+            idx = int(np.searchsorted(self.engine.timestamps, time, side="left"))
+            idx = max(0, min(idx, len(self.engine.timestamps) - 1))
+            absolute_sample = idx
+        else:
+            absolute_sample = int(round(time * self.engine.sr))
+
+        return int(absolute_sample - self.theta_detection_sample_offset)
 
     # ------------------------------------------------------------------
     # Painting
@@ -515,6 +542,13 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
                 if point is None:
                     continue
 
+                # Clamp the handle's x to the plot area so an epoch starting at
+                # sample 0 (or ending at the right edge) still shows its boundary
+                # handle. Without this the circle is drawn at the off-screen
+                # coordinate and effectively disappears.
+                hx = max(plot_left, min(plot_right, point[0]))
+                hy = point[1]
+
                 if merge_candidate:
                     handle_color = QColor(255, 60, 60)
                 elif selected:
@@ -525,9 +559,7 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
                 painter.setBrush(QBrush(handle_color))
                 painter.setPen(QPen(QColor(20, 20, 20), 1.2))
                 r = self._theta_handle_radius
-                painter.drawEllipse(
-                    QRectF(point[0] - r, point[1] - r, 2 * r, 2 * r)
-                )
+                painter.drawEllipse(QRectF(hx - r, hy - r, 2 * r, 2 * r))
 
     # ------------------------------------------------------------------
     # Merge logic
@@ -730,10 +762,14 @@ class ThetaEpochTraceViewWidget(TraceViewWidget):
 
             epoch = self.theta_epochs[index]
             sample = self._theta_x_to_sample(event.position().x())
-            # Clamp using sample/sr math only -- see _theta_epoch_time.
-            max_global_sample = max(0, int(round(self.engine.total_duration * self.engine.sr)))
+            # Clamp to the recording's sample bounds. total_samples is
+            # authoritative (it's the .dat file's own length); the
+            # previous total_duration * sr form could drift by one
+            # sample at very long durations.
+            total_samples = int(getattr(self.engine, "total_samples", 0)) \
+                or max(0, int(round(self.engine.total_duration * self.engine.sr)))
             min_relative = -self.theta_detection_sample_offset
-            max_relative = max_global_sample - self.theta_detection_sample_offset
+            max_relative = total_samples - self.theta_detection_sample_offset
             sample = max(min_relative, min(sample, max_relative))
 
             if self._theta_drag_side == "start":
