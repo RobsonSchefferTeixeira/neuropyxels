@@ -129,6 +129,17 @@ class ThetaCycleDialog(QDialog):
         self._build_ui()
         self._sync_time_range_from_engine()
 
+        # Push the spinboxes' initial values to the trace view so the
+        # two start in agreement even if a previous dialog session left
+        # the trace view at a different gain / width.
+        if self.trace_view is not None:
+            self.trace_view.set_theta_cycle_gain(
+                float(self.trace_gain_spin.value())
+            )
+            self.trace_view.set_theta_cycle_trace_width(
+                float(self.trace_width_spin.value())
+            )
+
         if initial_channels:
             self.channel_edit.setText(
                 ",".join(str(c) for c in initial_channels)
@@ -317,6 +328,38 @@ class ThetaCycleDialog(QDialog):
         self.edge_combo.addItems(["rising_zc", "falling_zc"])
         pairs.append(("Cycle start", self.edge_combo))
 
+        self.trace_gain_spin = QDoubleSpinBox()
+        self.trace_gain_spin.setRange(0.05, 100.0)
+        self.trace_gain_spin.setSingleStep(0.1)
+        self.trace_gain_spin.setDecimals(2)
+        self.trace_gain_spin.setValue(1.0)
+        self.trace_gain_spin.setSuffix(" ×")
+        self.trace_gain_spin.setToolTip(
+            "Multiplier on the fixed reference scale of the theta-\n"
+            "filtered overlay. The reference is measured once per\n"
+            "channel from the first window it is drawn in, so\n"
+            "scrolling does not change the trace height; only this\n"
+            "spinbox does."
+        )
+        self.trace_gain_spin.valueChanged.connect(self._on_trace_gain_changed)
+        pairs.append(("Trace gain", self.trace_gain_spin))
+
+        self.trace_width_spin = QDoubleSpinBox()
+        self.trace_width_spin.setRange(0.5, 5.0)
+        self.trace_width_spin.setSingleStep(0.1)
+        self.trace_width_spin.setDecimals(2)
+        self.trace_width_spin.setValue(1.0)
+        self.trace_width_spin.setSuffix(" px")
+        self.trace_width_spin.setToolTip(
+            "Stroke width of the theta-filtered overlay trace. The\n"
+            "selected-cycle highlight is always one pixel wider."
+        )
+        self.trace_width_spin.valueChanged.connect(
+            self._on_trace_width_changed
+        )
+        pairs.append(("Trace width", self.trace_width_spin))
+
+
         n_cols = 4
         row = 0
         col = 0
@@ -386,6 +429,14 @@ class ThetaCycleDialog(QDialog):
             except ValueError:
                 raise ValueError(f"'{part}' is not a valid channel number.")
         return out
+    
+    def _on_trace_gain_changed(self, value: float):
+        if self.trace_view is not None:
+            self.trace_view.set_theta_cycle_gain(float(value))
+
+    def _on_trace_width_changed(self, value: float):
+        if self.trace_view is not None:
+            self.trace_view.set_theta_cycle_trace_width(float(value))
 
     def _collect_params(self) -> ThetaCycleParams:
         return ThetaCycleParams(
