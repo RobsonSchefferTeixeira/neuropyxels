@@ -1530,6 +1530,7 @@ class TraceViewWidget(QWidget):
             return
         self.start_time = self._get_min_start_time()
         self._update_time_labels()
+        self._update_scrollbar_position()
         self._invalidate_cache()
         self.update()
         self.control_panel.set_time_display(self.start_time, self.start_time + self.window_duration)
@@ -1539,6 +1540,7 @@ class TraceViewWidget(QWidget):
             return
         self.start_time = self._get_max_start_time()
         self._update_time_labels()
+        self._update_scrollbar_position()
         self._invalidate_cache()
         self.update()
         self.control_panel.set_time_display(self.start_time, self.start_time + self.window_duration)
@@ -1551,6 +1553,7 @@ class TraceViewWidget(QWidget):
         max_start = self._get_max_start_time()
         self.start_time = min(max(min_start, self.start_time + time_delta), max_start)
         self._update_time_labels()
+        self._update_scrollbar_position()
         self._invalidate_cache()
         self.update()
         self.control_panel.set_time_display(self.start_time, self.start_time + self.window_duration)
@@ -3604,6 +3607,7 @@ class TraceViewWidget(QWidget):
             max_start = self._get_max_start_time()
             self.start_time = min(max(min_start, self.start_time - time_delta), max_start)
             self._update_time_labels()
+            self._update_scrollbar_position()
             self._invalidate_cache()
             self.update()
 
@@ -3633,6 +3637,7 @@ class TraceViewWidget(QWidget):
             max_start = self._get_max_start_time()
             self.start_time = min(max(min_start, self.start_time - time_delta), max_start)
             self._update_time_labels()
+            self._update_scrollbar_position()
             self._invalidate_cache()
             self.update()
 
@@ -3837,6 +3842,7 @@ class TraceViewWidget(QWidget):
             channel_delta = delta_y / max(1, channel_height)
             self._channel_offset = self._drag_start_offset + channel_delta
             self._update_time_labels()
+            self._update_scrollbar_position()
             self._invalidate_cache()
             self.update()
             event.accept()
@@ -3879,6 +3885,7 @@ class TraceViewWidget(QWidget):
         self.control_panel.duration_spin.setValue(self.window_duration)
         self.control_panel.duration_spin.blockSignals(False)
         self._update_time_labels()
+        self._update_scrollbar_range()
         self._invalidate_cache()
         self.update()
         event.accept()
