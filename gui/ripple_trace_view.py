@@ -458,11 +458,12 @@ class RippleTraceViewWidget(ThetaCycleTraceViewWidget):
 
         ctx = self._ripple_context_for(channel)
         sample_offset = int(ctx.get("sample_offset", 0)) if ctx else 0
-        sample_rate = float(ctx.get("sample_rate", self.engine.sr)) if ctx else self.engine.sr
 
-        global_sample = int(round(time * sample_rate))
+        # Use the engine's timestamp-aware inverse mapping. sample/sr
+        # would be wrong whenever a timestamps.npy is loaded, since
+        # self.start_time is then a clock value.
+        global_sample = int(self.engine.timestamp_to_sample(time))
         return int(global_sample - sample_offset)
-
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
@@ -540,7 +541,18 @@ class RippleTraceViewWidget(ThetaCycleTraceViewWidget):
         else:
             sample_indices = np.arange(first_idx, last_idx + 1, dtype=np.float64)
 
-        times_plot = (sample_offset + sample_indices) / sample_rate
+        # Map each sample index to x via the engine's current time base.
+        # sample / sr would be elapsed time, which disagrees with
+        # start_time once timestamps are loaded; sample_to_time keeps
+        # the curve aligned with the axis. Vectorized to avoid a
+        # per-sample Python call over potentially hundreds of
+        # thousands of samples.
+        global_samples = (sample_offset + sample_indices).astype(np.int64)
+        if self.engine.timestamps_loaded and self.engine.timestamps is not None:
+            idx = np.clip(global_samples, 0, len(self.engine.timestamps) - 1)
+            times_plot = self.engine.timestamps[idx].astype(np.float64)
+        else:
+            times_plot = global_samples.astype(np.float64) / float(self.engine.sr)
         x = plot_left + ((times_plot - start_time) / (end_time - start_time)) * plot_width
         y = to_y(data_slice)
         y = np.clip(y, plot_top, plot_bottom)
@@ -687,9 +699,8 @@ class RippleTraceViewWidget(ThetaCycleTraceViewWidget):
     def _ripple_event_time_for_channel(self, channel: int, sample: int) -> float:
         ctx = self._ripple_context_for(channel)
         sample_offset = int(ctx.get("sample_offset", 0)) if ctx else 0
-        sample_rate = float(ctx.get("sample_rate", self.engine.sr)) if ctx else self.engine.sr
         global_sample = sample_offset + int(sample)
-        return global_sample / float(sample_rate)
+        return float(self.engine.sample_to_time(global_sample))
 
     def _draw_ripple_events(self, painter: QPainter):
         if not self.show_ripple_events:
@@ -963,11 +974,11 @@ class RippleTraceViewWidget(ThetaCycleTraceViewWidget):
             raw_sample = self._ripple_x_to_sample(event.position().x(), ev_obj.channel)
 
             ctx = self._ripple_context_for(ev_obj.channel)
-            sample_rate = float(ctx.get("sample_rate", self.engine.sr)) if ctx else self.engine.sr
             sample_offset = int(ctx.get("sample_offset", 0)) if ctx else 0
-            max_global_sample = max(0, int(round(self.engine.total_duration * sample_rate)))
+            total_samples = int(getattr(self.engine, "total_samples", 0)) \
+                or max(0, int(round(self.engine.total_duration * self.engine.sr)))
             min_relative = -sample_offset
-            max_relative = max_global_sample - sample_offset
+            max_relative = total_samples - sample_offset
             raw_sample = max(min_relative, min(raw_sample, max_relative))
 
             # Snap-to-peak: unless Alt is held, snap the moving boundary

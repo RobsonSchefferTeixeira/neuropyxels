@@ -100,6 +100,7 @@ class _ProbePickerDialog(QDialog):
     clear) is exactly what's wanted here too.
     """
 
+
     def __init__(self, probe_data: dict, initial_channels: list[int], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Channels")
@@ -127,6 +128,7 @@ class _ProbePickerDialog(QDialog):
     def selected_channels(self) -> list[int]:
         return self.probe_map.get_selected_channels()
 
+ProbePickerDialog = _ProbePickerDialog
 
 class RippleTriggeredAverageDialog(QDialog):
     """
@@ -152,9 +154,16 @@ class RippleTriggeredAverageDialog(QDialog):
         # every event to absolute/global samples ONCE here, so
         # core.ripple_triggered_average only ever deals in one
         # consistent sample basis (its documented convention).
-        self.events_global: list[RippleEvent] = self._rebase_events_to_global(
-            events_by_channel, sample_offset_by_channel
-        )
+
+        # Keep the raw per-channel events and their sample offsets so we
+        # can re-filter by trigger channels and re-rebase on every
+        # Compute. Storing a pre-rebased flat list would freeze the
+        # trigger set at the moment the dialog opened.
+        self._events_by_channel = dict(events_by_channel or {})
+        self._sample_offset_by_channel = dict(sample_offset_by_channel or {})
+        self.events_global: list[RippleEvent] = []
+
+
         # Starting selection = whatever's currently active in the main
         # trace view, NOT every channel in the recording -- the person
         # is expected to already be looking at the channels they care
@@ -172,13 +181,23 @@ class RippleTriggeredAverageDialog(QDialog):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _rebase_events_to_global(events_by_channel: dict[int, list[RippleEvent]],
-                                  sample_offset_by_channel: dict[int, int]) -> list[RippleEvent]:
+    def _rebase_events_to_global(
+        events_by_channel: dict[int, list[RippleEvent]],
+        sample_offset_by_channel: dict[int, int],
+        trigger_channels: set[int] | None = None,
+    ) -> list[RippleEvent]:
         """Return a flat list of RippleEvent copies with every sample
-        field shifted into absolute/global recording-sample terms."""
+        field shifted into absolute/global recording-sample terms.
+
+        ``trigger_channels``, when provided, restricts the result to
+        events on those channels. Channels not in the set are ignored
+        entirely; their ripples do not act as triggers for the average,
+        even if the same channel is included in the display set."""
         import dataclasses
         rebased = []
         for ch, events in events_by_channel.items():
+            if trigger_channels is not None and ch not in trigger_channels:
+                continue
             offset = int(sample_offset_by_channel.get(ch, 0))
             if offset == 0:
                 rebased.extend(events)
@@ -218,6 +237,44 @@ class RippleTriggeredAverageDialog(QDialog):
     def _build_param_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
 
+        # ---- Trigger channel picker: which channels' ripples trigger
+        # the average. Separate from "Channels" (which channels to
+        # average); a ripple on a trigger channel contributes its
+        # alignment point, and every displayed channel is averaged
+        # around that point. ----
+        trig_col = QVBoxLayout()
+        trig_col.addWidget(QLabel("Trigger channels:"))
+
+        trig_btns = QHBoxLayout()
+        all_btn = QPushButton("All")
+        all_btn.setAutoDefault(False)
+        all_btn.setDefault(False)
+        all_btn.clicked.connect(self._select_all_trigger_channels)
+        trig_btns.addWidget(all_btn)
+
+        none_btn = QPushButton("None")
+        none_btn.setAutoDefault(False)
+        none_btn.setDefault(False)
+        none_btn.clicked.connect(self._select_no_trigger_channels)
+        trig_btns.addWidget(none_btn)
+
+        trig_col.addLayout(trig_btns)
+
+        self.trigger_channel_list = QListWidget()
+        self.trigger_channel_list.setMaximumWidth(180)
+        self.trigger_channel_list.setMaximumHeight(120)
+        self.trigger_channel_list.setToolTip(
+            "Only ripples detected on the checked channels are used as "
+            "trigger events. Uncheck a channel to exclude its ripples "
+            "from the average, even though it may still appear in the "
+            "averaged channels on the right."
+        )
+        self._populate_trigger_channel_list()
+        trig_col.addWidget(self.trigger_channel_list)
+        trig_col.addStretch(1)
+
+        row.addLayout(trig_col)
+
         # ---- Channel picker: current selection list + probe-map button ----
         chan_col = QVBoxLayout()
         chan_col.addWidget(QLabel("Channels:"))
@@ -238,6 +295,7 @@ class RippleTriggeredAverageDialog(QDialog):
         chan_col.addWidget(self.pick_from_probe_btn)
 
         row.addLayout(chan_col)
+        ...
 
         # ---- Params grid ----
         grid = QGridLayout()
@@ -275,6 +333,45 @@ class RippleTriggeredAverageDialog(QDialog):
             self.channel_list.addItem(item)
             item.setSelected(True)
 
+    def _populate_trigger_channel_list(self):
+        """Populate the trigger-channel checkbox list with every channel
+        that had at least one ripple detected. All channels start
+        checked, so the default behavior (use every detected ripple as
+        a trigger) is preserved; the user unchecks channels to exclude
+        them."""
+        self.trigger_channel_list.clear()
+        for ch in sorted(self._events_by_channel.keys()):
+            n = len(self._events_by_channel.get(ch, []))
+            if n == 0:
+                continue
+            item = QListWidgetItem(f"CH {ch}  ({n} ripples)")
+            item.setData(Qt.ItemDataRole.UserRole, int(ch))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.trigger_channel_list.addItem(item)
+
+    def _select_all_trigger_channels(self):
+        for i in range(self.trigger_channel_list.count()):
+            self.trigger_channel_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def _select_no_trigger_channels(self):
+        for i in range(self.trigger_channel_list.count()):
+            self.trigger_channel_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+    def _checked_trigger_channels(self) -> set[int]:
+        """Return the set of channels currently checked in the trigger
+        list. If the list is empty (no channels had ripples -- shouldn't
+        happen in practice), return an empty set, which the caller
+        treats as 'no triggers available.'"""
+        out: set[int] = set()
+        for i in range(self.trigger_channel_list.count()):
+            item = self.trigger_channel_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                ch = item.data(Qt.ItemDataRole.UserRole)
+                if ch is not None:
+                    out.add(int(ch))
+        return out
+    
     def _on_pick_from_probe_clicked(self):
         picker = _ProbePickerDialog(self.probe_data, self.selected_channels, parent=self)
         if picker.exec() == QDialog.DialogCode.Accepted:
@@ -301,20 +398,45 @@ class RippleTriggeredAverageDialog(QDialog):
         )
 
     def _on_compute_clicked(self):
+
         if not self.engine.data_loaded:
             QMessageBox.warning(self, "No data", "No data is currently loaded.")
             return
-        if not self.events_global:
+
+        if not self._events_by_channel or not any(self._events_by_channel.values()):
             QMessageBox.warning(
                 self, "No ripple events",
                 "No ripple events are available. Run detection (or load a "
                 "ripple CSV) in the Ripple Detection dialog first."
             )
             return
+
         if not self._selected_channels():
             QMessageBox.warning(self, "No channels", "Select at least one channel.")
             return
 
+        checked_triggers = self._checked_trigger_channels()
+        if not checked_triggers:
+            QMessageBox.warning(
+                self, "No trigger channels",
+                "Check at least one channel in the trigger list."
+            )
+            return
+
+        self.events_global = self._rebase_events_to_global(
+            self._events_by_channel,
+            self._sample_offset_by_channel,
+            trigger_channels=checked_triggers,
+        )
+
+        if not self.events_global:
+            QMessageBox.warning(
+                self, "No ripple events",
+                "None of the checked trigger channels have ripple events."
+            )
+            return
+
+        
         try:
             params = self._collect_params()
         except ValueError as exc:
@@ -331,14 +453,20 @@ class RippleTriggeredAverageDialog(QDialog):
         self.compute_btn.setEnabled(False)
         self.compute_btn.setText("Computing...")
         self.status_label.setText(
-            f"Averaging {len(self.events_global)} ripple event(s) across "
-            f"{len(params.channels)} channel(s), please wait..."
+            f"Averaging {len(self.events_global)} ripple event(s) from "
+            f"{len(checked_triggers)} trigger channel(s) across "
+            f"{len(params.channels)} display channel(s), please wait..."
         )
 
         self._compute_thread = _ComputeThread(
             self.analyzer, self.engine.data, self.engine.sr,
             self.events_global, params, parent=self,
         )
+
+        if self.events_global:
+            ev = self.events_global[0]
+
+            
         self._compute_thread.finished_ok.connect(self._on_compute_finished)
         self._compute_thread.failed.connect(self._on_compute_failed)
         self._compute_thread.start()

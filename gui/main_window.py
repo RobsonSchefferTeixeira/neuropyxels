@@ -2171,7 +2171,7 @@ class MainWindow(QMainWindow):
                         pass
                 for dialog in self._open_ripple_dialogs:
                     try:
-                        dialog._populate_summary_table()
+                        dialog.on_engine_time_base_changed()
                     except Exception:
                         pass
             else:
