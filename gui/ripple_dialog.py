@@ -306,12 +306,12 @@ class RippleDialog(QDialog):
 
         self.low_freq_spin = QDoubleSpinBox()
         self.low_freq_spin.setRange(1.0, 2000.0)
-        self.low_freq_spin.setValue(120.0)
+        self.low_freq_spin.setValue(130.0)
         col_pairs.append(("Band low (Hz)", self.low_freq_spin))
 
         self.high_freq_spin = QDoubleSpinBox()
         self.high_freq_spin.setRange(2.0, 2000.0)
-        self.high_freq_spin.setValue(250.0)
+        self.high_freq_spin.setValue(230.0)
         col_pairs.append(("Band high (Hz)", self.high_freq_spin))
 
         self.envelope_combo = QComboBox()
@@ -319,12 +319,12 @@ class RippleDialog(QDialog):
         col_pairs.append(("Envelope", self.envelope_combo))
 
         self.peak_sd_spin = QDoubleSpinBox()
-        self.peak_sd_spin.setRange(0.5, 20.0)
+        self.peak_sd_spin.setRange(0.1, 50.0)
         self.peak_sd_spin.setValue(4.0)
         col_pairs.append(("Peak threshold (SD)", self.peak_sd_spin))
 
         self.boundary_sd_spin = QDoubleSpinBox()
-        self.boundary_sd_spin.setRange(0.1, 20.0)
+        self.boundary_sd_spin.setRange(0.1, 50.0)
         self.boundary_sd_spin.setValue(1.0)
         col_pairs.append(("Boundary threshold (SD)", self.boundary_sd_spin))
 
@@ -336,7 +336,7 @@ class RippleDialog(QDialog):
 
         self.max_dur_spin = QDoubleSpinBox()
         self.max_dur_spin.setRange(0.0, 5000.0)
-        self.max_dur_spin.setValue(250.0)
+        self.max_dur_spin.setValue(500.0)
         self.max_dur_spin.setSpecialValueText("off")
         col_pairs.append(("Max duration (ms)", self.max_dur_spin))
 
@@ -344,8 +344,8 @@ class RippleDialog(QDialog):
         col_pairs.append((None, self.csd_check))
 
         self.csd_spacing_spin = QDoubleSpinBox()
-        self.csd_spacing_spin.setRange(1.0, 500.0)
-        self.csd_spacing_spin.setValue(20.0)
+        self.csd_spacing_spin.setRange(1.0, 5000.0)
+        self.csd_spacing_spin.setValue(30.0)
         col_pairs.append(("CSD spacing (\u00b5m)", self.csd_spacing_spin))
 
         self.exclude_theta_check = QCheckBox("Detect ripples outside theta only")
