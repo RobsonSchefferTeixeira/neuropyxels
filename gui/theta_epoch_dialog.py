@@ -19,7 +19,10 @@ from PyQt6.QtWidgets import (
 from core.theta_epoch_detector import ThetaEpochDetector, ThetaEpochParams, ThetaEpoch
 from core.trace_engine import TraceEngine
 from core.filters import bandpass_filter, notch_filter
-
+from core.analysis_folder import (
+    analysis_folder_for, ensure_analysis_folder,
+)
+from core.session_sidecar import save_sidecar, load_sidecar
 
 class _DetectThread(QThread):
     """Runs theta epoch detection off the UI thread."""
@@ -134,15 +137,19 @@ class _DetectThread(QThread):
             if self.cancel_requested:
                 self.finished_ok.emit([], {"cancelled": True})
                 return
-
+            
             self.finished_ok.emit(
                 all_epochs,
                 {
                     "sample_offset": start_idx,
+                    "n_samples": int(end_idx - start_idx),
                     "start_time": actual_start,
                     "end_time": actual_end,
                 },
             )
+
+
+
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -173,8 +180,10 @@ class ThetaEpochDialog(QDialog):
         self._sample_offset = 0
         self._available_min_time = 0.0
         self._available_max_time = 0.0
+        self._detect_n_samples = 0
 
         self._build_ui()
+        self._refresh_export_buttons()
 
         if initial_channels:
             self.channel_edit.setText(",".join(str(c) for c in initial_channels))
@@ -259,30 +268,19 @@ class ThetaEpochDialog(QDialog):
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         btn_row.addWidget(self.cancel_btn)
 
-        self.export_btn = QPushButton("Export CSV")
+        self.export_btn = QPushButton("Save")
         self.export_btn.setAutoDefault(False)
         self.export_btn.setDefault(False)
-        self.export_btn.clicked.connect(self._on_export_clicked)
+        self.export_btn.clicked.connect(self._on_save_clicked)
         self.export_btn.setEnabled(False)
         btn_row.addWidget(self.export_btn)
 
-        self.export_all_btn = QPushButton("Export All Channels...")
-        self.export_all_btn.setAutoDefault(False)
-        self.export_all_btn.setDefault(False)
-        self.export_all_btn.clicked.connect(self._on_export_all_clicked)
-        self.export_all_btn.setEnabled(False)
-        btn_row.addWidget(self.export_all_btn)
-
-        self.load_btn = QPushButton("Load CSV...")
+        self.load_btn = QPushButton("Load")
         self.load_btn.setAutoDefault(False)
         self.load_btn.setDefault(False)
-        self.load_btn.setToolTip(
-            "Load a previously-exported theta epoch CSV. Loaded epochs "
-            "replace the current set and behave exactly like freshly "
-            "detected ones (draggable, mergeable, deletable)."
-        )
         self.load_btn.clicked.connect(self._on_load_clicked)
         btn_row.addWidget(self.load_btn)
+        
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -396,9 +394,31 @@ class ThetaEpochDialog(QDialog):
         return grid
     
     def _refresh_export_buttons(self):
-        has = bool(self.epochs)
-        self.export_btn.setEnabled(has)
-        self.export_all_btn.setEnabled(has)
+        """Enable Save only when there are epochs to write. Load stays
+        enabled so the user can still try to load a saved session even
+        with nothing detected yet (the handler shows a helpful message
+        if the folder is empty)."""
+        has_events = bool(self.epochs)
+        has_file = getattr(self.engine, "data_file", None) is not None
+        self.export_btn.setEnabled(has_events and has_file)
+
+        if has_file:
+            folder = analysis_folder_for(self.engine)
+            self.export_btn.setToolTip(
+                f"Write all theta epochs and their parameters to:\n{folder}"
+            )
+            self.load_btn.setToolTip(
+                f"Load theta epochs and their parameters from:\n{folder}"
+            )
+        else:
+            self.export_btn.setToolTip(
+                "No data file is loaded. Load a continuous.dat before "
+                "saving or loading an analysis."
+            )
+            self.load_btn.setToolTip(
+                "No data file is loaded. Load a continuous.dat before "
+                "saving or loading an analysis."
+            )
 
     def _on_detect_clicked(self):
         if not self.engine.data_loaded:
@@ -428,6 +448,7 @@ class ThetaEpochDialog(QDialog):
             power_overlap=self.power_overlap_spin.value() / 100.0,
         )
 
+        self._last_params_for_sidecar = params
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting...")
         self.cancel_btn.setEnabled(True)
@@ -456,6 +477,7 @@ class ThetaEpochDialog(QDialog):
         # still leaves the value in a sane state for any pending
         # export / display.
         self._sample_offset = int(start_idx)
+
 
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
@@ -501,6 +523,7 @@ class ThetaEpochDialog(QDialog):
         self.epochs = sorted(list(epochs), key=lambda e: (e.channel, e.start_sample))
         self._detection_start_time = float(info.get("start_time", self.start_spin.value()))
         self._sample_offset = int(info.get("sample_offset", 0))
+        self._detect_n_samples = int(info.get("n_samples", 0))
         self.start_spin.setValue(self._detection_start_time)
         self._populate_table()
         # self.export_btn.setEnabled(bool(self.epochs))
@@ -609,87 +632,147 @@ class ThetaEpochDialog(QDialog):
         finally:
             self.table.blockSignals(False)
 
-    def _on_export_clicked(self):
+    def _on_save_clicked(self):
         if not self.epochs:
+            QMessageBox.information(
+                self, "Nothing to save",
+                "Detect (or load) theta epochs first."
+            )
             return
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export Theta Epochs",
-            "theta_epochs.csv",
-            "CSV files (*.csv);;All files (*)",
-        )
-        if not path_str:
+
+        folder = ensure_analysis_folder(self.engine)
+        if folder is None:
+            QMessageBox.warning(
+                self, "Cannot save",
+                "No data file is loaded, so there is no folder to save "
+                "the analysis into."
+            )
             return
+
+        csv_path = folder / "theta_epochs.csv"
+
         from core.theta_epoch_export import export_theta_epochs_to_csv
         try:
             export_theta_epochs_to_csv(
-                self.epochs, self._sample_offset, self.engine, path_str,
+                self.epochs, self._sample_offset, self.engine, csv_path,
             )
-            self.status_label.setText(f"Exported to {path_str}")
         except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+            QMessageBox.critical(self, "Save failed", str(exc))
+            return
 
-    def _on_export_all_clicked(self):
-        if not self.epochs:
-            return
-        dir_str = QFileDialog.getExistingDirectory(
-            self, "Export All Channels To Folder"
+        # Sidecar: only when the current session actually ran a
+        # detection (so we have a valid analysis window and params).
+        # A session that only loaded epochs from disk doesn't have a
+        # _detect_n_samples value; in that case skip the sidecar
+        # rather than overwrite the one that produced the file.
+        n = int(getattr(self, "_detect_n_samples", 0))
+        if n > 0:
+            analysis_end_sample = int(self._sample_offset) + n
+            try:
+                save_sidecar(
+                    csv_path=csv_path,
+                    kind="theta_epochs",
+                    sample_rate=float(self.engine.sr),
+                    analysis_start_sample=int(self._sample_offset),
+                    analysis_end_sample=analysis_end_sample,
+                    channels=sorted({e.channel for e in self.epochs}),
+                    params=self._last_detection_params(),
+                )
+            except Exception as exc:
+                print(f"[theta-epoch-save] sidecar failed: {exc}")
+
+        self.status_label.setText(
+            f"Saved {len(self.epochs)} epoch(s) to {folder}"
         )
-        if not dir_str:
-            return
-        grouped: dict[int, list] = {}
-        for ep in self.epochs:
-            grouped.setdefault(ep.channel, []).append(ep)
-        from core.theta_epoch_export import export_theta_epochs_per_channel
-        try:
-            written = export_theta_epochs_per_channel(
-                grouped, self._sample_offset, self.engine, dir_str,
-            )
-            self.status_label.setText(
-                f"Exported {len(written)} file(s) to {dir_str}"
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+
+    def _last_detection_params(self):
+        """Return the params used by the last detection, or reconstruct
+        them from the current spinbox values if no detection has run
+        yet (so the sidecar still has a sensible payload)."""
+        params = getattr(self, "_last_params_for_sidecar", None)
+        if params is not None:
+            return params
+        return ThetaEpochParams(
+            theta_low=self.theta_low_spin.value(),
+            theta_high=self.theta_high_spin.value(),
+            delta_low=self.delta_low_spin.value(),
+            delta_high=self.delta_high_spin.value(),
+            ratio_threshold=self.ratio_spin.value(),
+            min_duration_ms=self.min_dur_spin.value(),
+            merge_gap_ms=self.merge_gap_spin.value(),
+            power_window_ms=self.power_window_spin.value(),
+            power_overlap=self.power_overlap_spin.value() / 100.0,
+        )
 
     def _on_load_clicked(self):
         if not self.engine.data_loaded:
-            QMessageBox.warning(self, "No data loaded",
-                                "Load continuous.dat first.")
+            QMessageBox.warning(self, "No data loaded", "Load continuous.dat first.")
             return
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, "Load Theta Epochs", "", "CSV files (*.csv);;All files (*)"
-        )
-        if not path_str:
+
+        folder = analysis_folder_for(self.engine)
+        if folder is None:
+            QMessageBox.warning(
+                self, "Cannot load",
+                "No data file is loaded, so there is no folder to load "
+                "the analysis from."
+            )
             return
+
+        csv_path = folder / "theta_epochs.csv"
+        if not csv_path.exists():
+            QMessageBox.information(
+                self, "Nothing to load",
+                f"No saved theta epochs were found in:\n\n{folder}\n\n"
+                "Detect theta epochs and click Save first."
+            )
+            return
+
+        # Read the sidecar first: if it exists, its sample_offset is
+        # authoritative and its params should be restored on the dialog.
+        sidecar = None
+        try:
+            sidecar = load_sidecar(csv_path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Sidecar unreadable",
+                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}\n\n"
+                "The epochs will load, but saved parameters will not be "
+                "available."
+            )
+            sidecar = None
+
+        sample_offset_to_use = 0
+        if sidecar is not None:
+            sample_offset_to_use = int(sidecar.get("analysis_start_sample", 0))
 
         from core.theta_epoch_export import import_theta_epochs_from_csv
         try:
-            # CSVs store absolute sample indices. The dialog expects
-            # slice-relative values in memory, so subtract the current
-            # _sample_offset to convert back. If the dialog has no
-            # detection window yet (offset 0), the epochs remain
-            # absolute -- that's the correct behavior for a fresh
-            # session, since the epoch's absolute position is what the
-            # trace view needs.
             epochs = import_theta_epochs_from_csv(
-                path_str, sample_offset=self._sample_offset,
+                csv_path, sample_offset=sample_offset_to_use,
             )
         except Exception as exc:
-            QMessageBox.critical(self, "Failed to load",
-                                 f"Could not read {path_str}:\n\n{exc}")
+            QMessageBox.critical(self, "Failed to load", f"Could not read {csv_path}:\n\n{exc}")
             return
 
         if not epochs:
-            QMessageBox.information(self, "No epochs found",
-                                    f"{path_str} contains no theta epochs.")
+            QMessageBox.information(self, "No epochs found", f"{csv_path} contains no theta epochs.")
             return
 
         self.epochs = epochs
+        self._sample_offset = int(sample_offset_to_use)
+        self._detection_start_time = float(self.engine.sample_to_time(self._sample_offset))
+        self._detect_n_samples = 0  # not known; only set on fresh detection
+
+        if sidecar is not None:
+            self._apply_sidecar(sidecar)
+
         self._populate_table()
         self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
-        self.status_label.setText(
-            f"Loaded {len(self.epochs)} theta epoch(s) from {path_str}."
-        )
+        status = f"Loaded {len(self.epochs)} theta epoch(s) from {folder}."
+        if sidecar is not None:
+            status += " Parameters restored."
+        self.status_label.setText(status)
 
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
@@ -699,3 +782,39 @@ class ThetaEpochDialog(QDialog):
             self.trace_view.cancel_theta_creation()
         super().closeEvent(event)
 
+
+    def _apply_sidecar(self, sidecar: dict):
+        """Restore detection params from a loaded sidecar into the
+        spinboxes. The epochs themselves are already loaded; this just
+        makes the UI reflect the parameters that produced them, so a
+        subsequent re-detection uses the same settings."""
+        params_dict = sidecar.get("params") or {}
+        try:
+            params = ThetaEpochParams(**params_dict)
+        except TypeError as exc:
+            print(f"[theta-epoch-load] could not build params: {exc}")
+            return
+
+        self._last_params_for_sidecar = params
+
+        # Push into the spinboxes. Each blockSignals so the
+        # valueChanged handlers don't fire and clear state.
+        for spin, value in (
+            (self.theta_low_spin, params.theta_low),
+            (self.theta_high_spin, params.theta_high),
+            (self.delta_low_spin, params.delta_low),
+            (self.delta_high_spin, params.delta_high),
+            (self.ratio_spin, params.ratio_threshold),
+            (self.min_dur_spin, params.min_duration_ms),
+            (self.merge_gap_spin, params.merge_gap_ms),
+            (self.power_window_spin, params.power_window_ms),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+
+        self.power_overlap_spin.blockSignals(True)
+        self.power_overlap_spin.setValue(float(params.power_overlap) * 100.0)
+        self.power_overlap_spin.blockSignals(False)
+
+        self._refresh_export_buttons()

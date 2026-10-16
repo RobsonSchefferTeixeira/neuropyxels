@@ -10,9 +10,11 @@ One table per channel, selected via a dropdown. The channels field at
 the top accepts a comma-separated list; detection runs on each
 independently, matching ripple detection's model.
 
-Export mirrors the ripple dialog: "Export This Channel" writes one
-CSV for the currently-selected channel, "Export All Channels" writes
-one file per channel into a directory.
+Save writes a single CSV (all channels, one table) plus a small
+.meta.json sidecar into a `neuropyxels/` folder next to the loaded
+.dat. Load reads both back from the same folder, restoring the
+detection parameters so the filtered overlay and RTA-style analyses
+work without re-running detection.
 
 Editing is minimal: click a cycle's landmark circle on the trace view
 to select it, Delete to remove, Ctrl+Z to undo. Cycles have no drag,
@@ -29,7 +31,10 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QLineEdit, QFileDialog,
 )
-
+from core.analysis_folder import (
+    analysis_folder_for, ensure_analysis_folder,
+)
+from core.session_sidecar import save_sidecar, load_sidecar
 from core.theta_cycle_detector import (
     ThetaCycleDetector, ThetaCycleParams, ThetaCycle,
 )
@@ -126,8 +131,13 @@ class ThetaCycleDialog(QDialog):
         self._selected_channel: int | None = None
         self._selected_index: int | None = None
 
+        self._detect_n_samples = 0
+        self._last_params_for_sidecar = None
+
+
         self._build_ui()
         self._sync_time_range_from_engine()
+        self._refresh_export_buttons()
 
         # Push the spinboxes' initial values to the trace view so the
         # two start in agreement even if a previous dialog session left
@@ -223,12 +233,12 @@ class ThetaCycleDialog(QDialog):
         # goes into a single CSV, with a channel column inside. No
         # per-channel split, no channel suffix in the filename.
         io_row = QHBoxLayout()
-        self.export_btn = QPushButton("Export CSV...")
+        self.export_btn = QPushButton("Save")
         self.export_btn.setAutoDefault(False)
-        self.export_btn.clicked.connect(self._on_export_clicked)
+        self.export_btn.clicked.connect(self._on_save_clicked)
         io_row.addWidget(self.export_btn)
 
-        self.load_btn = QPushButton("Load CSV...")
+        self.load_btn = QPushButton("Load")
         self.load_btn.setAutoDefault(False)
         self.load_btn.clicked.connect(self._on_load_clicked)
         io_row.addWidget(self.load_btn)
@@ -411,6 +421,7 @@ class ThetaCycleDialog(QDialog):
         table so *_s columns reflect the new time base."""
         self._sync_time_range_from_engine()
         self._populate_table()
+        self._refresh_export_buttons()
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
@@ -497,6 +508,10 @@ class ThetaCycleDialog(QDialog):
         start_idx = self.engine.timestamp_to_sample(self.start_spin.value())
         end_idx = self.engine.timestamp_to_sample(self.end_spin.value())
 
+        self._sample_offset = int(start_idx)
+        self._detect_n_samples = max(0, int(end_idx) - int(start_idx))
+        self._last_params_for_sidecar = params
+
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
             start_idx, end_idx, params, parent=self,
@@ -524,12 +539,12 @@ class ThetaCycleDialog(QDialog):
         self.cycles_by_channel = results
         self._populate_table()
         self._push_flat_cycles_to_trace()
+        self._refresh_export_buttons()
         total = sum(len(v) for v in results.values())
         n_ch = sum(1 for v in results.values() if v)
         self.status_label.setText(
             f"Detected {total} cycle(s) across {n_ch} channel(s)."
         )
-
     # ------------------------------------------------------------------
     # Channel dropdown + table
     # ------------------------------------------------------------------
@@ -654,7 +669,7 @@ class ThetaCycleDialog(QDialog):
             regrouped[ch].sort(key=lambda c: c.zero_crossing_start)
         self.cycles_by_channel = regrouped
         self._populate_table()
-
+        self._refresh_export_buttons()
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
@@ -716,69 +731,162 @@ class ThetaCycleDialog(QDialog):
     # ------------------------------------------------------------------
     # Export / import
     # ------------------------------------------------------------------
-    def _on_export_clicked(self):
-        """Write every cycle from every channel into a single CSV.
-        Cycles are stored with absolute sample indices in memory, so
-        no offset is applied here. The engine supplies the time base
-        for the *_s columns."""
+    def _on_save_clicked(self):
+        """Write every cycle from every channel into a single CSV in
+        the neuropyxels/ folder next to the loaded .dat, plus a
+        sidecar with the parameters that produced them."""
         if not self.cycles_by_channel or not any(self.cycles_by_channel.values()):
             QMessageBox.information(
-                self, "Nothing to export",
+                self, "Nothing to save",
                 "Run detection (or load a CSV) first."
             )
             return
 
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export Theta Cycles",
-            "theta_cycles.csv",
-            "CSV files (*.csv);;All files (*)",
-        )
-        if not path_str:
+        folder = ensure_analysis_folder(self.engine)
+        if folder is None:
+            QMessageBox.warning(
+                self, "Cannot save",
+                "No data file is loaded, so there is no folder to save "
+                "the analysis into."
+            )
             return
 
+        csv_path = folder / "theta_cycles.csv"
         flat = self._flat_cycles()
         try:
-            export_cycles_to_csv(flat, self.engine, path_str)
-            self.status_label.setText(
-                f"Exported {len(flat)} cycle(s) to {path_str}"
-            )
+            export_cycles_to_csv(flat, self.engine, csv_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+            QMessageBox.critical(self, "Save failed", str(exc))
+            return
+
+        n = int(getattr(self, "_detect_n_samples", 0))
+        if n > 0:
+            analysis_end_sample = int(self._sample_offset) + n
+            try:
+                save_sidecar(
+                    csv_path=csv_path,
+                    kind="theta_cycles",
+                    sample_rate=float(self.engine.sr),
+                    analysis_start_sample=int(self._sample_offset),
+                    analysis_end_sample=analysis_end_sample,
+                    channels=sorted(self.cycles_by_channel.keys()),
+                    params=self._last_params_for_sidecar,
+                )
+            except Exception as exc:
+                print(f"[theta-cycle-save] sidecar failed: {exc}")
+
+        self.status_label.setText(
+            f"Saved {len(flat)} cycle(s) to {folder}"
+        )
+
 
     def _on_load_clicked(self):
         if not self.engine.data_loaded:
             QMessageBox.warning(self, "No data", "No data is currently loaded.")
             return
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, "Load Theta Cycles", "", "CSV files (*.csv);;All files (*)"
-        )
-        if not path_str:
+
+        folder = analysis_folder_for(self.engine)
+        if folder is None:
+            QMessageBox.warning(
+                self, "Cannot load",
+                "No data file is loaded, so there is no folder to load "
+                "the analysis from."
+            )
             return
+
+        csv_path = folder / "theta_cycles.csv"
+        if not csv_path.exists():
+            QMessageBox.information(
+                self, "Nothing to load",
+                f"No saved theta cycles were found in:\n\n{folder}\n\n"
+                "Detect theta cycles and click Save first."
+            )
+            return
+
+        sidecar = None
         try:
-            cycles = read_cycles_from_csv(path_str)
+            sidecar = load_sidecar(csv_path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Sidecar unreadable",
+                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}\n\n"
+                "The cycles will load, but saved parameters will not be "
+                "available."
+            )
+            sidecar = None
+
+        try:
+            cycles = read_cycles_from_csv(csv_path)
         except Exception as exc:
             QMessageBox.critical(self, "Failed to load",
-                                 f"Could not read {path_str}:\n\n{exc}")
+                                 f"Could not read {csv_path}:\n\n{exc}")
             return
+
         if not cycles:
             QMessageBox.information(self, "No cycles found",
-                                    f"{path_str} contains no cycles.")
+                                    f"{csv_path} contains no cycles.")
             return
-        # CSV sample indices are already absolute; merge as-is.
+
         for c in cycles:
             self.cycles_by_channel.setdefault(c.channel, []).append(c)
         for ch in self.cycles_by_channel:
             self.cycles_by_channel[ch].sort(
                 key=lambda c: c.zero_crossing_start
             )
+
+        if sidecar is not None:
+            self._apply_sidecar(sidecar)
+
         self._populate_table()
         self._push_flat_cycles_to_trace()
-        self.status_label.setText(
-            f"Loaded {len(cycles)} cycle(s) from {path_str}."
-        )
+        self._refresh_export_buttons()
+        status = f"Loaded {len(cycles)} cycle(s) from {folder}."
+        if sidecar is not None:
+            status += " Parameters restored."
+        self.status_label.setText(status)
 
+    def _apply_sidecar(self, sidecar: dict):
+        """Restore detection params and the theta band from a sidecar.
+        The band is pushed to the trace view so the filtered overlay
+        matches the band the cycles were detected with."""
+        params_dict = sidecar.get("params") or {}
+        try:
+            params = ThetaCycleParams(**params_dict)
+        except TypeError as exc:
+            print(f"[theta-cycle-load] could not build params: {exc}")
+            return
 
-        
+        self._last_params_for_sidecar = params
+
+        for spin, value in (
+            (self.low_spin, params.low_freq),
+            (self.high_spin, params.high_freq),
+            (self.min_amp_spin, params.min_theta_peak_percentile),
+            (self.delta_low_spin, params.delta_low_freq),
+            (self.delta_ratio_spin, params.theta_delta_ratio_min),
+            (self.fast_low_spin, params.fast_low_freq),
+            (self.fast_ratio_spin, params.fast_theta_ratio_max),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+
+        if params.delta_high_freq is not None:
+            self.delta_high_spin.blockSignals(True)
+            self.delta_high_spin.setValue(float(params.delta_high_freq))
+            self.delta_high_spin.blockSignals(False)
+
+        self.delta_check.setChecked(bool(params.delta_correction))
+        self.fast_check.setChecked(bool(params.fast_correction))
+        self.edge_combo.setCurrentText(str(params.cycle_start_edge))
+
+        # Restore the overlay's band so the filtered trace it draws
+        # matches what the cycles were detected against.
+        if self.trace_view is not None:
+            self.trace_view.set_theta_cycle_band(
+                params.low_freq, params.high_freq,
+            )
+
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -797,3 +905,41 @@ class ThetaCycleDialog(QDialog):
             pass
         self.trace_view.clear_theta_cycles()
         super().closeEvent(event)
+
+
+
+    def _refresh_export_buttons(self):
+        """Enable Save only when there are cycles to write and the
+        engine has a .dat to anchor the analysis folder to. Load stays
+        enabled as long as there's a .dat, so the user can still try to
+        load a saved session even with nothing detected yet (the
+        handler shows a helpful message if the folder is empty)."""
+        has_cycles = bool(
+            self.cycles_by_channel
+            and any(self.cycles_by_channel.values())
+        )
+        has_file = getattr(self.engine, "data_file", None) is not None
+
+        self.export_btn.setEnabled(has_cycles and has_file)
+
+        if has_file:
+            folder = analysis_folder_for(self.engine)
+            self.export_btn.setToolTip(
+                f"Write all theta cycles and their parameters to:\n{folder}"
+            )
+            self.load_btn.setToolTip(
+                f"Load theta cycles and their parameters from:\n{folder}"
+            )
+        else:
+            self.export_btn.setToolTip(
+                "No data file is loaded. Load a continuous.dat before "
+                "saving or loading an analysis."
+            )
+            self.load_btn.setToolTip(
+                "No data file is loaded. Load a continuous.dat before "
+                "saving or loading an analysis."
+            )
+
+        # Load is never disabled by 'no cycles' -- the user may want to
+        # load a saved session before running detection.
+        self.load_btn.setEnabled(has_file)
