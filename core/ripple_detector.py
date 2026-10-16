@@ -52,15 +52,15 @@ from scipy.signal import butter, sosfiltfilt, hilbert
 
 @dataclass
 class RippleParams:
-    low_freq: float = 120.0
-    high_freq: float = 250.0
+    low_freq: float = 130.0
+    high_freq: float = 230.0
     filter_order: int = 4
     envelope_method: str = "hilbert"   # "hilbert" or "rms"
     rms_window_ms: float = 10.0        # only used when envelope_method == "rms"
     peak_threshold_sd: float = 4.0     # candidate must have a sample above mean + N*SD
     boundary_threshold_sd: float = 1.0  # start/end where envelope crosses mean + N*SD
     min_duration_ms: float | None = 15.0
-    max_duration_ms: float | None = 250.0
+    max_duration_ms: float | None = 500.0
 
 
 @dataclass
