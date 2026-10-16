@@ -41,6 +41,8 @@ rather than redrawing a separate inspector.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -50,13 +52,14 @@ from PyQt6.QtWidgets import (
     QLineEdit, QFileDialog, QSplitter,
 )
 
+from core.session_sidecar import save_sidecar, load_sidecar
 from core.ripple_detector import RippleDetector, RippleParams, RippleEvent
 from core.phase_amplitude import PhaseAmplitudeAnalyzer
 from core.ripple_export import export_ripples_to_csv, export_ripples_per_channel, read_ripples_from_csv
 from core.trace_engine import TraceEngine
 from gui.ripple_trace_view import RippleTraceViewWidget
 from gui.ripple_triggered_average_dialog import RippleTriggeredAverageDialog
-
+from core.analysis_folder import (analysis_folder_for, ensure_analysis_folder,)
 
 class _DetectThread(QThread):
     """Runs detection across all requested channels off the UI thread."""
@@ -200,6 +203,7 @@ class RippleDialog(QDialog):
         self._selected_channel: int | None = None
         self._params: RippleParams | None = None
         self._open_rta_dialogs: list[RippleTriggeredAverageDialog] = []
+        self._detect_n_samples = 0
 
         self._open_inspector_dialogs: list = []
 
@@ -216,10 +220,12 @@ class RippleDialog(QDialog):
             self.channel_edit.setText(",".join(str(c) for c in initial_channels))
 
         self._refresh_theta_exclusion_availability()
+        self._refresh_save_load_enabled()
 
     def showEvent(self, event):
         self._refresh_theta_exclusion_availability()
         super().showEvent(event)
+        self._refresh_save_load_enabled()
 
     def _refresh_theta_exclusion_availability(self):
         has_theta = bool(getattr(self.trace_view, "theta_epochs", None))
@@ -489,22 +495,54 @@ class RippleDialog(QDialog):
 
         row.addStretch(1)
         return row
+    
+    def _refresh_save_load_enabled(self):
+        """Enable Save/Load only when there is a data file to anchor
+        the analysis folder to. Without one, both operations have
+        nowhere to write or read from, so they're greyed out with a
+        tooltip explaining why."""
+        has_file = getattr(self.engine, "data_file", None) is not None
+        self.export_all_btn.setEnabled(has_file)
+        self.load_btn.setEnabled(has_file)
+        if has_file:
+            folder = analysis_folder_for(self.engine)
+            self.export_all_btn.setToolTip(
+                f"Write all detected ripples and their parameters to:\n"
+                f"{folder}"
+            )
+            self.load_btn.setToolTip(
+                f"Load ripples and their parameters from:\n"
+                f"{folder}"
+            )
+        else:
+            self.export_all_btn.setToolTip(
+                "No data file is loaded. Load a continuous.dat before "
+                "saving or loading an analysis."
+            )
+            self.load_btn.setToolTip(
+                "No data file is loaded. Load a continuous.dat before "
+                "saving or loading an analysis."
+            )
+
 
     def _build_export_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        self.export_selected_btn = QPushButton("Export Selected Channel CSV...")
-        self.export_selected_btn.setAutoDefault(False)
-        self.export_selected_btn.setDefault(False)
-        self.export_selected_btn.clicked.connect(self._on_export_selected_clicked)
-        row.addWidget(self.export_selected_btn)
 
-        self.export_all_btn = QPushButton("Export All Channels...")
+        self.export_all_btn = QPushButton("Save")
         self.export_all_btn.setAutoDefault(False)
         self.export_all_btn.setDefault(False)
+        self.export_all_btn.setToolTip(
+            "Write one CSV per channel into a chosen folder, plus a "
+            "small .meta.json sidecar next to each CSV recording the "
+            "parameters and analysis window. Loading a CSV later "
+            "restores those so Ripple-Triggered Average and Single "
+            "Ripple View work without re-running detection."
+        )
         self.export_all_btn.clicked.connect(self._on_export_all_clicked)
         row.addWidget(self.export_all_btn)
 
-        self.load_btn = QPushButton("Load CSV...")
+
+        self.load_btn = QPushButton("Load")
         self.load_btn.setAutoDefault(False)
         self.load_btn.setDefault(False)
         self.load_btn.setToolTip(
@@ -815,7 +853,9 @@ class RippleDialog(QDialog):
         # or not a timestamps file is loaded.
         start_idx = self.engine.timestamp_to_sample(self.start_spin.value())
         end_idx = self.engine.timestamp_to_sample(self.end_spin.value())
+        self._detect_n_samples = int(end_idx) - int(start_idx)
         self._sample_offset = int(start_idx)
+        self._detect_n_samples = int(end_idx - start_idx)
 
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
@@ -1057,7 +1097,6 @@ class RippleDialog(QDialog):
         # their position in its own flat list, which is sorted the same
         # way, so the row index maps directly.
         self.trace_view.set_ripple_selected_event(row)
-        self.rippleEventSelected.emit(row)
 
         self._show_channel_in_trace_view(self._selected_channel)
         self.status_label.setText(
@@ -1189,7 +1228,6 @@ class RippleDialog(QDialog):
                 self.summary_table.selectRow(i)
                 self.summary_table.blockSignals(False)
                 self.trace_view.set_ripple_selected_event(i)
-                self.rippleEventSelected.emit(i)
                 self.status_label.setText(
                     f"CH{target.channel} ripple at {target_time:.3f} s "
                     f"({'(next)' if direction > 0 else '(prev)'})"
@@ -1199,83 +1237,207 @@ class RippleDialog(QDialog):
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
-
-    def _on_export_selected_clicked(self):
-        if self._selected_channel is None:
+    def _on_export_all_clicked(self):
+        if not self.events_by_channel or not any(self.events_by_channel.values()):
             QMessageBox.information(
-                self, "No channel selected",
-                "Select a channel row in the table first."
+                self, "Nothing to save",
+                "Run detection (or load a CSV) first."
             )
             return
-        events = self.events_by_channel.get(self._selected_channel, [])
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export Ripples to CSV",
-            f"ripples_channel{self._selected_channel}.csv",
-            "CSV files (*.csv);;All files (*)"
-        )
-        if not path_str:
-            return
-        try:
-            export_ripples_to_csv(events, self._sample_offset, self.engine, path_str)
-            self.status_label.setText(f"Exported {len(events)} event(s) to {path_str}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
 
-    def _on_export_all_clicked(self):
-        if not self.events_by_channel:
-            QMessageBox.information(self, "Nothing to export", "Run detection first.")
+        folder = ensure_analysis_folder(self.engine)
+        if folder is None:
+            QMessageBox.warning(
+                self, "Cannot save",
+                "No data file is loaded, so there is no folder to save "
+                "the analysis into."
+            )
             return
-        dir_str = QFileDialog.getExistingDirectory(self, "Export All Channels To Folder")
-        if not dir_str:
-            return
+
+        csv_path = folder / "ripples.csv"
+        meta_path = folder / "ripples.meta.json"
+
+        flat = self._flat_events()
         try:
-            written = export_ripples_per_channel(self.events_by_channel, self._sample_offset, self.engine, dir_str)
-            self.status_label.setText(f"Exported {len(written)} file(s) to {dir_str}")
+            export_ripples_to_csv(
+                flat, self._sample_offset, self.engine, csv_path,
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+            QMessageBox.critical(self, "Save failed", str(exc))
+            return
+
+        if self._params is not None:
+            n = int(getattr(self, "_detect_n_samples", 0))
+            analysis_end_sample = int(self._sample_offset) + n
+            if n > 0 and analysis_end_sample > int(self._sample_offset):
+                try:
+                    save_sidecar(
+                        csv_path=csv_path,
+                        kind="ripples",
+                        sample_rate=float(self.engine.sr),
+                        analysis_start_sample=int(self._sample_offset),
+                        analysis_end_sample=analysis_end_sample,
+                        channels=sorted(self.events_by_channel.keys()),
+                        params=self._params,
+                    )
+                except Exception as exc:
+                    print(f"[ripple-save] sidecar failed: {exc}")
+
+        self.status_label.setText(
+            f"Saved {len(flat)} event(s) to {folder}"
+            + (" (with parameters)" if self._params is not None else "")
+        )
+
 
     def _on_load_clicked(self):
         if not self.engine.data_loaded:
             QMessageBox.warning(self, "No data", "No data is currently loaded.")
             return
-        path_str, _ = QFileDialog.getOpenFileName(self, "Load Ripples", "", "CSV files (*.csv);;All files (*)")
-        if not path_str:
+
+        folder = analysis_folder_for(self.engine)
+        if folder is None:
+            QMessageBox.warning(
+                self, "Cannot load",
+                "No data file is loaded, so there is no folder to load "
+                "the analysis from."
+            )
             return
 
+        csv_path = folder / "ripples.csv"
+        if not csv_path.exists():
+            QMessageBox.information(
+                self, "Nothing to load",
+                f"No saved ripples were found in:\n\n{folder}\n\n"
+                "Detect ripples and click Save first."
+            )
+            return
+
+        # Try to read the sidecar; if it exists, its sample offset is
+        # authoritative for interpreting the CSV's absolute sample
+        # indices. If not, fall back to the dialog's current offset.
+        sidecar = None
         try:
-            # CSVs store absolute sample indices. Subtract the dialog's
-            # current offset to convert back to the slice-relative basis
-            # the trace view and the detector use in memory.
-            events = read_ripples_from_csv(path_str, sample_offset=self._sample_offset)
+            sidecar = load_sidecar(csv_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Failed to load", f"Could not read {path_str}:\n\n{exc}")
+            QMessageBox.warning(
+                self, "Sidecar unreadable",
+                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}\n\n"
+                "The events will load, but saved parameters and signals "
+                "will not be available."
+            )
+            sidecar = None
+
+        sample_offset_to_use = self._sample_offset
+        if sidecar is not None:
+            sidecar_sr = float(sidecar.get("sample_rate", 0.0))
+            if sidecar_sr > 0 and abs(sidecar_sr - float(self.engine.sr)) > 1e-6:
+                proceed = QMessageBox.question(
+                    self, "Sample rate mismatch",
+                    f"Saved analysis was recorded at {sidecar_sr:.1f} Hz but "
+                    f"the current engine reports {self.engine.sr:.1f} Hz.\n\n"
+                    "Times derived from samples will be wrong. Load anyway?"
+                )
+                if proceed != QMessageBox.StandardButton.Yes:
+                    return
+            sample_offset_to_use = int(sidecar.get("analysis_start_sample", 0))
+
+        try:
+            events = read_ripples_from_csv(csv_path, sample_offset=sample_offset_to_use)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to load", f"Could not read {csv_path}:\n\n{exc}")
             return
 
         if not events:
-            QMessageBox.information(self, "No events found", f"{path_str} contains no ripple events.")
+            QMessageBox.information(self, "No events found", f"{csv_path} contains no ripple events.")
             return
-
-        if self.events_by_channel and self._sample_offset != 0:
-            proceed = QMessageBox.question(
-                self, "Sample offset mismatch",
-                "Currently detected events use a non-zero sample offset "
-                f"({self._sample_offset} samples), but loaded events are "
-                "always absolute (offset 0). Loaded events may not "
-                "display in the correct position relative to existing "
-                "ones on the same channel.\n\nLoad anyway?",
-            )
-            if proceed != QMessageBox.StandardButton.Yes:
-                return
 
         for ev in events:
             self.events_by_channel.setdefault(ev.channel, []).append(ev)
         for ch in self.events_by_channel:
             self.events_by_channel[ch].sort(key=lambda e: e.start_sample)
 
+        if sidecar is not None:
+            self._apply_sidecar(sidecar, events)
+
         self._populate_summary_table()
         self._push_overlay_to_trace_view()
-        self.status_label.setText(f"Loaded {len(events)} ripple event(s) from {path_str}.")
 
+        status = f"Loaded {len(events)} ripple event(s) from {folder}."
+        if sidecar is not None:
+            status += " Parameters and signals restored."
+        else:
+            status += " No sidecar found; RTA and Single Ripple View will need fresh detection."
+        self.status_label.setText(status)
+
+
+
+    def _apply_sidecar(self, sidecar: dict, events: list[RippleEvent]):
+        """Restore detection params, sample offset, and per-channel
+        envelope / filtered signals from a loaded sidecar.
+
+        The envelope and filtered signal are recomputed from
+        engine.data over the recorded analysis window, matching the
+        algorithm the detector used. Both are bit-identical to what
+        the original detection produced because the filter is
+        deterministic and the input slice is the same.
+        """
+        params_dict = sidecar.get("params") or {}
+        try:
+            self._params = RippleParams(**params_dict)
+        except TypeError as exc:
+            print(f"[ripple-load] could not construct RippleParams "
+                  f"from sidecar: {exc}")
+            return
+
+        # Also restore the spinbox values so the UI shows the loaded
+        # session's settings -- otherwise a subsequent detection would
+        # silently use different parameters than what produced the CSV.
+        self.low_freq_spin.setValue(float(self._params.low_freq))
+        self.high_freq_spin.setValue(float(self._params.high_freq))
+        self.envelope_combo.setCurrentText(str(self._params.envelope_method))
+        self.peak_sd_spin.setValue(float(self._params.peak_threshold_sd))
+        self.boundary_sd_spin.setValue(float(self._params.boundary_threshold_sd))
+        self.min_dur_spin.setValue(
+            float(self._params.min_duration_ms) if self._params.min_duration_ms else 0.0
+        )
+        self.max_dur_spin.setValue(
+            float(self._params.max_duration_ms) if self._params.max_duration_ms else 0.0
+        )
+
+        self._sample_offset = int(sidecar.get("analysis_start_sample", 0))
+
+        analysis_start = int(sidecar.get("analysis_start_sample", 0))
+        analysis_end = int(sidecar.get("analysis_end_sample", 0))
+        if analysis_end <= analysis_start:
+            # Nothing to recompute; the events are still usable but
+            # the overlay will be missing.
+            return
+
+        # Recompute the per-channel signals over the exact same window
+        # the detector used. For each channel that appears in the
+        # sidecar's channel list, slice engine.data and re-filter.
+        for ch in sidecar.get("channels", []):
+            ch = int(ch)
+            try:
+                signal = self.engine.data[analysis_start:analysis_end, ch] \
+                    .flatten().astype(np.float64)
+            except Exception as exc:
+                print(f"[ripple-load] could not slice CH{ch}: {exc}")
+                continue
+            try:
+                filtered = self.detector.apply_ripple_filter(
+                    signal, self.engine.sr, self._params
+                )
+                envelope = self.detector.compute_envelope(
+                    filtered, self.engine.sr, self._params
+                )
+            except Exception as exc:
+                print(f"[ripple-load] could not filter CH{ch}: {exc}")
+                continue
+            self._signal_by_channel[ch] = signal
+            self._filtered_by_channel[ch] = filtered
+            self._envelope_by_channel[ch] = envelope
+            
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------

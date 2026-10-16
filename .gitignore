@@ -7,8 +7,8 @@ try_probe_map.py
 
 # --- test folders ---
 /test_data/
-
-
+/neuronexus_example/
+/neuropixels_example/
 # --- Python ---
 __pycache__/
 *.py[cod]
