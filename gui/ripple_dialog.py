@@ -177,6 +177,7 @@ class RippleDialog(QDialog):
     trace view.
     """
     eventsChanged = pyqtSignal()
+    eventFocused = pyqtSignal(int)   # channel id; the user clicked a row
     
     def __init__(self, probe_data: dict, engine: TraceEngine,
                  trace_view: RippleTraceViewWidget,
@@ -1101,6 +1102,9 @@ class RippleDialog(QDialog):
 
         self.trace_view.set_ripple_selected_event(row)
         self._show_channel_in_trace_view(self._selected_channel)
+        self._pan_to_event(target)
+        # Ask MainWindow to highlight this channel on the probe map.
+        self.eventFocused.emit(self._selected_channel)
         self.status_label.setText(
             f"CH{self._selected_channel} ripple at "
             f"{self.engine.sample_to_time(int(target.start_sample) + int(self._sample_offset)):.3f} s"
@@ -1128,6 +1132,29 @@ class RippleDialog(QDialog):
         else:
             self.trace_view.update()
 
+    def _pan_to_event(self, event: RippleEvent):
+        """Center the trace view on this ripple's peak time, using the
+        dialog's current navigation window duration. Called when the
+        user clicks a table row so the selected event is always
+        visible and centered, regardless of where the view was."""
+        try:
+            peak_time = float(self.engine.sample_to_time(
+                int(event.peak_sample) + int(self._sample_offset)
+            ))
+        except Exception:
+            return
+        window_duration = max(0.05, self.nav_window_spin.value())
+        t_min, _ = self.engine.get_time_range()
+        new_start = max(t_min, peak_time - window_duration / 2)
+
+        self.trace_view.window_duration = window_duration
+        self.trace_view.start_time = new_start
+        self.trace_view.control_panel.set_duration(window_duration)
+        self.trace_view._update_time_labels()
+        self.trace_view._update_scrollbar_position()
+        self.trace_view._invalidate_cache()
+        self.trace_view.update()
+        
     def _go_to_prev_ripple(self):
         self._step_ripple(direction=-1)
 

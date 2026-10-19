@@ -107,6 +107,7 @@ class ThetaCycleDialog(QDialog):
 
     cyclesChanged = pyqtSignal(object)   # list[ThetaCycle] (flat)
     cycleSelected = pyqtSignal(int)
+    eventFocused = pyqtSignal(int)   # channel id; the user clicked a row
 
     def __init__(
         self,
@@ -633,9 +634,28 @@ class ThetaCycleDialog(QDialog):
         self.trace_view.set_theta_cycle_selected(row)
         self.cycleSelected.emit(row)
 
-        # Auto-add the channel to the trace view if not already displayed,
-        # same as the ripple dialog does.
         self._ensure_channel_visible(target.channel)
+        self._pan_to_event(target)
+        # Ask MainWindow to highlight this channel on the probe map.
+        self.eventFocused.emit(int(target.channel))
+        
+    def _pan_to_event(self, cycle: ThetaCycle):
+        """Center the trace view on this cycle's peak1 time."""
+        try:
+            peak_time = float(self.engine.sample_to_time(int(cycle.peak1)))
+        except Exception:
+            return
+        window_duration = max(0.05, self.nav_window_spin.value())
+        t_min, _ = self.engine.get_time_range()
+        new_start = max(t_min, peak_time - window_duration / 2)
+
+        self.trace_view.window_duration = window_duration
+        self.trace_view.start_time = new_start
+        self.trace_view.control_panel.set_duration(window_duration)
+        self.trace_view._update_time_labels()
+        self.trace_view._update_scrollbar_position()
+        self.trace_view._invalidate_cache()
+        self.trace_view.update()
 
     def _ensure_channel_visible(self, channel: int):
         if channel not in self.trace_view.channels:

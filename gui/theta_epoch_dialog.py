@@ -158,7 +158,8 @@ class ThetaEpochDialog(QDialog):
     epochsChanged = pyqtSignal(object)
     mergeGapChanged = pyqtSignal(float)
     thetaEpochSelected = pyqtSignal(int)
-
+    eventFocused = pyqtSignal(int)   # channel id; the user clicked a row
+    
     def __init__(
         self,
         probe_data: dict,
@@ -280,7 +281,27 @@ class ThetaEpochDialog(QDialog):
         self.load_btn.setDefault(False)
         self.load_btn.clicked.connect(self._on_load_clicked)
         btn_row.addWidget(self.load_btn)
-        
+
+        self.prev_epoch_btn = QPushButton("\u25c4 Prev Epoch")
+        self.prev_epoch_btn.setAutoDefault(False)
+        self.prev_epoch_btn.setDefault(False)
+        self.prev_epoch_btn.clicked.connect(lambda: self._step_epoch(-1))
+        btn_row.addWidget(self.prev_epoch_btn)
+
+        self.next_epoch_btn = QPushButton("Next Epoch \u25ba")
+        self.next_epoch_btn.setAutoDefault(False)
+        self.next_epoch_btn.setDefault(False)
+        self.next_epoch_btn.clicked.connect(lambda: self._step_epoch(+1))
+        btn_row.addWidget(self.next_epoch_btn)
+
+        btn_row.addWidget(QLabel("Window (s):"))
+        self.nav_window_spin = QDoubleSpinBox()
+        self.nav_window_spin.setDecimals(2)
+        self.nav_window_spin.setRange(0.05, 60.0)
+        self.nav_window_spin.setValue(5.0)
+        btn_row.addWidget(self.nav_window_spin)
+
+
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -419,6 +440,10 @@ class ThetaEpochDialog(QDialog):
                 "No data file is loaded. Load a continuous.dat before "
                 "saving or loading an analysis."
             )
+
+        has_epochs = bool(self.epochs)
+        self.prev_epoch_btn.setEnabled(has_epochs)
+        self.next_epoch_btn.setEnabled(has_epochs)
 
     def _on_detect_clicked(self):
         if not self.engine.data_loaded:
@@ -567,8 +592,111 @@ class ThetaEpochDialog(QDialog):
     def _on_table_selection_changed(self):
         row = self.table.currentRow()
         self.delete_btn.setEnabled(row >= 0)
-        if row >= 0:
-            self.thetaEpochSelected.emit(row)
+        if row < 0:
+            return
+
+        # Emit so the trace view highlights this epoch.
+        self.thetaEpochSelected.emit(row)
+
+        if not (0 <= row < len(self.epochs)):
+            return
+        target = self.epochs[row]
+
+        # Make sure the epoch's channel is displayed, then pan the
+        # view so the epoch is centered.
+        self._show_channel_in_trace_view(int(target.channel))
+        self._pan_to_event(target)
+
+        # Ask MainWindow to highlight this channel on the probe map.
+        self.eventFocused.emit(int(target.channel))
+
+    def _show_channel_in_trace_view(self, channel: int):
+        """Append the channel to the trace view if not already there.
+        Mirrors RippleDialog._show_channel_in_trace_view."""
+        if self.trace_view is None:
+            return
+        if channel not in self.trace_view.channels:
+            chans = list(self.trace_view.channels)
+            chans.append(channel)
+            self.trace_view.set_channels(chans)
+        else:
+            self.trace_view.update()
+
+    def _pan_to_event(self, epoch):
+        """Center the trace view on this epoch's midpoint time.
+
+        The midpoint of [start_sample, end_sample] is used rather than
+        peak_sample because peak_sample is not part of the epoch CSV
+        schema -- every loaded epoch has peak_sample = 0, and using it
+        would pan the view to time 0 for every event. The midpoint is
+        close enough to the true peak for a "center the event" gesture
+        and is stable across detection-then-load cycles.
+        """
+        if self.trace_view is None:
+            return
+        try:
+            start_abs = int(epoch.start_sample) + int(self._sample_offset)
+            end_abs = int(epoch.end_sample) + int(self._sample_offset)
+            midpoint_sample = (start_abs + end_abs) // 2
+            midpoint_time = float(self.engine.sample_to_time(midpoint_sample))
+        except Exception:
+            return
+        window_duration = max(0.05, self.nav_window_spin.value())
+        t_min, _ = self.engine.get_time_range()
+        new_start = max(t_min, midpoint_time - window_duration / 2)
+
+        self.trace_view.window_duration = window_duration
+        self.trace_view.start_time = new_start
+        self.trace_view.control_panel.set_duration(window_duration)
+        self.trace_view._update_time_labels()
+        self.trace_view._update_scrollbar_position()
+        self.trace_view._invalidate_cache()
+        self.trace_view.update()
+
+    def _step_epoch(self, direction: int):
+        """Step Prev/Next through the flat, (channel, start_sample)-
+        sorted list of every epoch across every detected channel --
+        the same order the table shows. Crossing from the last epoch
+        of one channel into the first of the next is intentional.
+
+        The anchor is the table's own selection; if nothing is
+        selected, direction > 0 starts at row 0 and direction < 0
+        starts at the last row. When the end (or start) is reached,
+        the selection stays put -- no wrap.
+        """
+        if not self.epochs:
+            return
+
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            current_row = int(rows[0].row())
+        else:
+            current_row = -1 if direction > 0 else len(self.epochs)
+
+        new_row = current_row + direction
+        new_row = max(0, min(new_row, len(self.epochs) - 1))
+
+        target = self.epochs[new_row]
+        self._show_channel_in_trace_view(int(target.channel))
+        self._pan_to_event(target)
+
+        # Programmatic selection; block signals so
+        # _on_table_selection_changed doesn't fire mid-way.
+        self.table.blockSignals(True)
+        self.table.selectRow(new_row)
+        self.table.blockSignals(False)
+
+        # Emit selection so the trace view highlights this epoch.
+        self.thetaEpochSelected.emit(new_row)
+
+        # Tell MainWindow to merge this channel into the probe map's
+        # selection.
+        self.eventFocused.emit(int(target.channel))
+
+        self.status_label.setText(
+            f"Epoch {new_row + 1} of {len(self.epochs)} on CH{target.channel} "
+            f"({'(next)' if direction > 0 else '(prev)'})"
+        )
 
     def _delete_selected_epoch(self):
         row = self.table.currentRow()

@@ -1157,6 +1157,7 @@ class MainWindow(QMainWindow):
         dialog.finished.connect(
             lambda _res, d=dialog: self._on_theta_cycle_dialog_closed(d)
         )
+        dialog.eventFocused.connect(self._on_event_focused)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -2586,6 +2587,7 @@ class MainWindow(QMainWindow):
 
         self._open_ripple_dialogs.append(dialog)
         dialog.finished.connect(lambda _res, d=dialog: self._on_ripple_dialog_closed(d))
+        dialog.eventFocused.connect(self._on_event_focused)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -2626,9 +2628,30 @@ class MainWindow(QMainWindow):
         self.trace_view.thetaEpochSelected.connect(dialog.set_selected_epoch)
 
         dialog.finished.connect(lambda _res, d=dialog: self._on_theta_dialog_closed(d))
+        dialog.eventFocused.connect(self._on_event_focused)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _on_event_focused(self, channel: int):
+        """A dialog emitted eventFocused(channel) because the user
+        clicked a row in its table. Merge that channel into the
+        probe map's current selection so the event's electrode is
+        highlighted without discarding any channels the user was
+        already looking at. If the channel is already selected, this
+        is a no-op (the dialog's own pan is what moves the view)."""
+        if self.probe_map is None:
+            return
+        try:
+            current = set(self.probe_map.get_selected_channels())
+        except Exception:
+            current = set()
+        channel = int(channel)
+        if channel in current:
+            return
+        current.add(channel)
+        self.probe_map.set_selected_channels(sorted(current))
+
 
     def _on_theta_dialog_closed(self, dialog):
         if dialog in self._open_theta_dialogs:
