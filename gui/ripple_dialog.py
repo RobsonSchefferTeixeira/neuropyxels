@@ -201,6 +201,7 @@ class RippleDialog(QDialog):
         self._filtered_by_channel: dict[int, np.ndarray] = {}
         self._sample_offset = 0
         self._selected_channel: int | None = None
+        self._selected_index: int | None = None
         self._params: RippleParams | None = None
         self._open_rta_dialogs: list[RippleTriggeredAverageDialog] = []
         self._detect_n_samples = 0
@@ -1025,6 +1026,9 @@ class RippleDialog(QDialog):
         a timestamps file loaded after detection is reflected without
         reopening the dialog."""
         flat = self._flat_events()
+        # Null the anchor BEFORE touching the widget so the cache can
+        # never disagree with the visible selection, even transiently.
+        self._selected_index = None
         self.summary_table.blockSignals(True)
         try:
             self.summary_table.setRowCount(len(flat))
@@ -1067,6 +1071,7 @@ class RippleDialog(QDialog):
                     )
                     self.summary_table.setItem(row, col, item)
             self.summary_table.clearSelection()
+            
         finally:
             self.summary_table.blockSignals(False)
 
@@ -1084,6 +1089,7 @@ class RippleDialog(QDialog):
         rows = self.summary_table.selectionModel().selectedRows()
         if not rows:
             self._selected_channel = None
+            self._selected_index = None
             return
         row = rows[0].row()
         flat = self._flat_events()
@@ -1091,19 +1097,14 @@ class RippleDialog(QDialog):
             return
         target = flat[row]
         self._selected_channel = int(target.channel)
+        self._selected_index = int(row)
 
-        # Mirror the selection on the trace view: highlight this exact
-        # ripple, not just its channel. The trace view indexes events by
-        # their position in its own flat list, which is sorted the same
-        # way, so the row index maps directly.
         self.trace_view.set_ripple_selected_event(row)
-
         self._show_channel_in_trace_view(self._selected_channel)
         self.status_label.setText(
             f"CH{self._selected_channel} ripple at "
             f"{self.engine.sample_to_time(int(target.start_sample) + int(self._sample_offset)):.3f} s"
         )
-        self._show_channel_in_trace_view(self._selected_channel)
 
     def set_selected_event(self, index: int):
         """Slot for trace_view.rippleEventSelected -- index is into the
@@ -1134,77 +1135,39 @@ class RippleDialog(QDialog):
         self._step_ripple(direction=1)
 
     def _step_ripple(self, direction: int):
-        # If the user hasn't picked a channel yet, treat the first
-        # Next / Prev as "start from the beginning / end of the table"
-        # rather than refusing with a message. This makes the buttons
-        # immediately useful the moment ripples exist.
-        if self._selected_channel is None:
-            flat = self._flat_events()
-            if not flat:
-                return
-            target_row = 0 if direction > 0 else len(flat) - 1
-            target = flat[target_row]
+        """Step Prev/Next through the flat, (channel, start_sample)-
+        sorted list of every ripple across every detected channel --
+        the same order the table shows. Crossing from the last ripple
+        of one channel into the first of the next is intentional: the
+        button means 'next row in the table', not 'next ripple on this
+        channel'.
 
-            # Set the selected channel and pan so the following
-            # navigation logic (below) has a coherent anchor. From here
-            # on, behavior is identical to "user clicked a row".
-            self._selected_channel = int(target.channel)
-            self._show_channel_in_trace_view(self._selected_channel)
-
-            # Highlight the row in the table.
-            self.summary_table.blockSignals(True)
-            self.summary_table.selectRow(target_row)
-            self.summary_table.blockSignals(False)
-
-            # Pan the view.
-            window_duration = max(0.05, self.nav_window_spin.value())
-            target_time = float(self.engine.sample_to_time(
-                int(target.peak_sample) + int(self._sample_offset)
-            ))
-            t_min, _ = self.engine.get_time_range()
-            new_start = max(t_min, target_time - window_duration / 2)
-            self.trace_view.window_duration = window_duration
-            self.trace_view.start_time = new_start
-            self.trace_view.control_panel.set_duration(window_duration)
-            self.trace_view._update_time_labels()
-            self.trace_view._update_scrollbar_position()
-            self.trace_view._invalidate_cache()
-            self.trace_view.update()
-            # Tell the trace view to draw the green selection on this
-            # ripple. No signal to emit -- RippleDialog has no
-            # rippleEventSelected; that signal lives on the trace view
-            # and flows the other direction (trace -> dialog). Here we
-            # are the caller, not a subscriber.
-            self.trace_view.set_ripple_selected_event(target_row)
-            self.status_label.setText(
-                f"Ripple {target_row + 1} of {len(flat)} on CH{target.channel}."
-            )
+        The anchor is the table's own selection, not a cached index.
+        Whatever row is visibly highlighted is where the user is; if
+        nothing is selected, direction > 0 starts at row 0 and
+        direction < 0 starts at the last row. When the end (or start)
+        is reached, the selection stays put -- no wrap.
+        """
+        flat = self._flat_events()
+        if not flat:
             return
 
-        events = self.events_by_channel.get(self._selected_channel, [])
-        if not events:
-            return
-
-        self._show_channel_in_trace_view(self._selected_channel)
-
-        current_center_time = (
-            self.trace_view.start_time + self.trace_view.window_duration / 2
-        )
-
-        def event_peak_time(ev: RippleEvent) -> float:
-            return float(self.engine.sample_to_time(
-                int(ev.peak_sample) + int(self._sample_offset)
-            ))
-
-        if direction > 0:
-            candidates = [e for e in events if event_peak_time(e) > current_center_time + 1e-9]
-            target = candidates[0] if candidates else events[-1]
+        rows = self.summary_table.selectionModel().selectedRows()
+        if rows:
+            current_row = int(rows[0].row())
         else:
-            candidates = [e for e in events if event_peak_time(e) < current_center_time - 1e-9]
-            target = candidates[-1] if candidates else events[0]
+            current_row = -1 if direction > 0 else len(flat)
 
+        new_row = current_row + direction
+        new_row = max(0, min(new_row, len(flat) - 1))
+
+        target = flat[new_row]
+        target_time = float(self.engine.sample_to_time(
+            int(target.peak_sample) + int(self._sample_offset)
+        ))
+
+        # Pan the trace view to the target's peak time.
         window_duration = max(0.05, self.nav_window_spin.value())
-        target_time = event_peak_time(target)
         t_min, _ = self.engine.get_time_range()
         new_start = max(t_min, target_time - window_duration / 2)
 
@@ -1216,24 +1179,27 @@ class RippleDialog(QDialog):
         self.trace_view._invalidate_cache()
         self.trace_view.update()
 
-        # Select the target event in both the table and the trace view
-        # overlay. Both index the same flat, (channel, start_sample)-
-        # sorted list, so a single integer drives both. Without this,
-        # Prev/Next only moved the view -- the user couldn't see which
-        # ripple they had landed on.
-        flat = self._flat_events()
-        for i, ev in enumerate(flat):
-            if ev is target:
-                self.summary_table.blockSignals(True)
-                self.summary_table.selectRow(i)
-                self.summary_table.blockSignals(False)
-                self.trace_view.set_ripple_selected_event(i)
-                self.status_label.setText(
-                    f"CH{target.channel} ripple at {target_time:.3f} s "
-                    f"({'(next)' if direction > 0 else '(prev)'})"
-                )
-                break
+        # Ensure the target's channel is drawn (same effect as clicking
+        # the corresponding table row).
+        self._show_channel_in_trace_view(int(target.channel))
+        self._selected_channel = int(target.channel)
 
+        # Programmatic selection: block the table's signals so that
+        # itemSelectionChanged doesn't fire mid-way through and read a
+        # partially-updated selection. After this returns, the table
+        # reflects the new state; _selected_index is set explicitly so
+        # it can't disagree with what's visible.
+        self.summary_table.blockSignals(True)
+        self.summary_table.selectRow(new_row)
+        self.summary_table.blockSignals(False)
+        self._selected_index = new_row
+
+        self.trace_view.set_ripple_selected_event(new_row)
+
+        self.status_label.setText(
+            f"Ripple {new_row + 1} of {len(flat)} on CH{target.channel} "
+            f"({'(next)' if direction > 0 else '(prev)'})"
+        )
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
@@ -1351,10 +1317,17 @@ class RippleDialog(QDialog):
             QMessageBox.information(self, "No events found", f"{csv_path} contains no ripple events.")
             return
 
+        # Replace the in-memory event set with what was loaded. Loading
+        # the same file twice produces the same state, not a doubled
+        # list. This also discards any in-memory edits that weren't
+        # saved -- which is the expected behavior for "Load" (as
+        # opposed to "Import" or "Merge").
+        regrouped: dict[int, list[RippleEvent]] = {}
         for ev in events:
-            self.events_by_channel.setdefault(ev.channel, []).append(ev)
-        for ch in self.events_by_channel:
-            self.events_by_channel[ch].sort(key=lambda e: e.start_sample)
+            regrouped.setdefault(ev.channel, []).append(ev)
+        for ch in regrouped:
+            regrouped[ch].sort(key=lambda e: e.start_sample)
+        self.events_by_channel = regrouped
 
         if sidecar is not None:
             self._apply_sidecar(sidecar, events)

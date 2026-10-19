@@ -557,6 +557,7 @@ class ThetaCycleDialog(QDialog):
         is reflected on the next repopulation without any explicit
         'recompute' step."""
         flat = self._flat_cycles()
+        self._selected_index = None
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(len(flat))
@@ -675,40 +676,38 @@ class ThetaCycleDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _step_cycle(self, direction: int):
+        """Step Prev/Next through the flat, (channel, start_sample)-
+        sorted list of every cycle across every detected channel --
+        the same order the table shows. Crossing from the last cycle
+        of one channel into the first of the next is intentional: the
+        button means 'next row in the table', not 'next cycle on this
+        channel'.
+
+        If nothing is selected, direction > 0 starts at row 0 and
+        direction < 0 starts at the last row. When the end (or start)
+        is reached, the selection stays put -- no wrap.
+        """
         flat = self._flat_cycles()
         if not flat:
             return
 
-        # Determine the current position.
-        if self._selected_index is not None and 0 <= self._selected_index < len(flat):
-            current_cycle = flat[self._selected_index]
-            current_ch = current_cycle.channel
-            current_zc = current_cycle.zero_crossing_start
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            current_row = int(rows[0].row())
         else:
-            current_ch = flat[0].channel
-            current_zc = 0
+            current_row = -1 if direction > 0 else len(flat)
 
-        # Cycles on the same channel, ordered by zc_start.
-        same_ch = [c for c in flat if c.channel == current_ch]
-        if not same_ch:
-            return
+        new_row = current_row + direction
+        new_row = max(0, min(new_row, len(flat) - 1))
 
-        if direction > 0:
-            candidates = [c for c in same_ch if c.zero_crossing_start > current_zc]
-            target = candidates[0] if candidates else same_ch[-1]
-        else:
-            candidates = [c for c in same_ch if c.zero_crossing_start < current_zc]
-            target = candidates[-1] if candidates else same_ch[0]
+        target = flat[new_row]
 
-        self._ensure_channel_visible(target.channel)
+        self._ensure_channel_visible(int(target.channel))
 
-        # Center the view on the target's peak1. The trace view's
-        # start_time is in the engine's current time base (clock if
-        # timestamps loaded), so use sample_to_time rather than
-        # sample / sr.
+        # Center the view on the target's peak1.
         peak_time = float(self.engine.sample_to_time(int(target.peak1)))
         window = max(0.05, self.nav_window_spin.value())
-        t_min, t_max = self.engine.get_time_range()
+        t_min, _ = self.engine.get_time_range()
         new_start = max(t_min, peak_time - window / 2)
 
         self.trace_view.window_duration = window
@@ -718,16 +717,16 @@ class ThetaCycleDialog(QDialog):
         self.trace_view._invalidate_cache()
         self.trace_view.update()
 
-        # Select it in table + overlay.
-        for i, c in enumerate(flat):
-            if c is target:
-                self.trace_view.set_theta_cycle_selected(i)
-                self.cycleSelected.emit(i)
-                self.table.blockSignals(True)
-                self.table.selectRow(i)
-                self.table.blockSignals(False)
-                self._selected_index = i
-                break
+        self.table.blockSignals(True)
+        self.table.selectRow(new_row)
+        self.table.blockSignals(False)
+        self.trace_view.set_theta_cycle_selected(new_row)
+        self._selected_index = new_row
+
+        self.status_label.setText(
+            f"Cycle {new_row + 1} of {len(flat)} on CH{target.channel} "
+            f"({'(next)' if direction > 0 else '(prev)'})"
+        )
     # ------------------------------------------------------------------
     # Export / import
     # ------------------------------------------------------------------
@@ -827,12 +826,17 @@ class ThetaCycleDialog(QDialog):
                                     f"{csv_path} contains no cycles.")
             return
 
+        # Replace the in-memory cycle set with what was loaded. Loading
+        # the same file twice produces the same state, not a doubled
+        # list. This also discards any in-memory edits that weren't
+        # saved -- which is the expected behavior for "Load" (as
+        # opposed to "Import" or "Merge").
+        regrouped: dict[int, list[ThetaCycle]] = {}
         for c in cycles:
-            self.cycles_by_channel.setdefault(c.channel, []).append(c)
-        for ch in self.cycles_by_channel:
-            self.cycles_by_channel[ch].sort(
-                key=lambda c: c.zero_crossing_start
-            )
+            regrouped.setdefault(c.channel, []).append(c)
+        for ch in regrouped:
+            regrouped[ch].sort(key=lambda c: c.zero_crossing_start)
+        self.cycles_by_channel = regrouped
 
         if sidecar is not None:
             self._apply_sidecar(sidecar)
