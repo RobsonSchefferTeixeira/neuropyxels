@@ -182,8 +182,8 @@ class ChannelOptionsPanel(QWidget):
         self.csd_high_spin.setRange(0.0, 15000.0)
         self.csd_high_spin.setSingleStep(1.0)
         self.csd_high_spin.setToolTip("0 = compute CSD directly from raw")
-        self.csd_high_spin.valueChanged.connect(self._on_csd_high_edited)
         self.csd_high_spin.valueChanged.connect(self._on_any_changed)
+        self.csd_high_spin.valueChanged.connect(self._on_csd_high_edited)
         csd_layout.addWidget(self.csd_high_spin, 2, 1)
 
 
@@ -260,45 +260,35 @@ class ChannelOptionsPanel(QWidget):
         self._on_any_changed()
 
     def _on_csd_low_edited(self, value: float):
-        """CSD band low. 0 is a valid sentinel meaning 'no low cutoff';
-        the low < high ordering is only enforced when both sides are
-        nonzero. Ranges are never mutated here -- only values are
-        adjusted when they'd violate the ordering -- so both spinboxes
-        stay able to reach 0 at any time, which is essential since 0
-        disables the band (see
-        PhaseAmplitudeAnalyzer.compute_csd_with_options)."""
-        step = self.csd_low_spin.singleStep()
-        high_value = self.csd_high_spin.value()
-
-        if value > 0 and high_value > 0 and value >= high_value:
-            new_value = max(0.0, high_value - step)
+        step = self.csd_high_spin.singleStep()
+        new_min = value + step
+        high_max = self.csd_high_spin.maximum()
+        if new_min > high_max:
+            new_min = high_max
+            value = max(0.0, high_max - step)
             self.csd_low_spin.blockSignals(True)
-            self.csd_low_spin.setValue(new_value)
+            self.csd_low_spin.setValue(value)
             self.csd_low_spin.blockSignals(False)
-
+        self.csd_high_spin.blockSignals(True)
+        self.csd_high_spin.setMinimum(new_min)
+        self.csd_high_spin.blockSignals(False)
         self._on_any_changed()
 
     def _on_csd_high_edited(self, value: float):
-        """CSD band high. Mirror of _on_csd_low_edited."""
-        step = self.csd_high_spin.singleStep()
-        low_value = self.csd_low_spin.value()
-
-        if value > 0 and low_value > 0 and value <= low_value:
-            new_value = low_value + step
-            high_max = self.csd_high_spin.maximum()
-            if new_value > high_max:
-                # Can't push high above low's current value -- pull low
-                # down instead. This never forces low to a nonzero value.
-                new_value = high_max
-                new_low = max(0.0, new_value - step)
-                self.csd_low_spin.blockSignals(True)
-                self.csd_low_spin.setValue(new_low)
-                self.csd_low_spin.blockSignals(False)
+        step = self.csd_low_spin.singleStep()
+        new_max = value - step
+        low_min = self.csd_low_spin.minimum()
+        if new_max < low_min:
+            new_max = low_min
+            value = low_min + step
             self.csd_high_spin.blockSignals(True)
-            self.csd_high_spin.setValue(new_value)
+            self.csd_high_spin.setValue(value)
             self.csd_high_spin.blockSignals(False)
-
+        self.csd_low_spin.blockSignals(True)
+        self.csd_low_spin.setMaximum(new_max)
+        self.csd_low_spin.blockSignals(False)
         self._on_any_changed()
+        
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
