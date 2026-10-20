@@ -279,44 +279,6 @@ class ProbeDefinition:
             shank_ids=[int(s) for s in shanks.get("ids", [])],
         )
     
-    @classmethod
-    def load_json_with_source(
-        cls, path: str | Path
-    ) -> tuple["ProbeDefinition", str]:
-        """Same as load_json, but also returns which schema the file
-        used: 'definition' (native ProbeDefinition JSON) or
-        'kilosort_chanmap' (Kilosort chanMap JSON, translated).
-
-        Callers that want to add extra friction when a value had to be
-        defaulted rather than read -- e.g. forcing the user to confirm
-        the sample rate for a chanMap, which doesn't carry one -- use
-        this variant. Callers that just want the definition call
-        load_json instead.
-        """
-        path = Path(path)
-        with open(path, "r") as f:
-            data = json.load(f)
-
-        if cls._is_kilosort_chanmap(data):
-            return cls._from_kilosort_chanmap(data, name=path.stem), "kilosort_chanmap"
-
-        coords = data.get("coordinates", {})
-        shanks = data.get("shanks", {})
-
-        definition = cls(
-            name=str(data.get("name", "CustomProbe")),
-            n_channels=int(data.get("n_channels", 0)),
-            sample_rate=float(data.get("sample_rate", 30000.0)),
-            dtype=str(data.get("dtype", "int16")),
-            bit_volts=float(data.get("bit_volts", 1.0)),
-            probe_type=str(data.get("probe_type", "Custom")),
-            serial_number=str(data.get("serial_number", "")),
-            channels=[int(c) for c in coords.get("channels", [])],
-            x=[float(v) for v in coords.get("x", [])],
-            y=[float(v) for v in coords.get("y", [])],
-            shank_ids=[int(s) for s in shanks.get("ids", [])],
-        )
-        return definition, "definition"
     # ------------------------------------------------------------------
     # Open Ephys settings.xml I/O
     # ------------------------------------------------------------------

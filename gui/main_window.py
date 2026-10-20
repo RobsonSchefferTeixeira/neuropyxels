@@ -493,7 +493,7 @@ class MainWindow(QMainWindow):
             tv.control_panel.set_high_fidelity(False)
         except Exception:
             pass
-        
+
         # Global filter state + panel.
         tv.filter_enabled = False
         tv.filter_low_freq = 1.0
@@ -902,7 +902,7 @@ class MainWindow(QMainWindow):
                 "Focus mode: select one unit to open its local "
                 "neighborhood."
             )
-
+            
     def _on_focus_neighborhood_size_changed(self, _n: int):
         """If a unit is already focused, recompute its neighborhood
         with the new size."""
@@ -911,6 +911,8 @@ class MainWindow(QMainWindow):
         unit_id = self.phy_units_panel.focused_unit_id()
         if unit_id >= 0:
             self._apply_focus_neighborhood(unit_id)
+
+
 
     def _on_focused_unit_changed(self, unit_id: int):
         """Apply or clear focus for the given unit id. -1 means no
@@ -931,85 +933,6 @@ class MainWindow(QMainWindow):
             return
         self._apply_focus_neighborhood(unit_id)
 
-    def _apply_focus_neighborhood(self, unit_id: int):
-        phy_data = getattr(self.engine, "phy_data", None)
-        if phy_data is None:
-            return
-        unit = phy_data.units.get(int(unit_id))
-        if unit is None or unit.channel is None:
-            self._update_status(
-                f"Focus mode: unit {unit_id} has no assigned channel."
-            )
-            return
-
-        center_ch = int(unit.channel)
-        n_levels = self.phy_units_panel.focus_neighborhood_size()
-        neighborhood = self.trace_view.compute_focus_neighborhood(center_ch, n_levels)
-        if self._rejected_channels:
-            neighborhood = [
-                ch for ch in neighborhood
-                if ch not in self._rejected_channels
-            ]
-        if not neighborhood:
-
-            self._update_status(
-                f"Focus mode: could not compute neighborhood for "
-                f"unit {unit_id} (CH{center_ch}) -- is the probe "
-                f"geometry loaded?"
-            )
-            return
-
-        self.trace_view.set_channels(neighborhood)
-        self.trace_view.set_raster_units([int(unit_id)])
-
-        if self.probe_map is not None:
-            self.probe_map.set_selected_channels(neighborhood)
-
-        if hasattr(self, "selected_list"):
-            from PyQt6.QtWidgets import QListWidgetItem
-            self.selected_list.clear()
-            for ch in neighborhood:
-                self.selected_list.addItem(QListWidgetItem(f"CH{ch}"))
-            self.selected_channels_dock.setWindowTitle(
-                f"Selected Channels ({len(neighborhood)})"
-            )
-
-        self._update_status(
-            f"Focus mode: unit {unit_id} (CH{center_ch}) — "
-            f"{len(neighborhood)} channel(s) in neighborhood."
-        )
-
-
-
-
-    def _on_focus_mode_changed(self, enabled: bool):
-        """Entering focus mode clears the current display so the user
-        sees an empty trace view and an empty probe map, then waits
-        for a unit to be selected. Leaving focus mode does nothing
-        automatic -- the current selection stays in place, and
-        multi-select is re-enabled in the panel."""
-        if enabled:
-            # Clear trace view + probe map.
-            if self.trace_view is not None:
-                self.trace_view.set_raster_units([])
-                self.trace_view.set_channels([])
-            if self.probe_map is not None:
-                self.probe_map.set_selected_channels([])
-            if hasattr(self, "selected_list"):
-                self.selected_list.clear()
-            self._update_status(
-                "Focus mode: select one unit to open its local "
-                "neighborhood."
-            )
-
-    def _on_focus_neighborhood_size_changed(self, _n: int):
-        """If a unit is already focused, recompute its neighborhood
-        with the new size."""
-        if not self.phy_units_panel.focus_mode_enabled():
-            return
-        unit_id = self.phy_units_panel.focused_unit_id()
-        if unit_id >= 0:
-            self._apply_focus_neighborhood(unit_id)
 
     def _on_focused_unit_changed(self, unit_id: int):
         """Apply or clear focus for the given unit id. -1 means no
