@@ -287,8 +287,9 @@ class TraceControlPanel(QWidget):
         self.low_freq_spin.setEnabled(False)
         self.low_freq_spin.setKeyboardTracking(False)
         self.low_freq_spin.setToolTip("Set to 0 for low-pass only")
-        self.low_freq_spin.valueChanged.connect(self._on_low_freq_edited)
-        
+        self.low_freq_spin.setKeyboardTracking(False)
+        self.low_freq_spin.editingFinished.connect(self._on_filter_params_changed)
+
         bp_row.addWidget(self.low_freq_spin)
         
         
@@ -299,8 +300,9 @@ class TraceControlPanel(QWidget):
         self.high_freq_spin.setEnabled(False)
         self.high_freq_spin.setKeyboardTracking(False)
         self.high_freq_spin.setToolTip("Set to 0 for high-pass only")
-        self.high_freq_spin.valueChanged.connect(self._on_high_freq_edited)
-
+        self.high_freq_spin.setKeyboardTracking(False)
+        self.high_freq_spin.editingFinished.connect(self._on_filter_params_changed)
+        
         bp_row.addWidget(self.high_freq_spin)
 
         # In _build_ui, right after constructing high_freq_spin:
@@ -443,15 +445,11 @@ class TraceControlPanel(QWidget):
         layout.addWidget(perf_group)
 
 
-
-        # Paired-range priming. Runs first so the two spinboxes start
-        # mutually consistent.
-        self._on_low_freq_edited(self.low_freq_spin.value())
-
         # Then the enabled-state sync, which reads the global-filter
         # checkbox and greys out (or enables) the sub-controls.
         self._on_global_filter_toggled(self.global_filter_checkbox.isChecked())
-
+    
+    '''
 
     def _on_low_freq_edited(self, value: float):
         """Handler for the LOW cutoff spinbox.
@@ -611,7 +609,7 @@ class TraceControlPanel(QWidget):
         self.low_freq_spin.blockSignals(False)
 
         self._on_filter_params_changed()
-
+    '''
 
     def set_sample_rate(self, sample_rate: float):
         """Record the Nyquist-safe frequency bound for the current
@@ -629,13 +627,9 @@ class TraceControlPanel(QWidget):
         safe_high = max(1.0, 0.95 * nyq)
         self._nyquist_safe_max = safe_high
 
-        # Notch isn't paired, so it can keep a plain range constraint.
-        self.notch_freq_spin.blockSignals(True)
-        self.notch_freq_spin.setMaximum(safe_high)
-        self.notch_freq_spin.blockSignals(False)
-
-        # Re-prime the paired-range guards against the new bound.
-        self._on_low_freq_edited(self.low_freq_spin.value())
+        self.low_freq_spin.setRange(0.0, safe_high)
+        self.high_freq_spin.setRange(0.0, safe_high)
+        self.notch_freq_spin.setRange(0.0, safe_high)
         
     # ---- Signal emitters ----
 
@@ -995,6 +989,14 @@ class TraceViewWidget(QWidget):
 
         self._build_scrollbar(layout)
 
+        self.filter_warning_label = QLabel("")
+        self.filter_warning_label.setStyleSheet(
+            "color: #e57373; background-color: #2a1a1a; font-size: 10px; padding: 2px;"
+        )
+        self.filter_warning_label.setVisible(False)
+        layout.addWidget(self.filter_warning_label)
+
+
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _connect_control_panel(self):
@@ -1016,7 +1018,7 @@ class TraceViewWidget(QWidget):
         self.control_panel.globalFilterEnabledChanged.connect(self._on_global_filter_enabled_changed)
         self.control_panel.resetChannelCustomizationsRequested.connect(self._on_reset_all_channel_options)
         self.control_panel.highFidelityChanged.connect(self.set_high_fidelity)
-        
+
 
     def _build_scrollbar(self, layout: QVBoxLayout):
         self.scrollbar = QScrollBar(Qt.Orientation.Horizontal)
@@ -1658,6 +1660,8 @@ class TraceViewWidget(QWidget):
             return False
         return not opts.is_default()
 
+
+    
     def _open_channel_options_panel(self, channel: int):
         """Open (or refocus) the floating panel for a channel. Closes
         any panel already open for a different channel."""
@@ -1818,8 +1822,7 @@ class TraceViewWidget(QWidget):
     # Per-channel display modes
     # ------------------------------------------------------------------
 
-    def _has_channel_override(self, channel: int) -> bool:
-        return channel in self.channel_display_modes
+
 
     def _modes_for(self, channel: int) -> dict[str, bool]:
         return self.channel_display_modes.get(channel, {'raw': True, 'filtered': False, 'csd': False})
@@ -2619,6 +2622,15 @@ class TraceViewWidget(QWidget):
             self.filter_enabled or self.notch_enabled or self.detrend_enabled
         )
 
+        global_filter_invalid = (
+            self.filter_enabled
+            and self.filter_low_freq > 0 and self.filter_high_freq > 0
+            and self.filter_low_freq >= self.filter_high_freq
+        )
+        if global_filter_invalid:
+            global_filter_active = False
+
+            
         data: dict[int, list[dict]] = {}
 
         for ch in self.channels:
@@ -2638,10 +2650,11 @@ class TraceViewWidget(QWidget):
                 if opts.show_raw:
                     raw_trace = self._apply_filters(raw) if global_filter_active else raw
                     traces.append({'mode': 'raw', 'data': raw_trace, 'gain': opts.raw_gain})
-                if opts.show_filtered:
+                if opts.show_filtered and not opts.filter_band_invalid():
                     filtered = self._apply_channel_filter(raw, opts.filter_low, opts.filter_high)
-                    traces.append({'mode': 'filtered', 'data': filtered, 'gain': opts.filtered_gain})
-                if opts.show_csd:
+                    if filtered is not None:
+                        traces.append({'mode': 'filtered', 'data': filtered, 'gain': opts.filtered_gain})
+                if opts.show_csd and not opts.csd_band_invalid():
                     csd = self._compute_channel_csd(ch, raw, opts, end_time)
                     if csd is not None:
                         traces.append({'mode': 'csd', 'data': csd, 'gain': opts.csd_gain})
@@ -2658,6 +2671,29 @@ class TraceViewWidget(QWidget):
         self._cache_end = end_time
         self._cache_start_idx = start_idx
         self._cache_end_idx = end_idx
+
+
+        msgs = []
+        if global_filter_invalid:
+            msgs.append(
+                f"Global filter: Low ({self.filter_low_freq:.0f} Hz) "
+                f"must be < High ({self.filter_high_freq:.0f} Hz)."
+            )
+        for ch, opts in self._channel_options.items():
+            if ch not in self.channels:
+                continue
+            if opts.filter_band_invalid():
+                msgs.append(f"CH{ch} Filtered band invalid.")
+            if opts.csd_band_invalid():
+                msgs.append(f"CH{ch} CSD band invalid.")
+        if msgs:
+            # Deduplicate and cap so the label doesn't grow to hundreds of lines.
+            uniq = list(dict.fromkeys(msgs))[:6]
+            self.filter_warning_label.setText("  |  ".join(uniq))
+            self.filter_warning_label.setVisible(True)
+        else:
+            self.filter_warning_label.setVisible(False)
+
         return data
 
     def _apply_channel_filter(self, raw, low, high):
@@ -2699,11 +2735,8 @@ class TraceViewWidget(QWidget):
                     output="sos",
                 )
             else:
-                print(
-                    f"[filter] ch filter skipping invalid band: "
-                    f"low={low:.3f} high={high:.3f}"
-                )
-                return raw
+                return None
+            
             return sosfiltfilt(sos, raw, axis=0)
         except ValueError as exc:
             print(f"[filter] ch filter failed: {exc}; low={low} high={high}")

@@ -56,6 +56,19 @@ class ChannelOptions:
             and self.raw_gain == 1.0
         )
 
+    def filter_band_invalid(self) -> bool:
+        if not self.show_filtered:
+            return False
+        if self.filter_low <= 0 or self.filter_high <= 0:
+            return False
+        return self.filter_low >= self.filter_high
+
+    def csd_band_invalid(self) -> bool:
+        if not self.show_csd:
+            return False
+        if self.csd_low <= 0 or self.csd_high <= 0:
+            return False
+        return self.csd_low >= self.csd_high
 
 class ChannelOptionsPanel(QWidget):
     """Floating panel for editing one channel's ChannelOptions."""
@@ -91,8 +104,6 @@ class ChannelOptionsPanel(QWidget):
         # Now safe to prime the paired-range handlers: widgets hold the
         # saved values, so _on_any_changed() inside them is a no-op on
         # every field that wasn't touched.
-        self._on_filter_low_edited(self.filter_low_spin.value())
-        self._on_csd_low_edited(self.csd_low_spin.value())
 
     # ------------------------------------------------------------------
     # UI
@@ -136,8 +147,8 @@ class ChannelOptionsPanel(QWidget):
         self.filter_low_spin = QDoubleSpinBox()
         self.filter_low_spin.setRange(0.0, 15000.0)
         self.filter_low_spin.setSingleStep(1.0)
-        self.filter_low_spin.valueChanged.connect(self._on_any_changed)
-        self.filter_low_spin.valueChanged.connect(self._on_filter_low_edited)
+        self.filter_low_spin.setKeyboardTracking(False)
+        self.filter_low_spin.editingFinished.connect(self._on_any_changed)
         filt_layout.addWidget(self.filter_low_spin, 1, 1)
                 
         
@@ -145,8 +156,8 @@ class ChannelOptionsPanel(QWidget):
         self.filter_high_spin = QDoubleSpinBox()
         self.filter_high_spin.setRange(0.0, 15000.0)
         self.filter_high_spin.setSingleStep(1.0)
-        self.filter_high_spin.valueChanged.connect(self._on_any_changed)
-        self.filter_high_spin.valueChanged.connect(self._on_filter_high_edited)
+        self.filter_high_spin.setKeyboardTracking(False)
+        self.filter_high_spin.editingFinished.connect(self._on_any_changed)
         filt_layout.addWidget(self.filter_high_spin, 2, 1)
         
         
@@ -174,16 +185,16 @@ class ChannelOptionsPanel(QWidget):
         self.csd_low_spin.setToolTip("0 = compute CSD directly from raw")
 
 
-        self.csd_low_spin.valueChanged.connect(self._on_any_changed)
-        self.csd_low_spin.valueChanged.connect(self._on_csd_low_edited)
+        self.csd_low_spin.setKeyboardTracking(False)
+        self.csd_low_spin.editingFinished.connect(self._on_any_changed)
         csd_layout.addWidget(self.csd_low_spin, 1, 1)
         csd_layout.addWidget(QLabel("Band high (Hz):"), 2, 0)
         self.csd_high_spin = QDoubleSpinBox()
         self.csd_high_spin.setRange(0.0, 15000.0)
         self.csd_high_spin.setSingleStep(1.0)
         self.csd_high_spin.setToolTip("0 = compute CSD directly from raw")
-        self.csd_high_spin.valueChanged.connect(self._on_any_changed)
-        self.csd_high_spin.valueChanged.connect(self._on_csd_high_edited)
+        self.csd_high_spin.setKeyboardTracking(False)
+        self.csd_high_spin.editingFinished.connect(self._on_any_changed)
         csd_layout.addWidget(self.csd_high_spin, 2, 1)
 
 
@@ -216,6 +227,15 @@ class ChannelOptionsPanel(QWidget):
         csd_layout.addWidget(self.csd_status_label, 5, 0, 1, 2)
         layout.addWidget(csd_group)
 
+
+        self.warning_label = QLabel("")
+        self.warning_label.setStyleSheet("color: #e57373; font-size: 10px;")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setVisible(False)
+        layout.addWidget(self.warning_label)
+
+
+
         # 1. Paired-range priming: low/high spinboxes start consistent.
         #self._on_filter_low_edited(self.filter_low_spin.value())
         #if hasattr(self, "csd_low_spin"):
@@ -227,8 +247,7 @@ class ChannelOptionsPanel(QWidget):
         #self._update_enabled_states()
 
 
-
-
+    '''
     def _on_filter_low_edited(self, value: float):
         step = self.filter_high_spin.singleStep()
         new_min = value + step
@@ -288,7 +307,8 @@ class ChannelOptionsPanel(QWidget):
         self.csd_low_spin.setMaximum(new_max)
         self.csd_low_spin.blockSignals(False)
         self._on_any_changed()
-        
+    '''
+
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
@@ -369,8 +389,6 @@ class ChannelOptionsPanel(QWidget):
         # Re-prime paired-range guards against the new bound. Runs
         # before _update_enabled_states so the ranges are already
         # correct by the time enabled-ness is applied.
-        self._on_filter_low_edited(self.filter_low_spin.value())
-        self._on_csd_low_edited(self.csd_low_spin.value())
 
         # Re-sync enabled states against the Filtered / CSD checkboxes.
         self._update_enabled_states()
@@ -394,6 +412,15 @@ class ChannelOptionsPanel(QWidget):
         self._options.csd_gain = float(self.csd_gain_spin.value())
         self._update_enabled_states()
         self.optionsChanged.emit(self.channel, self._options)
+        
+        msgs = []
+        if self._options.filter_band_invalid():
+            msgs.append("Filtered: Low must be < High.")
+        if self._options.csd_band_invalid():
+            msgs.append("CSD: Low must be < High.")
+        self.warning_label.setText("  ".join(msgs))
+        self.warning_label.setVisible(bool(msgs))
+
 
     def set_csd_status(self, message: str, level: str = "info"):
         """Called by TraceViewWidget to report CSD availability for this
