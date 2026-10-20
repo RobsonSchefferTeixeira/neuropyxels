@@ -182,6 +182,7 @@ class ThetaEpochDialog(QDialog):
         self._available_min_time = 0.0
         self._available_max_time = 0.0
         self._detect_n_samples = 0
+        self._suppress_pan_on_select = False
 
         self._build_ui()
         self._refresh_export_buttons()
@@ -586,8 +587,27 @@ class ThetaEpochDialog(QDialog):
             self.status_label.setText(f"{len(self.epochs)} theta epochs.")
 
     def set_selected_epoch(self, index: int):
-        if 0 <= index < self.table.rowCount():
-            self.table.selectRow(index)
+        """Slot for trace_view.thetaEpochSelected -- an epoch was clicked
+        on the trace view. Highlight it in the table WITHOUT panning the
+        trace view: the user is already looking at the epoch (they just
+        clicked it), and re-centering on click makes it impossible to
+        resize a boundary handle near the edge of the window.
+
+        Navigation that SHOULD center -- clicking a table row, or the
+        Prev/Next Epoch buttons -- goes through _on_table_selection_changed
+        / _step_epoch instead, which do not set this flag.
+        """
+        if not (0 <= index < self.table.rowCount()):
+            return
+        self._suppress_pan_on_select = True
+        try:
+            self.table.blockSignals(True)
+            self.table.selectRow(int(index))
+            self.table.blockSignals(False)
+        finally:
+            self._suppress_pan_on_select = False
+        # Keep the row visible in the table without touching the trace view.
+        self.table.scrollToItem(self.table.item(int(index), 0))
 
     def _on_table_selection_changed(self):
         row = self.table.currentRow()
@@ -595,19 +615,23 @@ class ThetaEpochDialog(QDialog):
         if row < 0:
             return
 
-        # Emit so the trace view highlights this epoch.
+        # Always tell the trace view which epoch is selected, so it can
+        # draw the selection highlight.
         self.thetaEpochSelected.emit(row)
 
         if not (0 <= row < len(self.epochs)):
             return
-        target = self.epochs[row]
 
-        # Make sure the epoch's channel is displayed, then pan the
-        # view so the epoch is centered.
+        # Click-to-select on the trace view must NOT recenter: that would
+        # move the epoch under the user's cursor every time they click it
+        # to grab a resize handle. Only table-row clicks and the Prev/Next
+        # buttons recenter.
+        if getattr(self, "_suppress_pan_on_select", False):
+            return
+
+        target = self.epochs[row]
         self._show_channel_in_trace_view(int(target.channel))
         self._pan_to_event(target)
-
-        # Ask MainWindow to highlight this channel on the probe map.
         self.eventFocused.emit(int(target.channel))
 
     def _show_channel_in_trace_view(self, channel: int):
