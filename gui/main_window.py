@@ -487,6 +487,13 @@ class MainWindow(QMainWindow):
         tv.control_panel.set_gain(1.0)
         tv.control_panel.set_auto_scale(False)
 
+        # Rendering mode: fast default.
+        tv.high_fidelity = False
+        try:
+            tv.control_panel.set_high_fidelity(False)
+        except Exception:
+            pass
+        
         # Global filter state + panel.
         tv.filter_enabled = False
         tv.filter_low_freq = 1.0

@@ -124,6 +124,7 @@ class TraceControlPanel(QWidget):
     performanceChanged = pyqtSignal(dict)   
     globalFilterEnabledChanged = pyqtSignal(bool)
     resetChannelCustomizationsRequested = pyqtSignal()
+    highFidelityChanged = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -402,7 +403,11 @@ class TraceControlPanel(QWidget):
         self.optimal_points_spin.setRange(200, 20000)
         self.optimal_points_spin.setSingleStep(100)
         self.optimal_points_spin.setValue(2000)
-        self.optimal_points_spin.setToolTip("Target number of points per channel when zoomed out (min/max decimation).")
+        self.optimal_points_spin.setToolTip(
+            "Target number of points per channel. In the fast path, this "
+            "is how many samples are kept per channel. In the high-"
+            "fidelity path, this is how many min/max pairs to produce."
+        )
         self.optimal_points_spin.valueChanged.connect(self._on_perf_settings_changed)
         perf_layout.addWidget(self.optimal_points_spin, 0, 1)
         perf_layout.addWidget(QLabel("Max total pts:"), 1, 0)
@@ -410,9 +415,31 @@ class TraceControlPanel(QWidget):
         self.max_total_points_spin.setRange(10000, 2000000)
         self.max_total_points_spin.setSingleStep(10000)
         self.max_total_points_spin.setValue(300000)
-        self.max_total_points_spin.setToolTip("Upper bound on points summed across all visible channels.")
+        self.max_total_points_spin.setToolTip(
+            "Upper bound on points summed across all visible channels."
+        )
         self.max_total_points_spin.valueChanged.connect(self._on_perf_settings_changed)
         perf_layout.addWidget(self.max_total_points_spin, 1, 1)
+
+        # High-fidelity toggle. Off by default: stride sampling.
+        # On: full min/max decimation. Not persisted across sessions.
+        self.high_fidelity_checkbox = QCheckBox("High fidelity rendering")
+        self.high_fidelity_checkbox.setChecked(False)
+        self.high_fidelity_checkbox.setToolTip(
+            "On: draws every peak and trough in the visible window "
+            "(min/max decimation). Accurate but slower for wide time "
+            "windows and many channels.\n\n"
+            "Off (default): fast stride sampling. Smooth scrolling, but "
+            "high-frequency content (e.g. ripple-band oscillation) can "
+            "appear as noise at typical zoom. Use the trace view's "
+            "ripple overlay or the Single Ripple View dialog to inspect "
+            "high-frequency features accurately."
+        )
+        self.high_fidelity_checkbox.toggled.connect(
+            self._on_high_fidelity_toggled
+        )
+        perf_layout.addWidget(self.high_fidelity_checkbox, 2, 0, 1, 2)
+
         layout.addWidget(perf_group)
 
 
@@ -621,6 +648,17 @@ class TraceControlPanel(QWidget):
             'max_total_points': self.max_total_points_spin.value(),
         })
 
+    def _on_high_fidelity_toggled(self, checked: bool):
+        self.highFidelityChanged.emit(bool(checked))
+
+    def set_high_fidelity(self, enabled: bool):
+        """Programmatic setter for the checkbox (used by MainWindow on
+        reset, or by any future persistence). Blocks signals so it
+        doesn't re-emit highFidelityChanged."""
+        self.high_fidelity_checkbox.blockSignals(True)
+        self.high_fidelity_checkbox.setChecked(bool(enabled))
+        self.high_fidelity_checkbox.blockSignals(False)
+
     def _on_use_timestamps_toggled(self, checked: bool):
         self.useTimestampsChanged.emit(checked)
 
@@ -757,6 +795,9 @@ class TraceViewWidget(QWidget):
 
         self.optimal_points_per_channel = 2000
         self.max_total_points = 300000
+        # Fast default: stride-sampling. Toggle on for full min/max
+        # decimation. Not persisted; resets to False at startup.
+        self.high_fidelity = False
         self._trace_path_cache = {}
         self._trace_cache_key = None
 
@@ -974,7 +1015,8 @@ class TraceViewWidget(QWidget):
         self.control_panel.performanceChanged.connect(self._on_performance_changed)
         self.control_panel.globalFilterEnabledChanged.connect(self._on_global_filter_enabled_changed)
         self.control_panel.resetChannelCustomizationsRequested.connect(self._on_reset_all_channel_options)
-
+        self.control_panel.highFidelityChanged.connect(self.set_high_fidelity)
+        
 
     def _build_scrollbar(self, layout: QVBoxLayout):
         self.scrollbar = QScrollBar(Qt.Orientation.Horizontal)
@@ -2283,6 +2325,19 @@ class TraceViewWidget(QWidget):
             self.trace_width = width
             self.update()
 
+    def set_high_fidelity(self, enabled: bool):
+        """Toggle between stride-sampling (fast, default) and full
+        min/max decimation (accurate, slower). Changing this
+        invalidates the trace path cache so the next paint takes the
+        new code path; the change is immediate."""
+        enabled = bool(enabled)
+        if enabled == self.high_fidelity:
+            return
+        self.high_fidelity = enabled
+        self._trace_cache_key = None
+        self._trace_path_cache.clear()
+        self.update()
+
     def set_channel_color(self, channel: int, color: str | QColor):
         self.set_trace_color(color, channel=channel)
 
@@ -3238,9 +3293,27 @@ class TraceViewWidget(QWidget):
                             if n_samples > 1
                             else np.array([0.0])
                         )
-                    else:
+                    elif self.high_fidelity:
+                        # Full min/max decimation: preserves every peak
+                        # and trough. Slower, but exact.
                         draw_y, x_ratios = self._decimate_minmax(
                             channel_data, target_per_channel
+                        )
+                        if draw_y.size == 0:
+                            continue
+                    else:
+                        # Stride sampling: fast, aliases high-frequency
+                        # content. The x ratios are exact sample
+                        # positions, so the drawn trace spans the
+                        # correct extent even though most samples are
+                        # skipped.
+                        stride = max(1, n_samples // max(1, target_per_channel))
+                        draw_y = channel_data[::stride]
+                        sample_positions = np.arange(0, n_samples, stride)
+                        x_ratios = (
+                            sample_positions / max(1, n_samples - 1)
+                            if n_samples > 1
+                            else np.array([0.0])
                         )
                         if draw_y.size == 0:
                             continue
