@@ -932,6 +932,22 @@ class ThetaEpochDialog(QDialog):
             self._detect_thread.wait(2000)
         if self.trace_view is not None and self.add_epoch_btn.isChecked():
             self.trace_view.cancel_theta_creation()
+
+        if self.trace_view is not None:
+            try:
+                self.trace_view.thetaEpochsChanged.disconnect(
+                    self.set_epochs_from_trace
+                )
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.trace_view.thetaEpochSelected.disconnect(
+                    self.set_selected_epoch
+                )
+            except (TypeError, RuntimeError):
+                pass
+            self.trace_view.clear_theta_epochs()
+
         super().closeEvent(event)
 
 

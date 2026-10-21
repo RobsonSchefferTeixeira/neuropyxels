@@ -901,7 +901,7 @@ class TraceViewWidget(QWidget):
         self._cache_end = None
         self._cache_start_idx = None
         self._cache_end_idx = None
-
+        self._cache_target = None
 
         # Fixed-scale reference, cached per normalization_key. Recomputed
         # only when the cache key changes (channel set, gain, filter,
@@ -1121,6 +1121,9 @@ class TraceViewWidget(QWidget):
 
     def _on_control_duration_changed(self, duration: float):
         self.window_duration = max(0.1, duration)
+        max_start = self._get_max_start_time()
+        if self.start_time > max_start:
+            self.start_time = max_start
         self._update_scrollbar_range()
         self._update_time_labels()
         self._invalidate_cache()
@@ -2331,14 +2334,13 @@ class TraceViewWidget(QWidget):
     def set_high_fidelity(self, enabled: bool):
         """Toggle between stride-sampling (fast, default) and full
         min/max decimation (accurate, slower). Changing this
-        invalidates the trace path cache so the next paint takes the
-        new code path; the change is immediate."""
+        invalidates the cache so the next paint takes the new code
+        path; the change is immediate."""
         enabled = bool(enabled)
         if enabled == self.high_fidelity:
             return
         self.high_fidelity = enabled
-        self._trace_cache_key = None
-        self._trace_path_cache.clear()
+        self._invalidate_cache()
         self.update()
 
     def set_channel_color(self, channel: int, color: str | QColor):
@@ -2407,6 +2409,18 @@ class TraceViewWidget(QWidget):
 
     def set_channels(self, channels: list[int]):
         """Set which channels to display."""
+        selected = set(channels)
+
+        # Release cached traces for channels being dropped from the
+        # selection before anything else, so their memory is freed even
+        # if this change never triggers a repaint. _get_data_for_display
+        # does the same cleanup defensively, but doing it here makes the
+        # release immediate.
+        if self._cached_data is not None:
+            for ch in list(self._cached_data.keys()):
+                if ch not in selected:
+                    del self._cached_data[ch]
+
         self.channels = channels
         self._sort_channels_by_depth()
 
@@ -2593,21 +2607,48 @@ class TraceViewWidget(QWidget):
         self._cache_end = None
         self._cache_start_idx = None
         self._cache_end_idx = None
+        self._cache_target = None
         self._filtered_cache.clear()
         self._spectrogram_cache_key = None
         if self.show_spectrogram and self.spectrogram_channel is not None:
             self._schedule_spectrogram_update()
         self._trace_cache_key = None
         self._trace_path_cache.clear()
-
+        
     def _get_data_for_display(self):
         """Fetch data for the current window, per channel.
 
         Returns {channel: [{'mode': 'raw'|'filtered'|'csd'|'global',
                             'data': ndarray, 'gain': float}, ...]}.
+
+        The cache stores FULL-RESOLUTION data for every trace, in both
+        fidelity modes. The stride-vs-min/max decision lives in
+        _draw_traces, not here, so the renderer gets the original
+        samples to work with. This means the cache is bigger than a
+        decimated cache would be, but the "high fidelity" toggle is
+        actually meaningful: turning it off uses stride sampling (fast,
+        aliased), turning it on uses min/max decimation (slower, exact).
         """
         if not self._data_loaded or not self.channels:
             return None
+
+        # Clamp start_time against the recording's valid range. Several
+        # zoom / duration-change paths used to skip this clamp, which
+        # left start_time past total_duration at certain zooms and made
+        # every channel read return an empty array.
+        max_start = self._get_max_start_time()
+        if self.start_time > max_start:
+            self.start_time = max_start
+            self._update_scrollbar_position()
+            self._update_time_labels()
+
+        # Release any cached traces for channels that are no longer selected.
+        if self._cached_data is not None:
+            selected = set(self.channels)
+            for ch in list(self._cached_data.keys()):
+                if ch not in selected:
+                    del self._cached_data[ch]
+
         if self._cached_data is not None and self._cache_start is not None:
             if (self._cache_start <= self.start_time
                     and self._cache_end >= self.start_time + self.window_duration):
@@ -2630,7 +2671,6 @@ class TraceViewWidget(QWidget):
         if global_filter_invalid:
             global_filter_active = False
 
-            
         data: dict[int, list[dict]] = {}
 
         for ch in self.channels:
@@ -2648,8 +2688,8 @@ class TraceViewWidget(QWidget):
             if has_override:
                 traces: list[dict] = []
                 if opts.show_raw:
-                    raw_trace = self._apply_filters(raw) if global_filter_active else raw
-                    traces.append({'mode': 'raw', 'data': raw_trace, 'gain': opts.raw_gain})
+                    src = self._apply_filters(raw) if global_filter_active else raw
+                    traces.append({'mode': 'raw', 'data': src, 'gain': opts.raw_gain})
                 if opts.show_filtered and not opts.filter_band_invalid():
                     filtered = self._apply_channel_filter(raw, opts.filter_low, opts.filter_high)
                     if filtered is not None:
@@ -2665,13 +2705,6 @@ class TraceViewWidget(QWidget):
                     data[ch] = [{'mode': 'global', 'data': filtered, 'gain': 1.0}]
                 else:
                     data[ch] = [{'mode': 'global', 'data': raw, 'gain': 1.0}]
-
-        self._cached_data = data
-        self._cache_start = self.start_time
-        self._cache_end = end_time
-        self._cache_start_idx = start_idx
-        self._cache_end_idx = end_idx
-
 
         msgs = []
         if global_filter_invalid:
@@ -2694,8 +2727,14 @@ class TraceViewWidget(QWidget):
         else:
             self.filter_warning_label.setVisible(False)
 
-        return data
+        self._cached_data = data
+        self._cache_start = self.start_time
+        self._cache_end = end_time
+        self._cache_start_idx = start_idx
+        self._cache_end_idx = end_idx
 
+        return data
+    
     def _apply_channel_filter(self, raw, low, high):
         """Per-channel filtered trace: low-pass, high-pass, or bandpass,
         chosen by the same 0-sentinel convention as the global filter.
@@ -3131,7 +3170,9 @@ class TraceViewWidget(QWidget):
 
         # Path cache key: depends on view position, so it invalidates on
         # every scroll. Trace paths are built at absolute pixel positions,
-        # which change whenever the view moves.
+        # which change whenever the view moves. high_fidelity is part of
+        # the key so toggling it rebuilds the paths with the new
+        # rendering strategy rather than reusing the old paths.
         path_cache_key = (
             round(start_time, 6),
             round(float(self.window_duration), 6),
@@ -3144,6 +3185,7 @@ class TraceViewWidget(QWidget):
             bool(self.notch_enabled),
             round(float(self.notch_freq), 3),
             bool(self.detrend_enabled),
+            bool(self.high_fidelity),
             int(target_per_channel),
             tuple(display_channels),
             tuple(
@@ -3320,6 +3362,8 @@ class TraceViewWidget(QWidget):
 
                     n_samples = channel_data.size
                     if n_samples <= target_per_channel:
+                        # Source is already smaller than the paint
+                        # target -- just draw it as-is.
                         draw_y = channel_data
                         x_ratios = (
                             np.linspace(0.0, 1.0, n_samples)
@@ -3327,19 +3371,22 @@ class TraceViewWidget(QWidget):
                             else np.array([0.0])
                         )
                     elif self.high_fidelity:
-                        # Full min/max decimation: preserves every peak
-                        # and trough. Slower, but exact.
+                        # Reliable path: min/max decimation preserves
+                        # every peak and trough. Slower for wide windows
+                        # and many channels, but visually exact.
                         draw_y, x_ratios = self._decimate_minmax(
                             channel_data, target_per_channel
                         )
                         if draw_y.size == 0:
                             continue
                     else:
-                        # Stride sampling: fast, aliases high-frequency
-                        # content. The x ratios are exact sample
-                        # positions, so the drawn trace spans the
-                        # correct extent even though most samples are
-                        # skipped.
+                        # Fast path: stride sample. Aliases high-
+                        # frequency content (ripple-band oscillation at
+                        # typical zoom can look like noise), but renders
+                        # in constant time per channel regardless of
+                        # window duration. This is the default because
+                        # the trace view is expected to be a bird's-eye
+                        # view, not a precision instrument.
                         stride = max(1, n_samples // max(1, target_per_channel))
                         draw_y = channel_data[::stride]
                         sample_positions = np.arange(0, n_samples, stride)
@@ -3434,8 +3481,7 @@ class TraceViewWidget(QWidget):
                 # every selected unit's spike time-windows, once per
                 # unit so each unit's spikes get its own color.
                 # `recolor_regions` was precomputed once per frame at
-                # the top of _draw_traces -- see the comment there for
-                # why it isn't rebuilt here.
+                # the top of _draw_traces.
                 if recolor_regions:
                     for recolor_color, region in recolor_regions:
                         painter.save()
@@ -3448,7 +3494,9 @@ class TraceViewWidget(QWidget):
                         painter.restore()
 
 
+
     def _decimate_minmax(self, data: np.ndarray, target_points: int) -> tuple[np.ndarray, np.ndarray]:
+
         """Min/max decimate a 1-D array to at most ~2*target_points values,
         preserving peaks and troughs.
 
@@ -3463,11 +3511,13 @@ class TraceViewWidget(QWidget):
         original array's extent, so the caller can map it to pixels
         without needing to know absolute sample indices.
         """
+                
+        data = np.asarray(data, dtype=np.float64)
         n = data.size
         if n == 0:
             return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
         if target_points < 2 or n <= target_points:
-            y = data.astype(np.float64, copy=False)
+            y = data   # already float64, no copy
             x = np.linspace(0.0, 1.0, n) if n > 1 else np.array([0.0])
             return y, x
         bin_size = int(np.ceil(n / target_points))
@@ -4121,6 +4171,7 @@ class SpectrogramControlPanel(QWidget):
         self.cmapChanged.emit(str(name))
 
     def set_channels(self, channels: list[int]):
+
         self._building_channel_list = True
         current_channel = None
         if self.channel_combo.currentIndex() >= 0:
