@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF
+from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF
 from PyQt6.QtGui import QColor, QFont, QPen, QBrush
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QCheckBox,
@@ -195,6 +195,45 @@ MIN_LABEL_SPACING_PX = 4  # only draw channel-number text once neighboring
                             # probes with different geometries.
 
 
+class _ProbePlotWidget(pg.PlotWidget):
+    """pg.PlotWidget that forwards mouse press/move/release to a
+    callback so the parent can implement box selection without
+    fighting pyqtgraph's own pan handling.
+
+    The parent sets `mouse_hooks` to a dict with keys
+    'press', 'move', 'release', each a callable taking
+    (event) -> bool. Returning True consumes the event (parent's
+    box-selection logic handled it); returning False lets
+    pyqtgraph handle it normally (pan/zoom).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mouse_hooks = {"press": None, "move": None, "release": None}
+
+    def _dispatch(self, kind, event):
+        hook = self.mouse_hooks.get(kind)
+        if hook is not None:
+            try:
+                if hook(event):
+                    event.accept()
+                    return
+            except Exception as exc:
+                print(f"[probe-map] {kind} hook failed: {exc}")
+        super().mousePressEvent(event) if kind == "press" else \
+            super().mouseMoveEvent(event) if kind == "move" else \
+            super().mouseReleaseEvent(event)
+
+    def mousePressEvent(self, event):
+        self._dispatch("press", event)
+
+    def mouseMoveEvent(self, event):
+        self._dispatch("move", event)
+
+    def mouseReleaseEvent(self, event):
+        self._dispatch("release", event)
+
+
 class ProbeMapWidget(QWidget):
     """
     Interactive probe map: click electrodes to select/deselect, pan/zoom
@@ -238,6 +277,19 @@ class ProbeMapWidget(QWidget):
         self.state = np.zeros(n, dtype=np.uint8)  # 0=active 1=selected 2=rejected
         self._hover_idx: int | None = None
 
+        # ---- Box (rectangle) selection ----
+        # Two ways to enter box mode:
+        #   - hold Shift and drag (no mode to remember)
+        #   - toggle the "Box Select" button, then drag
+        # Both draw the same preview and produce the same result. The
+        # sticky mode is for repeated selections; Shift-drag is for
+        # one-off grabs.
+        self._box_mode_sticky = False
+        self._box_drag_active = False
+        self._box_drag_start: QPointF | None = None
+        self._box_drag_current: QPointF | None = None
+        self._box_additive = True    # add to existing selection (vs. replace)
+
         # channel -> row index, for O(1) lookups
         self._chan_to_idx = {int(ch): i for i, ch in enumerate(self.channels)}
 
@@ -245,6 +297,8 @@ class ProbeMapWidget(QWidget):
         self.base_font_size = 9  # Default label size
 
         self.setMinimumSize(400, 600)
+
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._build_ui()
         self._build_scatter()
@@ -296,6 +350,21 @@ class ProbeMapWidget(QWidget):
 
         layout.addLayout(bar)
 
+
+
+        self.box_select_btn = QPushButton("Box Select")
+        self.box_select_btn.setCheckable(True)
+        self.box_select_btn.setToolTip(
+            "Click, then drag on the probe map to draw a rectangle "
+            "and select every electrode inside it.\n\n"
+            "You can also Shift-drag at any time without clicking "
+            "this button. Rejected channels are never selected.\n\n"
+            "Esc cancels an in-progress rectangle."
+        )
+        self.box_select_btn.toggled.connect(self._on_box_select_toggled)
+        bar.addWidget(self.box_select_btn)
+
+
         # ---- Size control bar ----
         size_bar = QHBoxLayout()
         size_bar.addWidget(QLabel("Point Size:"))
@@ -341,7 +410,12 @@ class ProbeMapWidget(QWidget):
         layout.addLayout(label_size_bar)
 
         # ---- main plot area ----
-        self.plot_widget = pg.PlotWidget()
+        self.plot_widget = _ProbePlotWidget()
+        self.plot_widget.mouse_hooks = {
+            "press":   self._on_plot_mouse_press,
+            "move":    self._on_plot_mouse_move,
+            "release": self._on_plot_mouse_release,
+        }
         self.plot_widget.setAspectLocked(True)          # true physical aspect, phy2-style
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setMenuEnabled(False)
@@ -413,6 +487,21 @@ class ProbeMapWidget(QWidget):
 
         self.scatter.setZValue(10)
         self.plot_widget.addItem(self.scatter)
+
+
+        # Rubber-band rectangle for box selection. Created hidden and
+        # shown only during an active drag. Added at Z=100 so it sits
+        # above the electrodes and grid but below any popups.
+        self._box_rect_item = QGraphicsRectItem()
+        self._box_rect_item.setZValue(100)
+        self._box_rect_item.setPen(
+            QPen(QColor(70, 200, 255, 235), 1.5, Qt.PenStyle.DashLine)
+        )
+        self._box_rect_item.setBrush(QBrush(QColor(70, 200, 255, 45)))
+        self._box_rect_item.setVisible(False)
+        self.plot_widget.addItem(self._box_rect_item)
+
+
 
         # Text labels: created lazily/hidden, one pg.TextItem per channel
         # is still ~800 objects, but they are only made *visible* (and thus
@@ -661,6 +750,17 @@ class ProbeMapWidget(QWidget):
     def _on_toggle_labels(self, _state):
         self._update_label_visibility()
 
+    def _on_box_select_toggled(self, checked: bool):
+        self._box_mode_sticky = bool(checked)
+        if checked:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._box_drag_active = False
+            self._box_drag_start = None
+            self._box_drag_current = None
+            self.unsetCursor()
+        self.update()
+
     def _auto_range(self):
         pad_x = max((self.xcoords.max() - self.xcoords.min()) * 0.15, 30)
         pad_y = max((self.ycoords.max() - self.ycoords.min()) * 0.03, 30)
@@ -669,3 +769,123 @@ class ProbeMapWidget(QWidget):
             yRange=(self.ycoords.min() - pad_y, self.ycoords.max() + pad_y),
             padding=0,
         )
+
+
+
+    def _is_box_mode(self, event) -> bool:
+        """True if this event should start or continue a box drag:
+        either the sticky button is on, or Shift is held."""
+        return self._box_mode_sticky or bool(
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        )
+
+    def _scene_to_view(self, scene_pos: QPointF) -> QPointF:
+        return self.view_box.mapSceneToView(scene_pos)
+
+    def _on_plot_mouse_press(self, event) -> bool:
+        # Only left-clicks start a box. Right-click, middle-click, etc.
+        # pass through to pyqtgraph.
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        if not self._is_box_mode(event):
+            return False
+
+        # Record the start in *view* (data) coordinates so the rubber
+        # band stays anchored to physical positions even if the user
+        # pans or zooms mid-drag -- though in practice the drag is short
+        # enough that this doesn't come up.
+        scene_pos = self.plot_widget.mapToScene(event.pos())
+        self._box_drag_start = self._scene_to_view(scene_pos)
+        self._box_drag_current = self._box_drag_start
+        self._box_drag_active = True
+        self._box_additive = not bool(
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        )
+        self._update_box_rect_visual()
+        self.update()
+        return True
+
+    def _on_plot_mouse_move(self, event) -> bool:
+        if not self._box_drag_active:
+            return False
+        scene_pos = self.plot_widget.mapToScene(event.pos())
+        self._box_drag_current = self._scene_to_view(scene_pos)
+        self._update_box_rect_visual()
+        self.update()
+        return True
+
+    def _on_plot_mouse_release(self, event) -> bool:
+        if not self._box_drag_active:
+            return False
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        start = self._box_drag_start
+        end = self._box_drag_current
+        self._box_drag_active = False
+        self._box_drag_start = None
+        self._box_drag_current = None
+
+        if start is None or end is None:
+            self._update_box_rect_visual()
+            self.update()
+            return True
+
+        x_lo, x_hi = sorted((float(start.x()), float(end.x())))
+        y_lo, y_hi = sorted((float(start.y()), float(end.y())))
+
+        inside_mask = (
+            (self.xcoords >= x_lo) & (self.xcoords <= x_hi)
+            & (self.ycoords >= y_lo) & (self.ycoords <= y_hi)
+        )
+        # Never include rejected channels.
+        inside_mask &= (self.state != 2)
+
+        if not np.any(inside_mask):
+            self.update()
+            return True
+
+        if self._box_additive:
+            # Add to whatever was already selected.
+            self.state[inside_mask] = 1
+        else:
+            # Replace: keep rejected as-is, unset everything else, then
+            # set the box interior. Ctrl+drag at press time captured the
+            # "not additive" intent.
+            non_rejected = (self.state != 2)
+            self.state[non_rejected] = 0
+            self.state[inside_mask] = 1
+
+        self._update_colors()
+        self._emit_selection()
+        self._update_box_rect_visual()
+        self.update()
+        return True
+
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._box_drag_active:
+            self._box_drag_active = False
+            self._box_drag_start = None
+            self._box_drag_current = None
+            self._update_box_rect_visual()
+            self.update()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+    def _update_box_rect_visual(self):
+        if (not self._box_drag_active
+                or self._box_drag_start is None
+                or self._box_drag_current is None):
+            self._box_rect_item.setVisible(False)
+            return
+        x0, y0 = float(self._box_drag_start.x()), float(self._box_drag_start.y())
+        x1, y1 = float(self._box_drag_current.x()), float(self._box_drag_current.y())
+        left, right = sorted((x0, x1))
+        bottom, top = sorted((y0, y1))
+        self._box_rect_item.setRect(
+            QRectF(left, bottom, right - left, top - bottom)
+        )
+        self._box_rect_item.setVisible(True)
