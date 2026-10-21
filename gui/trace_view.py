@@ -901,7 +901,6 @@ class TraceViewWidget(QWidget):
         self._cache_end = None
         self._cache_start_idx = None
         self._cache_end_idx = None
-        self._cache_target = None
 
         # Fixed-scale reference, cached per normalization_key. Recomputed
         # only when the cache key changes (channel set, gain, filter,
@@ -2607,7 +2606,6 @@ class TraceViewWidget(QWidget):
         self._cache_end = None
         self._cache_start_idx = None
         self._cache_end_idx = None
-        self._cache_target = None
         self._filtered_cache.clear()
         self._spectrogram_cache_key = None
         if self.show_spectrogram and self.spectrogram_channel is not None:
