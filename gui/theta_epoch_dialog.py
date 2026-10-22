@@ -9,7 +9,7 @@ results table.
 from __future__ import annotations
 
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QPushButton, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -183,6 +183,18 @@ class ThetaEpochDialog(QDialog):
         self._available_max_time = 0.0
         self._detect_n_samples = 0
         self._suppress_pan_on_select = False
+
+        # ---- Autosave ----
+        # Armed by _on_detect_finished / _on_load_clicked once the
+        # dialog has an analysis window (_sample_offset) and params
+        # (_last_params_for_sidecar). Only then does an edit schedule a
+        # write. Debounced 600ms so a drag doesn't rewrite the file on
+        # every mouse-move.
+        self._autosave_armed = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(600)
+        self._autosave_timer.timeout.connect(self._autosave_now)
 
         self._build_ui()
         self._refresh_export_buttons()
@@ -446,6 +458,59 @@ class ThetaEpochDialog(QDialog):
         self.prev_epoch_btn.setEnabled(has_epochs)
         self.next_epoch_btn.setEnabled(has_epochs)
 
+    def _schedule_autosave(self):
+        """Debounced trigger for any epoch-list mutation made after a
+        detection or load. Fires _autosave_now 600ms after the last
+        change. No-op before the dialog has an analysis window."""
+        if not self._autosave_armed:
+            return
+        self._autosave_timer.start()
+
+    def _autosave_now(self):
+        """Same file layout as the Save button, silently. Skips writing
+        when there is nothing to write (empty epoch list), so a previous
+        good file on disk is never clobbered by an accidental "delete
+        all then close" -- the user must use the manual Save to clear
+        it, or delete the file themselves."""
+        if not self._autosave_armed:
+            return
+        if not self.epochs:
+            return
+        folder = ensure_analysis_folder(self.engine)
+        if folder is None:
+            return
+
+        csv_path = folder / "theta_epochs.csv"
+        from core.theta_epoch_export import export_theta_epochs_to_csv
+        try:
+            export_theta_epochs_to_csv(
+                self.epochs, self._sample_offset, self.engine, csv_path,
+            )
+        except Exception as exc:
+            print(f"[theta-epoch-autosave] CSV write failed: {exc}")
+            return
+
+        n = int(getattr(self, "_detect_n_samples", 0))
+        if n > 0:
+            params = self._last_detection_params()
+            if params is not None:
+                try:
+                    save_sidecar(
+                        csv_path=csv_path,
+                        kind="theta_epochs",
+                        sample_rate=float(self.engine.sr),
+                        analysis_start_sample=int(self._sample_offset),
+                        analysis_end_sample=int(self._sample_offset) + n,
+                        channels=sorted({e.channel for e in self.epochs}),
+                        params=params,
+                    )
+                except Exception as exc:
+                    print(f"[theta-epoch-autosave] sidecar write failed: {exc}")
+
+        self.status_label.setText(
+            f"Auto-saved {len(self.epochs)} epoch(s)."
+        )
+
     def _on_detect_clicked(self):
         if not self.engine.data_loaded:
             QMessageBox.warning(self, "No data", "No data loaded.")
@@ -552,10 +617,12 @@ class ThetaEpochDialog(QDialog):
         self._detect_n_samples = int(info.get("n_samples", 0))
         self.start_spin.setValue(self._detection_start_time)
         self._populate_table()
-        # self.export_btn.setEnabled(bool(self.epochs))
         self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
         self.status_label.setText(f"Found {len(self.epochs)} theta epochs.")
+
+        self._autosave_armed = True
+        self._schedule_autosave()
 
     def set_epochs_from_trace(self, epochs: list[ThetaEpoch]):
         self.epochs = sorted(list(epochs), key=lambda e: (e.channel, e.start_sample))
@@ -572,6 +639,7 @@ class ThetaEpochDialog(QDialog):
             self.add_epoch_btn.blockSignals(True)
             self.add_epoch_btn.setChecked(False)
             self.add_epoch_btn.blockSignals(False)
+        self._schedule_autosave()
 
     def _on_add_epoch_toggled(self, checked: bool):
         if self.trace_view is None:
@@ -732,6 +800,8 @@ class ThetaEpochDialog(QDialog):
         self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
         self.status_label.setText(f"{len(self.epochs)} theta epochs.")
+        self._schedule_autosave()
+
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete and self.delete_btn.isEnabled():
@@ -925,6 +995,7 @@ class ThetaEpochDialog(QDialog):
         if sidecar is not None:
             status += " Parameters restored."
         self.status_label.setText(status)
+        self._autosave_armed = True
 
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
@@ -933,6 +1004,10 @@ class ThetaEpochDialog(QDialog):
         if self.trace_view is not None and self.add_epoch_btn.isChecked():
             self.trace_view.cancel_theta_creation()
 
+        if self._autosave_armed and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+            self._autosave_now()
+            
         if self.trace_view is not None:
             try:
                 self.trace_view.thetaEpochsChanged.disconnect(

@@ -44,7 +44,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QSpinBox, QCheckBox, QPushButton, QComboBox, QMessageBox, QWidget,
@@ -208,6 +208,15 @@ class RippleDialog(QDialog):
         self._detect_n_samples = 0
 
         self._open_inspector_dialogs: list = []
+
+        # ---- Autosave ----
+        # Armed after a detection or CSV load. Every event-list mutation
+        # after that schedules a debounced write. See _autosave_now.
+        self._autosave_armed = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(600)
+        self._autosave_timer.timeout.connect(self._autosave_now)
 
         self._build_ui()
         self._sync_time_range_from_engine()
@@ -526,6 +535,46 @@ class RippleDialog(QDialog):
                 "saving or loading an analysis."
             )
 
+    def _schedule_autosave(self):
+        if not self._autosave_armed:
+            return
+        self._autosave_timer.start()
+
+    def _autosave_now(self):
+        if not self._autosave_armed:
+            return
+        flat = self._flat_events()
+        if not flat:
+            return
+        folder = ensure_analysis_folder(self.engine)
+        if folder is None:
+            return
+
+        csv_path = folder / "ripples.csv"
+        try:
+            export_ripples_to_csv(flat, self._sample_offset, self.engine, csv_path)
+        except Exception as exc:
+            print(f"[ripple-autosave] CSV write failed: {exc}")
+            return
+
+        if self._params is not None:
+            n = int(getattr(self, "_detect_n_samples", 0))
+            if n > 0:
+                try:
+                    save_sidecar(
+                        csv_path=csv_path,
+                        kind="ripples",
+                        sample_rate=float(self.engine.sr),
+                        analysis_start_sample=int(self._sample_offset),
+                        analysis_end_sample=int(self._sample_offset) + n,
+                        channels=sorted({e.channel for e in flat}),
+                        params=self._params,
+                    )
+                except Exception as exc:
+                    print(f"[ripple-autosave] sidecar write failed: {exc}")
+
+        self.status_label.setText(f"Auto-saved {len(flat)} ripple event(s).")
+
 
     def _build_export_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -717,6 +766,8 @@ class RippleDialog(QDialog):
             f"Rejected ripple on CH{channel}. "
             f"Ctrl+Z on the trace view to undo."
         )
+        self._schedule_autosave()
+
 
     def _on_inspector_selected(self, channel: int, start_sample: int):
         """Highlight the row in this dialog's table corresponding to
@@ -914,6 +965,8 @@ class RippleDialog(QDialog):
             f"Detected {total_events} ripple(s) across {len(results)} channel(s). "
             "Click a row to jump the main trace view to that channel."
         )
+        self._autosave_armed = True
+        self._schedule_autosave()
 
     # ------------------------------------------------------------------
     # Overlay: pushing results to the main trace view
@@ -984,7 +1037,7 @@ class RippleDialog(QDialog):
             self.add_ripple_btn.blockSignals(True)
             self.add_ripple_btn.setChecked(False)
             self.add_ripple_btn.blockSignals(False)
-
+        self._schedule_autosave()
     # ------------------------------------------------------------------
     # Edit-mode handlers
     # ------------------------------------------------------------------
@@ -1154,7 +1207,7 @@ class RippleDialog(QDialog):
         self.trace_view._update_scrollbar_position()
         self.trace_view._invalidate_cache()
         self.trace_view.update()
-        
+
     def _go_to_prev_ripple(self):
         self._step_ripple(direction=-1)
 
@@ -1368,7 +1421,7 @@ class RippleDialog(QDialog):
         else:
             status += " No sidecar found; RTA and Single Ripple View will need fresh detection."
         self.status_label.setText(status)
-
+        self._autosave_armed = True
 
 
     def _apply_sidecar(self, sidecar: dict, events: list[RippleEvent]):
@@ -1445,6 +1498,12 @@ class RippleDialog(QDialog):
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
             self._detect_thread.wait(2000)
+
+        if self._autosave_armed and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+            self._autosave_now()
+            
+
         try:
             self.trace_view.rippleEventsChanged.disconnect(self.set_events_from_trace)
         except (TypeError, RuntimeError):

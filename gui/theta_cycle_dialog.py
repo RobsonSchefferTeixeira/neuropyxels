@@ -24,7 +24,7 @@ split, or merge.
 from __future__ import annotations
 
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QSpinBox, QCheckBox, QPushButton, QComboBox, QMessageBox, QWidget,
@@ -135,6 +135,12 @@ class ThetaCycleDialog(QDialog):
         self._detect_n_samples = 0
         self._last_params_for_sidecar = None
 
+        # ---- Autosave ----
+        self._autosave_armed = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(600)
+        self._autosave_timer.timeout.connect(self._autosave_now)
 
         self._build_ui()
         self._sync_time_range_from_engine()
@@ -546,6 +552,9 @@ class ThetaCycleDialog(QDialog):
         self.status_label.setText(
             f"Detected {total} cycle(s) across {n_ch} channel(s)."
         )
+        self._autosave_armed = True
+        self._schedule_autosave()
+
     # ------------------------------------------------------------------
     # Channel dropdown + table
     # ------------------------------------------------------------------
@@ -638,7 +647,7 @@ class ThetaCycleDialog(QDialog):
         self._pan_to_event(target)
         # Ask MainWindow to highlight this channel on the probe map.
         self.eventFocused.emit(int(target.channel))
-        
+
     def _pan_to_event(self, cycle: ThetaCycle):
         """Center the trace view on this cycle's peak1 time."""
         try:
@@ -691,6 +700,8 @@ class ThetaCycleDialog(QDialog):
         self.cycles_by_channel = regrouped
         self._populate_table()
         self._refresh_export_buttons()
+        self._schedule_autosave()
+
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
@@ -868,6 +879,7 @@ class ThetaCycleDialog(QDialog):
         if sidecar is not None:
             status += " Parameters restored."
         self.status_label.setText(status)
+        self._autosave_armed = True
 
     def _apply_sidecar(self, sidecar: dict):
         """Restore detection params and the theta band from a sidecar.
@@ -919,6 +931,11 @@ class ThetaCycleDialog(QDialog):
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
             self._detect_thread.wait(2000)
+
+        if self._autosave_armed and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+            self._autosave_now()
+
         try:
             self.trace_view.thetaCyclesChanged.disconnect(self.set_cycles_from_trace)
         except (TypeError, RuntimeError):
@@ -967,3 +984,44 @@ class ThetaCycleDialog(QDialog):
         # Load is never disabled by 'no cycles' -- the user may want to
         # load a saved session before running detection.
         self.load_btn.setEnabled(has_file)
+
+    def _schedule_autosave(self):
+        if not self._autosave_armed:
+            return
+        self._autosave_timer.start()
+
+    def _autosave_now(self):
+        if not self._autosave_armed:
+            return
+        flat = self._flat_cycles()
+        if not flat:
+            return
+        folder = ensure_analysis_folder(self.engine)
+        if folder is None:
+            return
+
+        csv_path = folder / "theta_cycles.csv"
+        try:
+            export_cycles_to_csv(flat, self.engine, csv_path)
+        except Exception as exc:
+            print(f"[theta-cycle-autosave] CSV write failed: {exc}")
+            return
+
+        n = int(getattr(self, "_detect_n_samples", 0))
+        if n > 0 and self._last_params_for_sidecar is not None:
+            try:
+                save_sidecar(
+                    csv_path=csv_path,
+                    kind="theta_cycles",
+                    sample_rate=float(self.engine.sr),
+                    analysis_start_sample=int(self._sample_offset),
+                    analysis_end_sample=int(self._sample_offset) + n,
+                    channels=sorted(self.cycles_by_channel.keys()),
+                    params=self._last_params_for_sidecar,
+                )
+            except Exception as exc:
+                print(f"[theta-cycle-autosave] sidecar write failed: {exc}")
+
+        self.status_label.setText(
+            f"Auto-saved {len(flat)} cycle(s)."
+        )
