@@ -45,7 +45,7 @@ from gui.psd_dialog import PsdDialog
 from gui.phy_units_panel import PhyUnitsPanel
 from core.phy_loader import load_phy_folder, PhyLoadError
 from gui.theta_cycle_dialog import ThetaCycleDialog
-
+from gui.export_panel import ExportDataPanel
 
 class ColorButton(QPushButton):
 
@@ -337,6 +337,8 @@ class MainWindow(QMainWindow):
         self._open_psd_dialogs: list[PsdDialog] = []
         self.phy_units_panel: PhyUnitsPanel | None = None
         self._open_theta_cycle_dialogs: list[ThetaCycleDialog] = []
+        self.export_data_panel: ExportDataPanel | None = None
+        self.export_data_dock = None
 
         self._build_menu()
         self._build_trace_view()
@@ -344,6 +346,7 @@ class MainWindow(QMainWindow):
         self._build_selected_channels_dock()
         self._build_display_settings_dock()
         self._build_phy_units_dock()
+        self._build_export_data_dock()
         self._build_panels_menu()
         self.setStatusBar(QStatusBar())
         self._update_status("No settings file or data loaded.")
@@ -693,7 +696,41 @@ class MainWindow(QMainWindow):
         dock.setVisible(False)
         dock.visibilityChanged.connect(self._on_phy_units_visibility_changed)
 
+    def _build_export_data_dock(self):
+        """Dock panel for filtering + downsampling + exporting a
+        subset of channels. Starts hidden and floating like the other
+        panels, opened via Panels or File → Export."""
+        dock = QDockWidget("Export Data", self)
+        dock.setObjectName("export_data_dock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+        )
 
+        self.export_data_panel = ExportDataPanel(
+            self.engine,
+            self._current_probe_data_dict(),
+            parent=dock,
+        )
+        self.export_data_panel.set_rejected_channels(
+            sorted(self._rejected_channels) if hasattr(self, "_rejected_channels") else []
+        )
+        self.export_data_panel.set_selected_channels(
+            self.get_selected_channels()
+        )
+
+        dock.setWidget(self.export_data_panel)
+        self.export_data_dock = dock
+        self._finalize_dock(dock, Qt.DockWidgetArea.RightDockWidgetArea)
+
+    def _current_probe_data_dict(self) -> dict | None:
+        if not self._current_probe_key or not self._probes:
+            return None
+        try:
+            return self._probes["probes"][self._current_probe_key]
+        except KeyError:
+            return None
+        
     def _on_reclassify_requested(self, cluster_ids: list, new_class: str):
         if self.phy_units_panel is None or not cluster_ids:
             return
@@ -1206,6 +1243,19 @@ class MainWindow(QMainWindow):
         eeg_menu.addAction(load_montage_action)
 
         # ------------------------------------------------------------------
+        # Export
+        # ------------------------------------------------------------------
+        export_menu = file_menu.addMenu("&Export")
+
+        export_channels_action = QAction("Filtered channels…", self)
+        export_channels_action.setToolTip(
+            "Open the Export Data panel: filter, downsample, and save "
+            "a subset of channels to disk."
+        )
+        export_channels_action.triggered.connect(self._on_open_export_panel)
+        export_menu.addAction(export_channels_action)
+
+        # ------------------------------------------------------------------
         # App lifecycle
         # ------------------------------------------------------------------
         file_menu.addSeparator()
@@ -1303,6 +1353,14 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
+
+    def _on_open_export_panel(self):
+        if self.export_data_dock is None:
+            return
+        self.export_data_dock.setVisible(True)
+        self.export_data_dock.raise_()
+        self.export_data_dock.activateWindow()
+
     def _show_shortcuts(self):
         """Show keyboard shortcuts dialog."""
         shortcuts_text = """
@@ -1395,6 +1453,7 @@ class MainWindow(QMainWindow):
             ("Probe Map", self.probe_map_dock),
             ("Selected Channels", self.selected_channels_dock),
             ("Display Settings", self.display_settings_dock),
+            ("Export Data", self.export_data_dock),
         ]
         for label, dock in panel_docks:
             action = QAction(label, self)
@@ -1687,6 +1746,12 @@ class MainWindow(QMainWindow):
 
         self.selected_list.clear()
         self._update_analysis_actions_enabled()
+
+        if getattr(self, "export_data_panel", None) is not None:
+            self.export_data_panel.update_engine(
+                self.engine, self._current_probe_data_dict()
+            )
+        
         self._push_full_probe_geometry_to_trace_view()
               
     def _push_full_probe_geometry_to_trace_view(self):
@@ -1781,6 +1846,10 @@ class MainWindow(QMainWindow):
 
         self.engine = new_engine
         self.trace_view.set_data_source(self.engine)
+
+        if getattr(self, "export_data_panel", None) is not None:
+            self.export_data_panel.update_engine(self.engine, self._current_probe_data_dict())
+        
         self.trace_view.clear_theta_cycles()
 
         # Spike rasters belong to the old recording. Clear them and
@@ -2146,6 +2215,8 @@ class MainWindow(QMainWindow):
             if channels:
                 self.trace_view.set_spectrogram_channel(channels[0])
 
+        if getattr(self, "export_data_panel", None) is not None:
+            self.export_data_panel.set_selected_channels(channels)
 
     # ------------------------------------------------------------------
     # Rejected channels
@@ -2233,6 +2304,8 @@ class MainWindow(QMainWindow):
         # ---- Phy panel: hide units whose channel was rejected ----
         if self.phy_units_panel is not None:
             self.phy_units_panel.set_rejected_channels(sorted(new_rejected))
+        if getattr(self, "export_data_panel", None) is not None:
+            self.export_data_panel.set_rejected_channels(sorted(new_rejected))
 
         # ---- Advance focus if the focused unit's channel was rejected ----
         if newly_rejected and self.phy_units_panel is not None:

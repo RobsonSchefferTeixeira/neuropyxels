@@ -11,3 +11,5 @@ matplotlib>=3.7
 
 # Parallel wavelet transform
 joblib>=1.2
+
+h5py>=3.9
