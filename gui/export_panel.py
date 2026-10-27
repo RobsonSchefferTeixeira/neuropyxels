@@ -114,7 +114,8 @@ class ExportDataPanel(QWidget):
         self._sync_time_range_from_engine()
         self._refresh_selection_label()
         self._refresh_target_sr_hint()
-
+        self._on_notch_toggled(self.notch_check.isChecked())
+        
     # ------------------------------------------------------------------
     # Public API (called by MainWindow)
     # ------------------------------------------------------------------
@@ -216,13 +217,34 @@ class ExportDataPanel(QWidget):
         self.order_spin.setValue(4)
         filt_layout.addWidget(self.order_spin, 1, 1)
 
-        filt_layout.addWidget(QLabel("Notch (Hz):"), 1, 2)
+        # ---- Notch: enabled checkbox + frequency spinbox ----
+        notch_col = QHBoxLayout()
+        self.notch_check = QCheckBox("Notch")
+        self.notch_check.setChecked(True)
+        self.notch_check.setToolTip(
+            "Enable or disable the notch filter. When off, no notch is "
+            "applied regardless of the frequency below."
+        )
+        self.notch_check.toggled.connect(self._on_notch_toggled)
+        notch_col.addWidget(self.notch_check)
+
         self.notch_spin = QDoubleSpinBox()
         self.notch_spin.setRange(0.0, 20000.0)
         self.notch_spin.setSingleStep(10.0)
         self.notch_spin.setValue(50.0)
-        self.notch_spin.setToolTip("0 disables the notch filter")
-        filt_layout.addWidget(self.notch_spin, 1, 3)
+        self.notch_spin.setKeyboardTracking(False)
+        self.notch_spin.setToolTip(
+            "Line-noise frequency to notch out. Typical: 50 Hz (Europe, "
+            "most of Asia/Africa) or 60 Hz (Americas, parts of Asia)."
+        )
+        notch_col.addWidget(self.notch_spin)
+
+        filt_layout.addWidget(QLabel("Notch:"), 1, 2)
+        notch_wrap = QWidget()
+        notch_wrap.setLayout(notch_col)
+        notch_col.setContentsMargins(0, 0, 0, 0)
+        filt_layout.addWidget(notch_wrap, 1, 3)
+
 
         self.detrend_check = QCheckBox("Detrend (remove DC offset)")
         filt_layout.addWidget(self.detrend_check, 2, 0, 1, 4)
@@ -380,6 +402,9 @@ class ExportDataPanel(QWidget):
         self.start_spin.setEnabled(not whole_checked)
         self.end_spin.setEnabled(not whole_checked)
 
+    def _on_notch_toggled(self, checked: bool):
+        self.notch_spin.setEnabled(bool(checked))
+
     def _on_pick_channels_clicked(self):
         if not self.probe_data:
             QMessageBox.warning(
@@ -458,8 +483,11 @@ class ExportDataPanel(QWidget):
         if order not in SUPPORTED_FILTER_ORDERS:
             raise ValueError(f"Filter order must be 2-8, got {order}.")
 
-        notch = float(self.notch_spin.value())
-        notch_val = notch if notch > 0 else None
+        if self.notch_check.isChecked():
+            notch = float(self.notch_spin.value())
+            notch_val = notch if notch > 0 else None
+        else:
+            notch_val = None
 
         geometry = self._channel_geometry_map()
 
