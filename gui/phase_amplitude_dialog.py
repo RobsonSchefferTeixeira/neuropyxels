@@ -37,12 +37,7 @@ from PyQt6.QtWidgets import (
 
 from core.phase_amplitude import PhaseAmplitudeAnalyzer, PhaseAmplitudeParams
 from core.trace_engine import TraceEngine
-
-
-CMAP_OPTIONS = [
-    "viridis", "plasma", "inferno", "magma", "cividis",
-    "CET-D1", "CET-D4",  # pyqtgraph's built-in diverging maps (RdBu-ish)
-]
+from core.colormaps import COLORMAP_NAMES, resolve_name, get_pg_colormap
 
 
 class _ComputeThread(QThread):
@@ -211,9 +206,16 @@ class PhaseAmplitudeDialog(QDialog):
         col_pairs.append(("CSD spacing (\u00b5m)", self.csd_spacing_spin))
 
         self.cmap_combo = QComboBox()
-        self.cmap_combo.addItems(CMAP_OPTIONS)
+        self.cmap_combo.addItems(COLORMAP_NAMES)
         self.cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         col_pairs.append(("Colormap", self.cmap_combo))
+
+        self.reverse_cmap_check = QCheckBox("Reverse")
+        self.reverse_cmap_check.toggled.connect(
+            lambda _checked: self._on_cmap_changed(self.cmap_combo.currentText())
+        )
+        col_pairs.append((None, self.reverse_cmap_check))
+
 
         n_cols = 4
         row = 0
@@ -374,6 +376,17 @@ class PhaseAmplitudeDialog(QDialog):
         self.image_item.setRect(x0, y0, x1 - x0, y1 - y0)
 
         self.colorbar.setLevels((vmin, vmax))
+
+        resolved = resolve_name(
+            self.cmap_combo.currentText(),
+            reverse=self.reverse_cmap_check.isChecked(),
+        )
+        try:
+            self.image_item.setColorMap(get_pg_colormap(resolved))
+        except Exception as exc:
+            print(f"[phase-amplitude] image colormap {resolved!r} unavailable: {exc}")
+
+
         self.image_item.setLevels((vmin, vmax))
 
         # Cosine reference curve, scaled into a thin band near the bottom
@@ -413,11 +426,19 @@ class PhaseAmplitudeDialog(QDialog):
         )
 
     def _on_cmap_changed(self, name: str):
+        resolved = resolve_name(name, reverse=self.reverse_cmap_check.isChecked())
         try:
-            cmap = pg.colormap.get(name)
-        except Exception:
+            cmap = get_pg_colormap(resolved)
+        except Exception as exc:
+            print(f"[phase-amplitude] colormap {resolved!r} unavailable: {exc}")
             return
         self.colorbar.setColorMap(cmap)
+        # The heatmap image is pre-coloured through setImage() using the
+        # previous colormap; re-render the image itself so the figure's
+        # colours match the colorbar. Without this, only the colorbar
+        # changes on a colormap switch.
+        if self._last_results is not None:
+            self._render(self._last_results)
 
     # ------------------------------------------------------------------
     # Cleanup

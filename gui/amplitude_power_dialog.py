@@ -44,12 +44,8 @@ from PyQt6.QtWidgets import (
 
 from core.amplitude_power import AmplitudePowerAnalyzer, AmplitudePowerParams
 from core.trace_engine import TraceEngine
+from core.colormaps import COLORMAP_NAMES, resolve_name, get_pg_colormap
 
-
-CMAP_OPTIONS = [
-    "viridis", "plasma", "inferno", "magma", "cividis",
-    "CET-D1", "CET-D4", "CET-L17",
-]
 
 BG_COLOR = "#1e1e1e"
 GRID_COLOR = (255, 255, 255, 15)
@@ -62,8 +58,10 @@ BAND_PRESETS = {
     "Theta (4-12 Hz)": (4.0, 12.0),
     "Alpha (8-13 Hz)": (8.0, 13.0),
     "Beta (13-30 Hz)": (13.0, 30.0),
-    "Low Gamma (30-60 Hz)": (30.0, 60.0),
-    "High Gamma (60-150 Hz)": (60.0, 150.0),
+    "Slow Gamma (30-60 Hz)": (30.0, 60.0),
+    "Mid Gamma (60-100 Hz)": (60.0, 100.0),
+    "Fast Gamma (100-150 Hz)": (100.0, 150.0),
+    "MUA (300-1000 Hz)": (300.0, 1000.0),
 }
 
 
@@ -226,9 +224,15 @@ class AmplitudePowerDialog(QDialog):
         col_pairs.append((None, self.notch_check))
 
         self.cmap_combo = QComboBox()
-        self.cmap_combo.addItems(CMAP_OPTIONS)
+        self.cmap_combo.addItems(COLORMAP_NAMES)
         self.cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         col_pairs.append(("Colormap", self.cmap_combo))
+
+        self.reverse_cmap_check = QCheckBox("Reverse")
+        self.reverse_cmap_check.toggled.connect(
+            lambda _checked: self._on_cmap_changed(self.cmap_combo.currentText())
+        )
+        col_pairs.append((None, self.reverse_cmap_check))
 
         n_cols = 4
         row = 0
@@ -372,7 +376,15 @@ class AmplitudePowerDialog(QDialog):
                 vmin -= 1
                 vmax += 1
 
-        cmap = pg.colormap.get(self.cmap_combo.currentText())
+        try:
+            cmap = get_pg_colormap(resolve_name(
+                self.cmap_combo.currentText(),
+                reverse=self.reverse_cmap_check.isChecked(),
+            ))
+        except Exception as exc:
+            print(f"[spatial-power] colormap unavailable: {exc}")
+            return
+        
         norm = np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
         colors = cmap.map(norm, mode="qcolor")
         brushes = [pg.mkBrush(c) for c in colors]

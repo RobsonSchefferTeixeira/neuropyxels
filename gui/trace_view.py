@@ -67,6 +67,7 @@ from core.filters import bandpass_filter, notch_filter, hilbert
 
 from scipy.signal import spectrogram, butter, sosfiltfilt, resample_poly
 from matplotlib import colormaps
+from core.colormaps import COLORMAP_NAMES, resolve_name, get_matplotlib_colormap
 
 from gui.channel_options_panel import ChannelOptionsPanel, ChannelOptions
 from core.phase_amplitude import PhaseAmplitudeAnalyzer
@@ -1422,7 +1423,12 @@ class TraceViewWidget(QWidget):
         normalized = np.clip((Sxx_db - vmin) / (vmax - vmin), 0.0, 1.0)
         normalized = np.flipud(normalized)
 
-        cmap = colormaps.get_cmap(self.spectrogram_cmap)
+        cmap_name = resolve_name(
+            self.spectrogram_cmap,
+            reverse=self.spectrogram_control.reverse_cmap_enabled(),
+        )
+        cmap = get_matplotlib_colormap(cmap_name)
+
         rgba = cmap(normalized)
         rgb = (rgba[..., :3] * 255).astype(np.uint8)
         rgb = np.ascontiguousarray(rgb)
@@ -1518,7 +1524,91 @@ class TraceViewWidget(QWidget):
             painter.setPen(self.default_trace_color)
             painter.drawText(int(label_x), int(y_pixel), text)
 
+        self._draw_spectrogram_colorbar(painter, spectrogram_rect)
+
         painter.restore()
+
+    def _draw_spectrogram_colorbar(self, painter: QPainter, spectrogram_rect: QRectF):
+        """Vertical colorbar drawn to the right of the spectrogram.
+
+        Values range from ``self.spectrogram_vmin`` (bottom) to
+        ``self.spectrogram_vmax`` (top), matching the dB scale the
+        image itself is normalised against in
+        _render_spectrogram_image. The colormap is re-resolved here
+        (same name and reverse flag as the image) so toggling Reverse
+        updates the bar in lockstep with the image.
+        """
+        if self._spectrogram_image is None:
+            return
+
+        cmap_name = resolve_name(
+            self.spectrogram_cmap,
+            reverse=self.spectrogram_control.reverse_cmap_enabled(),
+        )
+        try:
+            cmap = get_matplotlib_colormap(cmap_name)
+        except Exception:
+            cmap = get_matplotlib_colormap("viridis")
+
+        bar_w = 18.0
+        gap = 8.0
+        bar_rect = QRectF(
+            spectrogram_rect.right() + gap,
+            spectrogram_rect.top(),
+            bar_w,
+            spectrogram_rect.height(),
+        )
+        # Not enough room to draw it cleanly? Bail rather than overdraw
+        # into the trace panel.
+        if bar_rect.right() > self.rect().right() - 4:
+            return
+
+        # ---- Gradient: 64 evenly spaced samples of the colormap ----
+        from PyQt6.QtGui import QLinearGradient, QGradient
+        gradient = QLinearGradient(
+            bar_rect.left(), bar_rect.bottom(),
+            bar_rect.left(), bar_rect.top(),
+        )
+        for i in range(64):
+            frac = i / 63.0
+            r, g, b, _a = cmap(frac)
+            gradient.setColorAt(
+                1.0 - frac,
+                QColor(int(r * 255), int(g * 255), int(b * 255)),
+            )
+        painter.save()
+        painter.setPen(QPen(QColor(120, 120, 120), 1.0))
+        painter.setBrush(QBrush(gradient))
+        painter.drawRect(bar_rect)
+        painter.restore()
+
+        # ---- Tick labels at min, mid, max ----
+        painter.save()
+        painter.setPen(QColor(200, 200, 200))
+        font = QFont()
+        font.setPointSize(8)
+        painter.setFont(font)
+
+        vmin = float(self.spectrogram_vmin)
+        vmax = float(self.spectrogram_vmax)
+        ticks = [vmin, (vmin + vmax) / 2.0, vmax]
+        metrics = painter.fontMetrics()
+        for val in ticks:
+            frac = (val - vmin) / max(1e-9, vmax - vmin)
+            y = bar_rect.bottom() - frac * bar_rect.height()
+            label = f"{val:.0f}"
+            text_w = metrics.horizontalAdvance(label)
+            text_x = bar_rect.right() + 4
+            if text_x + text_w > self.rect().right() - 2:
+                # No room for the label on the right; skip.
+                continue
+            painter.drawText(
+                int(text_x),
+                int(y + metrics.ascent() / 2 - 1),
+                label,
+            )
+        painter.restore()
+
 
     def set_spectrogram_enabled(self, enabled: bool):
         enabled = bool(enabled)
@@ -4131,11 +4221,23 @@ class SpectrogramControlPanel(QWidget):
 
         cmap_group = QGroupBox("Colormap")
         cmap_layout = QVBoxLayout(cmap_group)
+
         self.cmap_combo = QComboBox()
-        self.cmap_combo.addItems(["viridis", "plasma", "inferno", "magma", "cividis", "jet"])
+        self.cmap_combo.addItems(COLORMAP_NAMES)
         self.cmap_combo.setCurrentText("viridis")
         self.cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         cmap_layout.addWidget(self.cmap_combo)
+
+        self.reverse_cmap_check = QCheckBox("Reverse")
+        self.reverse_cmap_check.setToolTip(
+            "Draw the colormap with its ends swapped (append the "
+            "'_r' suffix at render time)."
+        )
+        self.reverse_cmap_check.toggled.connect(
+            lambda _checked: self._on_cmap_changed(self.cmap_combo.currentText())
+        )
+        cmap_layout.addWidget(self.reverse_cmap_check)
+
         layout.addWidget(cmap_group)
 
     def _on_min_db_changed(self, value: float):
@@ -4168,6 +4270,9 @@ class SpectrogramControlPanel(QWidget):
     def _on_cmap_changed(self, name: str):
         self.cmapChanged.emit(str(name))
 
+    def reverse_cmap_enabled(self) -> bool:
+        return bool(self.reverse_cmap_check.isChecked())
+    
     def set_channels(self, channels: list[int]):
 
         self._building_channel_list = True

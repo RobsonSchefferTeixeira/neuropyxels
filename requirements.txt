@@ -13,3 +13,5 @@ matplotlib>=3.7
 joblib>=1.2
 
 h5py>=3.9
+
+colorcet>=3.0
