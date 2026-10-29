@@ -1,27 +1,31 @@
 """
 theta_cycle_dialog.py
 
-Non-modal dialog for theta cycle detection. Detection runs on a
-QThread per requested channel; results are collected into
-`cycles_by_channel`, which drives both the dialog's table and the
-trace view's overlay.
+Non-modal dialog for theta cycle detection.
 
-One table per channel, selected via a dropdown. The channels field at
-the top accepts a comma-separated list; detection runs on each
-independently, matching ripple detection's model.
+Detection runs on a QThread per requested channel; results are
+collected into `cycles_by_channel`, which drives both the dialog's
+table and the trace view's overlay.
+
+The six landmark columns are positional (ref_1 .. ref_6). What each
+position means depends on the current cycle_start_edge scheme; the
+sidecar records this in its `landmark_names` key on save, and the
+dialog restores it on load. A label above the table shows the
+current scheme so the reader knows what they're looking at without
+having to scroll back to the controls.
 
 Save writes a single CSV (all channels, one table) plus a small
 .meta.json sidecar into a `neuropyxels/` folder next to the loaded
-.dat. Load reads both back from the same folder, restoring the
-detection parameters so the filtered overlay and RTA-style analyses
-work without re-running detection.
+.dat. Load reads both back, restoring detection parameters, the
+cycle_start_edge scheme, and (for new files) the landmark names.
 
 Editing is minimal: click a cycle's landmark circle on the trace view
-to select it, Delete to remove, Ctrl+Z to undo. Cycles have no drag,
-split, or merge.
+to select it, Delete to remove, Ctrl+Z to undo.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -37,6 +41,7 @@ from core.analysis_folder import (
 from core.session_sidecar import save_sidecar, load_sidecar
 from core.theta_cycle_detector import (
     ThetaCycleDetector, ThetaCycleParams, ThetaCycle,
+    LANDMARK_NAMES_BY_MODE, VALID_CYCLE_START_EDGES,
 )
 from core.theta_cycle_export import (
     export_cycles_to_csv, read_cycles_from_csv,
@@ -53,17 +58,16 @@ class _DetectThread(QThread):
     failed = pyqtSignal(str)
     progress = pyqtSignal(int, int)
 
-    def __init__(self, channels, raw_data, sample_rate, start_idx, end_idx, params, parent=None):
+    def __init__(self, channels, raw_data, sample_rate, start_idx, end_idx,
+                 params, epoch_intervals=None, parent=None):
         super().__init__(parent)
         self.channels = channels
         self.raw_data = raw_data
         self.sample_rate = float(sample_rate)
-        # Sample indices, already resolved by the dialog against the
-        # engine's current time base. See theta_epoch_dialog for the
-        # same pattern.
         self.start_idx = int(start_idx)
         self.end_idx = int(end_idx)
         self.params = params
+        self.epoch_intervals = list(epoch_intervals or [])
         self.detector = ThetaCycleDetector()
 
     def run(self):
@@ -79,14 +83,22 @@ class _DetectThread(QThread):
                     raise ValueError(
                         f"Channel {ch} is outside the loaded data."
                     )
+
                 signal = self.raw_data[start_idx:end_idx, ch] \
                     .flatten().astype(np.float64)
-                cycles = self.detector.detect(
-                    signal, self.sample_rate, self.params, channel=ch,
+
+                params_for_channel = dataclasses.replace(
+                    self.params,
+                    epoch_intervals=self.epoch_intervals,
                 )
+
+                cycles = self.detector.detect(
+                    signal, self.sample_rate, params_for_channel,
+                    channel=ch,
+                )
+
                 # Detector returns sample indices relative to `signal`
-                # (i.e. 0 = start_idx). Convert to raw recording samples
-                # before handing off.
+                # (i.e. 0 = start_idx). Convert to raw recording samples.
                 for c in cycles:
                     c.zero_crossing_start += start_idx
                     c.peak1 += start_idx
@@ -105,9 +117,9 @@ class _DetectThread(QThread):
 class ThetaCycleDialog(QDialog):
     """Non-modal theta cycle detection dialog."""
 
-    cyclesChanged = pyqtSignal(object)   # list[ThetaCycle] (flat)
+    cyclesChanged = pyqtSignal(object)
     cycleSelected = pyqtSignal(int)
-    eventFocused = pyqtSignal(int)   # channel id; the user clicked a row
+    eventFocused = pyqtSignal(int)
 
     def __init__(
         self,
@@ -120,20 +132,35 @@ class ThetaCycleDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Theta Cycle Detection")
         self.setModal(False)
-        self.resize(900, 640)
+        self.resize(1050, 680)
 
         self.engine = engine
         self.trace_view = trace_view
         self.probe_data = probe_data
         self._detect_thread: _DetectThread | None = None
 
-        # Source of truth: cycles grouped by channel.
         self.cycles_by_channel: dict[int, list[ThetaCycle]] = {}
         self._selected_channel: int | None = None
         self._selected_index: int | None = None
 
+        # Analysis-window bookkeeping; initialized so Save/autosave
+        # paths never dereference an unset attribute even before any
+        # detect or load has run.
+        self._sample_offset = 0
         self._detect_n_samples = 0
         self._last_params_for_sidecar = None
+
+        # Scheme of the currently-loaded cycle set, if it came from a
+        # Load (as opposed to a Detect). Used when saving so loaded
+        # cycles are re-labeled with the scheme that produced them,
+        # even if the user has since changed the combo.
+        self._loaded_cycle_start_edge: str | None = None
+
+        # Cached landmark-names list associated with the loaded set,
+        # or None. Read back from the sidecar on Load, saved back on
+        # Save. Cleared on Detect (fresh detection derives names from
+        # the combo).
+        self._loaded_landmark_names: list[str] | None = None
 
         # ---- Autosave ----
         self._autosave_armed = False
@@ -145,10 +172,8 @@ class ThetaCycleDialog(QDialog):
         self._build_ui()
         self._sync_time_range_from_engine()
         self._refresh_export_buttons()
+        self._refresh_landmark_scheme_label()
 
-        # Push the spinboxes' initial values to the trace view so the
-        # two start in agreement even if a previous dialog session left
-        # the trace view at a different gain / width.
         if self.trace_view is not None:
             self.trace_view.set_theta_cycle_gain(
                 float(self.trace_gain_spin.value())
@@ -162,10 +187,11 @@ class ThetaCycleDialog(QDialog):
                 ",".join(str(c) for c in initial_channels)
             )
 
-        # Keep the dialog's copy in sync with edits made on the trace
-        # view (deletions via Delete key or Ctrl+Z).
         self.trace_view.thetaCyclesChanged.connect(self.set_cycles_from_trace)
         self.trace_view.thetaCycleSelected.connect(self.set_selected_cycle)
+        self.trace_view.thetaEpochsChanged.connect(self._on_theta_epochs_changed)
+
+        self._refresh_theta_epoch_availability()
 
     # ------------------------------------------------------------------
     # UI scaffolding
@@ -187,16 +213,29 @@ class ThetaCycleDialog(QDialog):
         btn_row.addWidget(self.progress_label, stretch=1)
         layout.addLayout(btn_row)
 
+        # ---- Landmark scheme label ----
+        self.landmark_scheme_label = QLabel("")
+        self.landmark_scheme_label.setStyleSheet(
+            "color: #ccc; font-size: 10px; font-style: italic;"
+        )
+        layout.addWidget(self.landmark_scheme_label)
+
+        # ---- Pooled table ----
+        # Six ref_N landmark columns (smp + s), plus duration, amp,
+        # ratios. Column count = 1 (channel) + 6 (ref_smp) + 1 (dur_smp)
+        # + 6 (ref_s) + 1 (dur_s) + 3 (amp + 2 ratios) = 18, matching
+        # the previous layout's column count.
         self.table = QTableWidget(0, 18)
         self.table.setHorizontalHeaderLabels([
             "Channel",
-            "zc_start_smp", "peak1_smp", "zc_mid_smp", "valley_smp",
-            "zc_end_smp", "peak2_smp", "duration_smp",
-            "zc_start_s", "peak1_s", "zc_mid_s", "valley_s", "zc_end_s",
-            "peak2_s", "duration_s",
+            "ref_1_smp", "ref_2_smp", "ref_3_smp",
+            "ref_4_smp", "ref_5_smp", "ref_6_smp",
+            "duration_smp",
+            "ref_1_s", "ref_2_s", "ref_3_s",
+            "ref_4_s", "ref_5_s", "ref_6_s",
+            "duration_s",
             "amp", "θ/δ", "fast/θ",
         ])
-
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
@@ -235,10 +274,7 @@ class ThetaCycleDialog(QDialog):
         nav_row.addStretch(1)
         layout.addLayout(nav_row)
 
-        # ---- Export / load ----
-        # One export button, matching the theta epoch dialog: everything
-        # goes into a single CSV, with a channel column inside. No
-        # per-channel split, no channel suffix in the filename.
+        # ---- Save / Load ----
         io_row = QHBoxLayout()
         self.export_btn = QPushButton("Save")
         self.export_btn.setAutoDefault(False)
@@ -278,6 +314,25 @@ class ThetaCycleDialog(QDialog):
         self.end_spin.setValue(10.0)
         pairs.append(("End (s)", self.end_spin))
 
+        self.full_range_btn = QPushButton("Full available range")
+        self.full_range_btn.setToolTip(
+            "Set the analysis interval to the minimum and maximum "
+            "available time."
+        )
+        self.full_range_btn.setAutoDefault(False)
+        self.full_range_btn.setDefault(False)
+        self.full_range_btn.clicked.connect(self._set_full_available_range)
+        pairs.append((None, self.full_range_btn))
+
+        self.only_in_epochs_check = QCheckBox("Only inside theta epochs")
+        self.only_in_epochs_check.setToolTip(
+            "Keep only cycles whose span [ref_1, ref_5] lies inside a "
+            "detected theta epoch. Requires theta epochs to be defined "
+            "on the main trace view."
+        )
+        self.only_in_epochs_check.setEnabled(False)
+        pairs.append((None, self.only_in_epochs_check))
+
         self.low_spin = QDoubleSpinBox()
         self.low_spin.setRange(0.1, 100.0)
         self.low_spin.setValue(4.0)
@@ -298,6 +353,55 @@ class ThetaCycleDialog(QDialog):
         )
         pairs.append(("Min amp percentile", self.min_amp_spin))
 
+        # ---- New spinboxes: peak-distance bounds ----
+        self.peak_low_spin = QDoubleSpinBox()
+        self.peak_low_spin.setRange(0.5, 10.0)
+        self.peak_low_spin.setSingleStep(0.1)
+        self.peak_low_spin.setDecimals(2)
+        self.peak_low_spin.setValue(2.5)
+        self.peak_low_spin.setSuffix(" Hz")
+        self.peak_low_spin.setToolTip(
+            "Lower bound of the accepted instantaneous frequency "
+            "implied by inter-peak distance. Widening lowers the "
+            "maximum accepted peak-to-peak spacing; a value of 2.5 Hz "
+            "allows cycles as slow as ~2.5 Hz to pair."
+        )
+        pairs.append(("Peak low (Hz)", self.peak_low_spin))
+
+        self.peak_high_spin = QDoubleSpinBox()
+        self.peak_high_spin.setRange(5.0, 30.0)
+        self.peak_high_spin.setSingleStep(0.5)
+        self.peak_high_spin.setDecimals(2)
+        self.peak_high_spin.setValue(15.0)
+        self.peak_high_spin.setSuffix(" Hz")
+        self.peak_high_spin.setToolTip(
+            "Upper bound of the accepted instantaneous frequency "
+            "implied by inter-peak distance. Raising it allows faster "
+            "cycles (or noisier peak spacing) to pair."
+        )
+        pairs.append(("Peak high (Hz)", self.peak_high_spin))
+
+        self.filter_order_spin = QSpinBox()
+        self.filter_order_spin.setRange(2, 8)
+        self.filter_order_spin.setValue(4)
+        self.filter_order_spin.setToolTip(
+            "Butterworth order for the theta, delta, and fast band "
+            "filters. 4 is conventional; 2 widens the effective "
+            "passband; higher orders sharpen the cutoff but slow "
+            "detection on long windows."
+        )
+        pairs.append(("Filter order", self.filter_order_spin))
+
+        self.detrend_check = QCheckBox("Detrend")
+        self.detrend_check.setChecked(True)
+        self.detrend_check.setToolTip(
+            "Remove a linear trend from the filtered signals before "
+            "computing envelopes. Turn off if the signal is already "
+            "detrended or if you suspect the linear fit is stripping "
+            "slow theta itself."
+        )
+        pairs.append((None, self.detrend_check))
+
         self.delta_check = QCheckBox("Delta correction")
         self.delta_check.setChecked(True)
         pairs.append((None, self.delta_check))
@@ -317,8 +421,8 @@ class ThetaCycleDialog(QDialog):
         self.delta_ratio_spin.setSingleStep(0.1)
         self.delta_ratio_spin.setValue(1.5)
         self.delta_ratio_spin.setToolTip(
-            "Minimum mean(theta)/mean(delta) ratio over each cycle's "
-            "span. Cycles below this are discarded."
+            "Minimum mean(theta)/mean(delta) ratio over the cycle's "
+            "[ref_1, ref_5] span. Cycles below this are discarded."
         )
         pairs.append(("θ/δ ratio min", self.delta_ratio_spin))
 
@@ -336,13 +440,22 @@ class ThetaCycleDialog(QDialog):
         self.fast_ratio_spin.setSingleStep(0.1)
         self.fast_ratio_spin.setValue(0.5)
         self.fast_ratio_spin.setToolTip(
-            "Maximum mean(fast)/mean(theta) ratio over each cycle's "
-            "span. Cycles above this are discarded."
+            "Maximum mean(fast)/mean(theta) ratio over the cycle's "
+            "[ref_1, ref_5] span. Cycles above this are discarded."
         )
         pairs.append(("fast/θ ratio max", self.fast_ratio_spin))
 
         self.edge_combo = QComboBox()
-        self.edge_combo.addItems(["rising_zc", "falling_zc"])
+        self.edge_combo.addItems(list(VALID_CYCLE_START_EDGES))
+        self.edge_combo.setToolTip(
+            "Which event opens a cycle. The six landmark slots "
+            "(ref_1..ref_6) are populated chronologically under the "
+            "chosen convention; see the Landmark scheme label above "
+            "the table after the first run."
+        )
+        self.edge_combo.currentTextChanged.connect(
+            self._refresh_landmark_scheme_label
+        )
         pairs.append(("Cycle start", self.edge_combo))
 
         self.trace_gain_spin = QDoubleSpinBox()
@@ -352,11 +465,8 @@ class ThetaCycleDialog(QDialog):
         self.trace_gain_spin.setValue(1.0)
         self.trace_gain_spin.setSuffix(" ×")
         self.trace_gain_spin.setToolTip(
-            "Multiplier on the fixed reference scale of the theta-\n"
-            "filtered overlay. The reference is measured once per\n"
-            "channel from the first window it is drawn in, so\n"
-            "scrolling does not change the trace height; only this\n"
-            "spinbox does."
+            "Multiplier on the fixed reference scale of the theta-"
+            "filtered overlay."
         )
         self.trace_gain_spin.valueChanged.connect(self._on_trace_gain_changed)
         pairs.append(("Trace gain", self.trace_gain_spin))
@@ -368,14 +478,12 @@ class ThetaCycleDialog(QDialog):
         self.trace_width_spin.setValue(1.0)
         self.trace_width_spin.setSuffix(" px")
         self.trace_width_spin.setToolTip(
-            "Stroke width of the theta-filtered overlay trace. The\n"
-            "selected-cycle highlight is always one pixel wider."
+            "Stroke width of the theta-filtered overlay trace."
         )
         self.trace_width_spin.valueChanged.connect(
             self._on_trace_width_changed
         )
         pairs.append(("Trace width", self.trace_width_spin))
-
 
         n_cols = 4
         row = 0
@@ -401,14 +509,57 @@ class ThetaCycleDialog(QDialog):
         return grid
 
     # ------------------------------------------------------------------
+    # Landmark scheme label
+    # ------------------------------------------------------------------
+
+    def _refresh_landmark_scheme_label(self, *_args):
+        """Update the label above the table to describe the scheme
+        currently attached to the displayed cycles. Preference order:
+        loaded scheme (from Load) > current combo (what a fresh Detect
+        would use)."""
+        if self._loaded_cycle_start_edge is not None:
+            scheme = self._loaded_cycle_start_edge
+            source = "loaded"
+        else:
+            scheme = self.edge_combo.currentText()
+            source = "current"
+        names = LANDMARK_NAMES_BY_MODE.get(scheme, [])
+        joined = ", ".join(
+            f"ref_{i + 1}={name}" for i, name in enumerate(names)
+        )
+        self.landmark_scheme_label.setText(
+            f"Landmark scheme ({source}): {scheme} — {joined}"
+        )
+
+    # ------------------------------------------------------------------
+    # Theta-epoch availability
+    # ------------------------------------------------------------------
+
+    def _refresh_theta_epoch_availability(self):
+        has_theta = bool(getattr(self.trace_view, "theta_epochs", None))
+        self.only_in_epochs_check.setEnabled(has_theta)
+        if not has_theta and self.only_in_epochs_check.isChecked():
+            self.only_in_epochs_check.setChecked(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_theta_epoch_availability()
+
+    def _on_theta_epochs_changed(self, _epochs: list):
+        self._refresh_theta_epoch_availability()
+
+    # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
 
+    def _set_full_available_range(self):
+        if not self.engine.data_loaded:
+            return
+        t_min, t_max = self.engine.get_time_range()
+        self.start_spin.setValue(t_min)
+        self.end_spin.setValue(t_max)
+
     def _sync_time_range_from_engine(self):
-        """Spinbox bounds follow the engine's current time base: clock
-        values when a timestamps.npy is loaded, elapsed seconds
-        otherwise. Called from __init__ and by MainWindow whenever the
-        timestamps state changes after the dialog was opened."""
         if not self.engine.data_loaded:
             return
         t_min, t_max = self.engine.get_time_range()
@@ -423,12 +574,10 @@ class ThetaCycleDialog(QDialog):
         self.end_spin.blockSignals(False)
 
     def on_engine_time_base_changed(self):
-        """Called by MainWindow when a timestamps.npy is loaded after
-        the dialog opened. Re-syncs spinbox bounds and repopulates the
-        table so *_s columns reflect the new time base."""
         self._sync_time_range_from_engine()
         self._populate_table()
         self._refresh_export_buttons()
+
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
@@ -445,9 +594,11 @@ class ThetaCycleDialog(QDialog):
             try:
                 out.append(int(part))
             except ValueError:
-                raise ValueError(f"'{part}' is not a valid channel number.")
+                raise ValueError(
+                    f"'{part}' is not a valid channel number."
+                )
         return out
-    
+
     def _on_trace_gain_changed(self, value: float):
         if self.trace_view is not None:
             self.trace_view.set_theta_cycle_gain(float(value))
@@ -458,12 +609,16 @@ class ThetaCycleDialog(QDialog):
 
     def _collect_params(self) -> ThetaCycleParams:
         return ThetaCycleParams(
-            channels=[],  # unused by the detector; the thread iterates
+            channels=[],
             start_time=self.start_spin.value(),
             end_time=self.end_spin.value(),
             low_freq=self.low_spin.value(),
             high_freq=self.high_spin.value(),
+            filter_order=int(self.filter_order_spin.value()),
+            detrend=bool(self.detrend_check.isChecked()),
             min_theta_peak_percentile=self.min_amp_spin.value(),
+            peak_low_freq=float(self.peak_low_spin.value()),
+            peak_high_freq=float(self.peak_high_spin.value()),
             delta_correction=self.delta_check.isChecked(),
             delta_low_freq=self.delta_low_spin.value(),
             delta_high_freq=self.delta_high_spin.value(),
@@ -500,34 +655,69 @@ class ThetaCycleDialog(QDialog):
 
         params = self._collect_params()
 
-        # Tell the overlay which band we're using, so the filtered
-        # trace it draws matches the one the detector saw.
         self.trace_view.set_theta_cycle_band(
             params.low_freq, params.high_freq,
         )
+
+        start_idx = self.engine.timestamp_to_sample(self.start_spin.value())
+        end_idx = self.engine.timestamp_to_sample(self.end_spin.value())
+
+        epoch_intervals = []
+        if self.only_in_epochs_check.isChecked():
+            epoch_intervals = self._theta_epoch_intervals_for_cycle_detection(
+                start_idx
+            )
+            if not epoch_intervals:
+                QMessageBox.information(
+                    self, "No theta epochs",
+                    "Only-inside-theta-epochs is checked, but no theta "
+                    "epochs are currently defined on the main trace view."
+                )
+                return
 
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting...")
         self.progress_label.setText("")
         self.status_label.setText("Running detection...")
 
-
-        start_idx = self.engine.timestamp_to_sample(self.start_spin.value())
-        end_idx = self.engine.timestamp_to_sample(self.end_spin.value())
-
         self._sample_offset = int(start_idx)
         self._detect_n_samples = max(0, int(end_idx) - int(start_idx))
         self._last_params_for_sidecar = params
 
+        # Fresh detection: any previously-loaded scheme/names are no
+        # longer associated with the in-memory cycles.
+        self._loaded_cycle_start_edge = None
+        self._loaded_landmark_names = None
+        self._refresh_landmark_scheme_label()
+
         self._detect_thread = _DetectThread(
             channels, self.engine.data, self.engine.sr,
-            start_idx, end_idx, params, parent=self,
+            start_idx, end_idx, params, epoch_intervals, parent=self,
         )
 
         self._detect_thread.progress.connect(self._on_progress)
         self._detect_thread.finished_ok.connect(self._on_detect_finished)
         self._detect_thread.failed.connect(self._on_detect_failed)
         self._detect_thread.start()
+
+    def _theta_epoch_intervals_for_cycle_detection(
+        self, cycle_start_idx: int
+    ) -> list[tuple[int, int]]:
+        epochs = getattr(self.trace_view, "theta_epochs", None) or []
+        if not epochs:
+            return []
+        epoch_offset = int(
+            getattr(self.trace_view, "theta_detection_sample_offset", 0)
+        )
+        intervals: list[tuple[int, int]] = []
+        for ep in epochs:
+            lo_abs = int(ep.start_sample) + epoch_offset
+            hi_abs = int(ep.end_sample) + epoch_offset
+            intervals.append((
+                lo_abs - int(cycle_start_idx),
+                hi_abs - int(cycle_start_idx),
+            ))
+        return intervals
 
     def _on_progress(self, done: int, total: int):
         self.progress_label.setText(f"{done}/{total} channels")
@@ -547,6 +737,7 @@ class ThetaCycleDialog(QDialog):
         self._populate_table()
         self._push_flat_cycles_to_trace()
         self._refresh_export_buttons()
+        self._refresh_landmark_scheme_label()
         total = sum(len(v) for v in results.values())
         n_ch = sum(1 for v in results.values() if v)
         self.status_label.setText(
@@ -556,55 +747,38 @@ class ThetaCycleDialog(QDialog):
         self._schedule_autosave()
 
     # ------------------------------------------------------------------
-    # Channel dropdown + table
+    # Table
     # ------------------------------------------------------------------
 
-
     def _populate_table(self):
-        """Populate the pooled table. Time columns are derived from
-        the current engine's time base every time this runs, so a
-        timestamps file loaded after detection (or after a CSV load)
-        is reflected on the next repopulation without any explicit
-        'recompute' step."""
         flat = self._flat_cycles()
         self._selected_index = None
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(len(flat))
             for row, c in enumerate(flat):
-                zc_start = int(c.zero_crossing_start)
-                peak1 = int(c.peak1)
-                zc_mid = int(c.zero_crossing_mid)
-                valley = int(c.valley)
-                zc_end = int(c.zero_crossing_end)
-                peak2 = int(c.peak2)
-                dur_smp = zc_end - zc_start
+                landmarks = c.landmarks()
+                ref_smp = [int(x) for x in landmarks]
+                dur_smp = ref_smp[4] - ref_smp[0]
 
                 def t(smp):
                     return float(self.engine.sample_to_time(smp))
 
-                vals = [
-                    str(c.channel),
-                    str(zc_start),
-                    str(peak1),
-                    str(zc_mid),
-                    str(valley),
-                    str(zc_end),
-                    str(peak2),
-                    str(dur_smp),
-                    f"{t(zc_start):.3f}",
-                    f"{t(peak1):.3f}",
-                    f"{t(zc_mid):.3f}",
-                    f"{t(valley):.3f}",
-                    f"{t(zc_end):.3f}",
-                    f"{t(peak2):.3f}",
-                    f"{dur_smp / float(self.engine.sr):.3f}",
-                    f"{c.amplitude:.3g}",
+                vals = [str(c.channel)]
+                vals.extend(str(x) for x in ref_smp)
+                vals.append(str(dur_smp))
+                vals.extend(f"{t(x):.3f}" for x in ref_smp)
+                vals.append(f"{dur_smp / float(self.engine.sr):.3f}")
+                vals.append(f"{c.amplitude:.3g}")
+                vals.append(
                     "" if c.theta_delta_ratio is None
-                        else f"{c.theta_delta_ratio:.3f}",
+                    else f"{c.theta_delta_ratio:.3f}"
+                )
+                vals.append(
                     "" if c.fast_theta_ratio is None
-                        else f"{c.fast_theta_ratio:.3f}",
-                ]
+                    else f"{c.fast_theta_ratio:.3f}"
+                )
+
                 for col, v in enumerate(vals):
                     item = QTableWidgetItem(v)
                     item.setTextAlignment(
@@ -645,11 +819,12 @@ class ThetaCycleDialog(QDialog):
 
         self._ensure_channel_visible(target.channel)
         self._pan_to_event(target)
-        # Ask MainWindow to highlight this channel on the probe map.
         self.eventFocused.emit(int(target.channel))
 
     def _pan_to_event(self, cycle: ThetaCycle):
-        """Center the trace view on this cycle's peak1 time."""
+        """Center the trace view on the cycle's second landmark
+        (ref_2), which is always the first peak or peak-equivalent
+        landmark of the oscillation under every scheme."""
         try:
             peak_time = float(self.engine.sample_to_time(int(cycle.peak1)))
         except Exception:
@@ -675,9 +850,6 @@ class ThetaCycleDialog(QDialog):
             self.trace_view.update()
 
     def set_selected_cycle(self, flat_index: int):
-        """Slot for trace_view.thetaCycleSelected -- a cycle was clicked on
-        the trace view. Row index in the table equals flat_index, so
-        selection is a direct lookup."""
         flat = self._flat_cycles()
         if not (0 <= flat_index < len(flat)):
             return
@@ -687,9 +859,6 @@ class ThetaCycleDialog(QDialog):
         self._selected_index = flat_index
 
     def set_cycles_from_trace(self, cycles: list):
-        """Slot for trace_view.thetaCyclesChanged -- a cycle was deleted
-        or an undo happened on the trace view. Regroup into
-        cycles_by_channel and refresh the table."""
         regrouped: dict[int, list[ThetaCycle]] = {}
         for c in cycles:
             regrouped.setdefault(c.channel, []).append(c)
@@ -707,17 +876,6 @@ class ThetaCycleDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _step_cycle(self, direction: int):
-        """Step Prev/Next through the flat, (channel, start_sample)-
-        sorted list of every cycle across every detected channel --
-        the same order the table shows. Crossing from the last cycle
-        of one channel into the first of the next is intentional: the
-        button means 'next row in the table', not 'next cycle on this
-        channel'.
-
-        If nothing is selected, direction > 0 starts at row 0 and
-        direction < 0 starts at the last row. When the end (or start)
-        is reached, the selection stays put -- no wrap.
-        """
         flat = self._flat_cycles()
         if not flat:
             return
@@ -732,10 +890,8 @@ class ThetaCycleDialog(QDialog):
         new_row = max(0, min(new_row, len(flat) - 1))
 
         target = flat[new_row]
-
         self._ensure_channel_visible(int(target.channel))
 
-        # Center the view on the target's peak1.
         peak_time = float(self.engine.sample_to_time(int(target.peak1)))
         window = max(0.05, self.nav_window_spin.value())
         t_min, _ = self.engine.get_time_range()
@@ -758,14 +914,29 @@ class ThetaCycleDialog(QDialog):
             f"Cycle {new_row + 1} of {len(flat)} on CH{target.channel} "
             f"({'(next)' if direction > 0 else '(prev)'})"
         )
+
     # ------------------------------------------------------------------
     # Export / import
     # ------------------------------------------------------------------
+
+    def _current_export_scheme(self) -> str:
+        """Scheme to write for the current cycle set: the loaded
+        scheme if these cycles came from a Load, otherwise the current
+        combo value (which is what a fresh Detect would have used)."""
+        if self._loaded_cycle_start_edge is not None:
+            return self._loaded_cycle_start_edge
+        return self.edge_combo.currentText()
+
+    def _current_export_landmark_names(self) -> list[str]:
+        if self._loaded_landmark_names is not None:
+            return list(self._loaded_landmark_names)
+        scheme = self._current_export_scheme()
+        return list(LANDMARK_NAMES_BY_MODE.get(scheme, []))
+
     def _on_save_clicked(self):
-        """Write every cycle from every channel into a single CSV in
-        the neuropyxels/ folder next to the loaded .dat, plus a
-        sidecar with the parameters that produced them."""
-        if not self.cycles_by_channel or not any(self.cycles_by_channel.values()):
+        if not self.cycles_by_channel or not any(
+            self.cycles_by_channel.values()
+        ):
             QMessageBox.information(
                 self, "Nothing to save",
                 "Run detection (or load a CSV) first."
@@ -783,8 +954,12 @@ class ThetaCycleDialog(QDialog):
 
         csv_path = folder / "theta_cycles.csv"
         flat = self._flat_cycles()
+        scheme = self._current_export_scheme()
         try:
-            export_cycles_to_csv(flat, self.engine, csv_path)
+            export_cycles_to_csv(
+                flat, self.engine, csv_path,
+                cycle_start_edge=scheme,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return
@@ -801,6 +976,7 @@ class ThetaCycleDialog(QDialog):
                     analysis_end_sample=analysis_end_sample,
                     channels=sorted(self.cycles_by_channel.keys()),
                     params=self._last_params_for_sidecar,
+                    landmark_names=self._current_export_landmark_names(),
                 )
             except Exception as exc:
                 print(f"[theta-cycle-save] sidecar failed: {exc}")
@@ -808,7 +984,6 @@ class ThetaCycleDialog(QDialog):
         self.status_label.setText(
             f"Saved {len(flat)} cycle(s) to {folder}"
         )
-
 
     def _on_load_clicked(self):
         if not self.engine.data_loaded:
@@ -839,29 +1014,26 @@ class ThetaCycleDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(
                 self, "Sidecar unreadable",
-                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}\n\n"
-                "The cycles will load, but saved parameters will not be "
-                "available."
+                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}"
             )
             sidecar = None
 
         try:
-            cycles = read_cycles_from_csv(csv_path)
+            cycles, csv_scheme, _ = read_cycles_from_csv(csv_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Failed to load",
-                                 f"Could not read {csv_path}:\n\n{exc}")
+            QMessageBox.critical(
+                self, "Failed to load",
+                f"Could not read {csv_path}:\n\n{exc}"
+            )
             return
 
         if not cycles:
-            QMessageBox.information(self, "No cycles found",
-                                    f"{csv_path} contains no cycles.")
+            QMessageBox.information(
+                self, "No cycles found",
+                f"{csv_path} contains no cycles."
+            )
             return
 
-        # Replace the in-memory cycle set with what was loaded. Loading
-        # the same file twice produces the same state, not a doubled
-        # list. This also discards any in-memory edits that weren't
-        # saved -- which is the expected behavior for "Load" (as
-        # opposed to "Import" or "Merge").
         regrouped: dict[int, list[ThetaCycle]] = {}
         for c in cycles:
             regrouped.setdefault(c.channel, []).append(c)
@@ -869,12 +1041,54 @@ class ThetaCycleDialog(QDialog):
             regrouped[ch].sort(key=lambda c: c.zero_crossing_start)
         self.cycles_by_channel = regrouped
 
+        # Determine the scheme and landmark_names for the loaded set.
+        # The sidecar is authoritative when present; otherwise we fall
+        # back to whatever the CSV itself claims.
+        sidecar_scheme = None
+        sidecar_landmarks = None
         if sidecar is not None:
             self._apply_sidecar(sidecar)
+            sidecar_scheme = (
+                (sidecar.get("params") or {}).get("cycle_start_edge")
+            )
+            lm = sidecar.get("landmark_names")
+            if isinstance(lm, list) and len(lm) == 6:
+                sidecar_landmarks = [str(x) for x in lm]
+            self._sample_offset = int(
+                sidecar.get("analysis_start_sample", 0)
+            )
+            start_n = int(sidecar.get("analysis_start_sample", 0))
+            end_n = int(sidecar.get("analysis_end_sample", 0))
+            self._detect_n_samples = max(0, end_n - start_n)
+        else:
+            self._sample_offset = 0
+            self._detect_n_samples = 0
+
+        # Cross-check sidecar vs CSV; prefer sidecar.
+        if sidecar_scheme is not None and csv_scheme is not None \
+                and sidecar_scheme != csv_scheme:
+            print(
+                f"[theta-cycle-load] scheme mismatch: sidecar="
+                f"{sidecar_scheme!r} csv={csv_scheme!r}; using sidecar."
+            )
+        loaded_scheme = (
+            sidecar_scheme if sidecar_scheme is not None else csv_scheme
+        )
+        self._loaded_cycle_start_edge = loaded_scheme
+        self._loaded_landmark_names = sidecar_landmarks
+
+        # Reflect the loaded scheme in the combo so a user editing
+        # afterwards sees the correct controls.
+        if loaded_scheme is not None:
+            self.edge_combo.blockSignals(True)
+            self.edge_combo.setCurrentText(loaded_scheme)
+            self.edge_combo.blockSignals(False)
 
         self._populate_table()
         self._push_flat_cycles_to_trace()
         self._refresh_export_buttons()
+        self._refresh_landmark_scheme_label()
+
         status = f"Loaded {len(cycles)} cycle(s) from {folder}."
         if sidecar is not None:
             status += " Parameters restored."
@@ -882,9 +1096,11 @@ class ThetaCycleDialog(QDialog):
         self._autosave_armed = True
 
     def _apply_sidecar(self, sidecar: dict):
-        """Restore detection params and the theta band from a sidecar.
-        The band is pushed to the trace view so the filtered overlay
-        matches the band the cycles were detected with."""
+        """Restore detection params and the theta band from a sidecar,
+        including the four new spinboxes. Fields absent from the
+        sidecar fall back to the widget's default; this makes old
+        sidecars (saved before the peak-lows / filter-order / detrend
+        controls existed) load cleanly."""
         params_dict = sidecar.get("params") or {}
         try:
             params = ThetaCycleParams(**params_dict)
@@ -907,6 +1123,26 @@ class ThetaCycleDialog(QDialog):
             spin.setValue(float(value))
             spin.blockSignals(False)
 
+        # Peak-distance bounds: default 2.5 / 15.0 if the sidecar
+        # stored None (which happens for old sidecars and for
+        # sessions that never exposed the fields).
+        pl = params.peak_low_freq if params.peak_low_freq is not None else 2.5
+        ph = params.peak_high_freq if params.peak_high_freq is not None else 15.0
+        self.peak_low_spin.blockSignals(True)
+        self.peak_low_spin.setValue(float(pl))
+        self.peak_low_spin.blockSignals(False)
+        self.peak_high_spin.blockSignals(True)
+        self.peak_high_spin.setValue(float(ph))
+        self.peak_high_spin.blockSignals(False)
+
+        self.filter_order_spin.blockSignals(True)
+        self.filter_order_spin.setValue(int(params.filter_order))
+        self.filter_order_spin.blockSignals(False)
+
+        self.detrend_check.blockSignals(True)
+        self.detrend_check.setChecked(bool(params.detrend))
+        self.detrend_check.blockSignals(False)
+
         if params.delta_high_freq is not None:
             self.delta_high_spin.blockSignals(True)
             self.delta_high_spin.setValue(float(params.delta_high_freq))
@@ -916,45 +1152,16 @@ class ThetaCycleDialog(QDialog):
         self.fast_check.setChecked(bool(params.fast_correction))
         self.edge_combo.setCurrentText(str(params.cycle_start_edge))
 
-        # Restore the overlay's band so the filtered trace it draws
-        # matches what the cycles were detected against.
         if self.trace_view is not None:
             self.trace_view.set_theta_cycle_band(
                 params.low_freq, params.high_freq,
             )
 
-
     # ------------------------------------------------------------------
-    # Cleanup
+    # Export-button state / autosave
     # ------------------------------------------------------------------
-
-    def closeEvent(self, event):
-        if self._detect_thread is not None and self._detect_thread.isRunning():
-            self._detect_thread.wait(2000)
-
-        if self._autosave_armed and self._autosave_timer.isActive():
-            self._autosave_timer.stop()
-            self._autosave_now()
-
-        try:
-            self.trace_view.thetaCyclesChanged.disconnect(self.set_cycles_from_trace)
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self.trace_view.thetaCycleSelected.disconnect(self.set_selected_cycle)
-        except (TypeError, RuntimeError):
-            pass
-        self.trace_view.clear_theta_cycles()
-        super().closeEvent(event)
-
-
 
     def _refresh_export_buttons(self):
-        """Enable Save only when there are cycles to write and the
-        engine has a .dat to anchor the analysis folder to. Load stays
-        enabled as long as there's a .dat, so the user can still try to
-        load a saved session even with nothing detected yet (the
-        handler shows a helpful message if the folder is empty)."""
         has_cycles = bool(
             self.cycles_by_channel
             and any(self.cycles_by_channel.values())
@@ -981,8 +1188,6 @@ class ThetaCycleDialog(QDialog):
                 "saving or loading an analysis."
             )
 
-        # Load is never disabled by 'no cycles' -- the user may want to
-        # load a saved session before running detection.
         self.load_btn.setEnabled(has_file)
 
     def _schedule_autosave(self):
@@ -1001,8 +1206,12 @@ class ThetaCycleDialog(QDialog):
             return
 
         csv_path = folder / "theta_cycles.csv"
+        scheme = self._current_export_scheme()
         try:
-            export_cycles_to_csv(flat, self.engine, csv_path)
+            export_cycles_to_csv(
+                flat, self.engine, csv_path,
+                cycle_start_edge=scheme,
+            )
         except Exception as exc:
             print(f"[theta-cycle-autosave] CSV write failed: {exc}")
             return
@@ -1018,6 +1227,7 @@ class ThetaCycleDialog(QDialog):
                     analysis_end_sample=int(self._sample_offset) + n,
                     channels=sorted(self.cycles_by_channel.keys()),
                     params=self._last_params_for_sidecar,
+                    landmark_names=self._current_export_landmark_names(),
                 )
             except Exception as exc:
                 print(f"[theta-cycle-autosave] sidecar write failed: {exc}")
@@ -1025,3 +1235,37 @@ class ThetaCycleDialog(QDialog):
         self.status_label.setText(
             f"Auto-saved {len(flat)} cycle(s)."
         )
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        if self._detect_thread is not None and self._detect_thread.isRunning():
+            self._detect_thread.wait(2000)
+
+        if self._autosave_armed and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+            self._autosave_now()
+
+        try:
+            self.trace_view.thetaCyclesChanged.disconnect(
+                self.set_cycles_from_trace
+            )
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.trace_view.thetaCycleSelected.disconnect(
+                self.set_selected_cycle
+            )
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.trace_view.thetaEpochsChanged.disconnect(
+                self._on_theta_epochs_changed
+            )
+        except (TypeError, RuntimeError):
+            pass
+
+        self.trace_view.clear_theta_cycles()
+        super().closeEvent(event)

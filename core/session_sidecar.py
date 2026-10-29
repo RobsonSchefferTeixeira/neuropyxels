@@ -11,7 +11,8 @@ Format
 A JSON file next to the CSV with the same base name and a
 ``.meta.json`` suffix:
 
-    ripples_ch18.csv  ->  ripples_ch18.meta.json
+    ripples_ch18.csv      ->  ripples_ch18.meta.json
+    theta_cycles.csv      ->  theta_cycles.meta.json
 
 Contents (version 1):
 
@@ -23,13 +24,16 @@ Contents (version 1):
       "analysis_start_sample": 0,
       "analysis_end_sample": 24000000,
       "channels": [18],
-      "params": { ... }     # kind-specific, matches the dataclass fields
+      "params": { ... },             # kind-specific, matches the dataclass
+      "landmark_names": [ ... ]      # OPTIONAL: 6 strings, theta_cycles only
     }
 
-If the sidecar is missing when a CSV is loaded, the dialog falls back
-to today's behavior: load the events with whatever parameters are
-currently on screen, no per-channel signals, and RTA/Inspector disabled
-until the user runs a detection.
+``landmark_names`` is only written by theta-cycle saves. It gives the
+exact landmark identity of each ref_1..ref_6 CSV column for the
+scheme that produced the file, so a reader of the sidecar can
+interpret the position-only CSV without knowing the scheme rules.
+Absent for other kinds and for any file saved before this field
+existed; in that case the reader falls back to the rising_zc layout.
 
 No GUI dependency.
 """
@@ -54,20 +58,12 @@ def sidecar_path_for(csv_path: str | Path) -> Path:
     ``foo``     -> ``foo.meta.json``
     """
     csv_path = Path(csv_path)
-    # Strip a trailing .csv if present, then append the sidecar suffix.
     stem = csv_path.stem if csv_path.suffix.lower() == ".csv" else csv_path.name
     return csv_path.with_name(stem + SIDECAR_SUFFIX)
 
 
 def _params_to_dict(params: Any) -> dict:
-    """Convert a params dataclass (or plain dict) into a JSON-safe dict.
-
-    ``dataclasses.asdict`` handles nested dataclasses; we just need to
-    make sure the values are JSON-serializable (no numpy scalars, no
-    tuples that should be lists). All current params are made of plain
-    Python types, so asdict is sufficient. If a future param adds a
-    numpy scalar, this is where the conversion would go.
-    """
+    """Convert a params dataclass (or plain dict) into a JSON-safe dict."""
     if is_dataclass(params) and not isinstance(params, type):
         return asdict(params)
     if isinstance(params, dict):
@@ -85,8 +81,15 @@ def save_sidecar(
     analysis_end_sample: int,
     channels: list[int],
     params: Any,
+    landmark_names: list[str] | None = None,
 ) -> Path:
-    """Write the sidecar next to the CSV. Returns the sidecar path."""
+    """Write the sidecar next to the CSV. Returns the sidecar path.
+
+    ``landmark_names``, when provided, is stored under a top-level
+    key and gives the exact meaning of each ref_N column for the
+    scheme that produced the file. Only theta_cycles saves currently
+    pass it.
+    """
     sidecar = sidecar_path_for(csv_path)
     payload = {
         "kind": str(kind),
@@ -98,6 +101,8 @@ def save_sidecar(
         "channels": [int(c) for c in channels],
         "params": _params_to_dict(params),
     }
+    if landmark_names is not None:
+        payload["landmark_names"] = [str(n) for n in landmark_names]
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     with open(sidecar, "w") as f:
         json.dump(payload, f, indent=2)

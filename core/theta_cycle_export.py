@@ -5,27 +5,25 @@ CSV export / import for detected or edited theta cycles.
 
 Column conventions
 ------------------
-Every ``*_smp`` column is an ABSOLUTE sample index into the original
-``.dat`` file. Cycles are stored in memory with absolute sample
-indices (the detection thread converts from slice-relative to absolute
-before returning), so no offset is applied at export time.
+The six landmark columns are POSITIONAL: ref_1_smp .. ref_6_smp. What
+each position means depends on the file's cycle_start_edge:
 
-Every ``*_s`` column is a convenience value derived at EXPORT time
-from the engine's current time base:
+  rising_zc : zc_rising_1, peak1, zc_falling_1, valley_1, zc_rising_2, peak2
+  falling_zc: zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2, valley_2
+  peak      : peak1, zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2
+  valley    : valley_1, zc_rising_2, peak2, zc_falling_2, valley_2, zc_rising_3
 
-  * if a timestamps.npy is loaded, the value is the timestamp at that
-    sample;
-  * otherwise, the value is ``sample / engine.sr`` (elapsed seconds).
+The CSV carries a cycle_start_edge column so a naked file is
+self-identifying per row. The sidecar (theta_cycles.meta.json) also
+carries a "landmark_names" list of six strings, matching the file's
+scheme. A reader with both has an unambiguous view; a reader with
+only the CSV can consult the cycle_start_edge column and this
+docstring to reconstruct the interpretation.
 
-The CSV file is therefore a self-consistent snapshot, but the ``_s``
-columns are informational only. On import, ``_s`` values are
-recomputed from the samples against the current engine, so a cycle
-loaded after a timestamps file is attached will display correctly.
-
-``duration_s`` is always ``duration_smp / engine.sr`` -- sample-count
-duration is a property of the recording, not of the timestamps array,
-and a delta of samples divided by the sampling rate gives the right
-answer even when timestamps are non-uniform.
+Every *_smp column is an ABSOLUTE sample index into the original
+.dat file. Every *_s column is derived at export time from the
+engine's current time base (timestamps if loaded, else sample/sr).
+duration_smp is (ref_5 - ref_1), one full oscillation.
 
 No GUI dependency.
 """
@@ -36,28 +34,15 @@ import csv
 from pathlib import Path
 from typing import Sequence
 
-from core.theta_cycle_detector import ThetaCycle
+from core.theta_cycle_detector import (
+    ThetaCycle, LANDMARK_NAMES_BY_MODE, VALID_CYCLE_START_EDGES,
+)
 
 
-# Snake_case on disk. The in-app table uses human-readable headers
-# (see gui/theta_cycle_dialog.py) but the CSV is designed for scripts
-# and spreadsheets, where a single canonical spelling matters more
-# than brevity.
-CSV_FIELDNAMES = [
-    "channel",
-    "zc_start_smp",
-    "peak1_smp",
-    "zc_mid_smp",
-    "valley_smp",
-    "zc_end_smp",
-    "peak2_smp",
+# Columns shared by every scheme.
+_STATIC_HEAD = ["channel", "cycle_start_edge"]
+_STATIC_TAIL = [
     "duration_smp",
-    "zc_start_s",
-    "peak1_s",
-    "zc_mid_s",
-    "valley_s",
-    "zc_end_s",
-    "peak2_s",
     "duration_s",
     "amp",
     "theta_delta_ratio",
@@ -65,65 +50,69 @@ CSV_FIELDNAMES = [
 ]
 
 
-def _to_row(cycle: ThetaCycle, engine) -> dict:
-    """Build one CSV row from a ThetaCycle. ``engine`` supplies the
-    time base: ``engine.sample_to_time(sample)`` returns the timestamp
-    if a timestamps.npy is loaded, else ``sample / engine.sr``."""
-    zc_start_smp = int(cycle.zero_crossing_start)
-    peak1_smp = int(cycle.peak1)
-    zc_mid_smp = int(cycle.zero_crossing_mid)
-    valley_smp = int(cycle.valley)
-    zc_end_smp = int(cycle.zero_crossing_end)
-    peak2_smp = int(cycle.peak2)
-    # Half-open span: a cycle runs from its start crossing up to (but
-    # not including) the next cycle's start crossing. Consecutive
-    # cycle durations therefore sum exactly to the interval between
-    # consecutive starts.
-    duration_smp = zc_end_smp - zc_start_smp
+def _ref_columns() -> list[str]:
+    cols: list[str] = []
+    cols.extend(f"ref_{i}_smp" for i in range(1, 7))
+    cols.extend(f"ref_{i}_s"   for i in range(1, 7))
+    return cols
 
-    return {
+
+CSV_FIELDNAMES = _STATIC_HEAD + _ref_columns() + _STATIC_TAIL
+
+
+def _landmark_names_for(mode: str) -> list[str]:
+    return list(LANDMARK_NAMES_BY_MODE.get(mode, []))
+
+
+def _to_row(cycle: ThetaCycle, engine, cycle_start_edge: str) -> dict:
+    landmarks = cycle.landmarks()
+    ref_smp = [int(x) for x in landmarks]
+    duration_smp = ref_smp[4] - ref_smp[0]
+
+    row = {
         "channel": int(cycle.channel),
-        "zc_start_smp": zc_start_smp,
-        "peak1_smp": peak1_smp,
-        "zc_mid_smp": zc_mid_smp,
-        "valley_smp": valley_smp,
-        "zc_end_smp": zc_end_smp,
-        "peak2_smp": peak2_smp,
-        "duration_smp": duration_smp,
-        "zc_start_s": round(float(engine.sample_to_time(zc_start_smp)), 6),
-        "peak1_s": round(float(engine.sample_to_time(peak1_smp)), 6),
-        "zc_mid_s": round(float(engine.sample_to_time(zc_mid_smp)), 6),
-        "valley_s": round(float(engine.sample_to_time(valley_smp)), 6),
-        "zc_end_s": round(float(engine.sample_to_time(zc_end_smp)), 6),
-        "peak2_s": round(float(engine.sample_to_time(peak2_smp)), 6),
-        "duration_s": round(duration_smp / float(engine.sr), 6),
-        "amp": round(float(cycle.amplitude), 6),
-        "theta_delta_ratio": (
-            "" if cycle.theta_delta_ratio is None
-            else round(float(cycle.theta_delta_ratio), 4)
-        ),
-        "fast_theta_ratio": (
-            "" if cycle.fast_theta_ratio is None
-            else round(float(cycle.fast_theta_ratio), 4)
-        ),
+        "cycle_start_edge": str(cycle_start_edge),
     }
+    for i, smp in enumerate(ref_smp, start=1):
+        row[f"ref_{i}_smp"] = smp
+    for i, smp in enumerate(ref_smp, start=1):
+        row[f"ref_{i}_s"] = round(
+            float(engine.sample_to_time(smp)), 6
+        )
+    row["duration_smp"] = duration_smp
+    row["duration_s"] = round(duration_smp / float(engine.sr), 6)
+    row["amp"] = round(float(cycle.amplitude), 6)
+    row["theta_delta_ratio"] = (
+        "" if cycle.theta_delta_ratio is None
+        else round(float(cycle.theta_delta_ratio), 4)
+    )
+    row["fast_theta_ratio"] = (
+        "" if cycle.fast_theta_ratio is None
+        else round(float(cycle.fast_theta_ratio), 4)
+    )
+    return row
 
 
 def export_cycles_to_csv(
     cycles: Sequence[ThetaCycle],
     engine,
     output_path: str | Path,
+    cycle_start_edge: str = "rising_zc",
 ) -> Path:
-    """Write one row per cycle, sorted by (channel, zc_start_smp).
+    """Write one row per cycle. The cycle_start_edge argument is
+    written to every row and determines the meaning of the six
+    ref_N columns (see module docstring)."""
+    if cycle_start_edge not in VALID_CYCLE_START_EDGES:
+        raise ValueError(
+            f"cycle_start_edge must be one of "
+            f"{VALID_CYCLE_START_EDGES}, got {cycle_start_edge!r}"
+        )
 
-    ``engine`` is a TraceEngine; it supplies both ``sr`` and the
-    current time base (timestamps-aware).
-    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = [_to_row(c, engine) for c in cycles]
-    rows.sort(key=lambda r: (r["channel"], r["zc_start_smp"]))
+    rows = [_to_row(c, engine, cycle_start_edge) for c in cycles]
+    rows.sort(key=lambda r: (r["channel"], r["ref_1_smp"]))
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
@@ -138,61 +127,99 @@ def export_cycles_per_channel(
     engine,
     output_dir: str | Path,
     filename_template: str = "theta_cycles_channel{channel}.csv",
+    cycle_start_edge: str = "rising_zc",
 ) -> list[Path]:
-    """One CSV per channel. Channels with zero cycles still get a
-    header-only file, so it's clear detection ran and found nothing."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     written: list[Path] = []
     for channel, cycles in cycles_by_channel.items():
         path = output_dir / filename_template.format(channel=channel)
-        export_cycles_to_csv(cycles, engine, path)
+        export_cycles_to_csv(
+            cycles, engine, path, cycle_start_edge=cycle_start_edge
+        )
         written.append(path)
     return written
 
 
-def read_cycles_from_csv(path: str | Path) -> list[ThetaCycle]:
-    """Read a cycle CSV.
+def _detect_scheme_from_row(row: dict) -> str | None:
+    """Read cycle_start_edge from the row if present and valid."""
+    value = (row.get("cycle_start_edge") or "").strip()
+    if value in VALID_CYCLE_START_EDGES:
+        return value
+    return None
 
-    Only the ``*_smp`` columns are read. The ``*_s`` columns are
-    ignored (they were computed against whatever time base was active
-    when the file was saved, which may not match the current session).
-    Every returned ThetaCycle holds absolute sample indices; callers
-    that want to display times compute them from the current engine.
 
-    ``duration_ms`` is populated from the half-open sample span and
-    ``engine.sr`` is not available here, so we recompute it later at
-    display time. For now store the sample-count duration scaled by
-    a placeholder sr of 1.0 and rely on display to recompute.
-    Actually: store ``duration_ms`` as 0 and let display recompute;
-    see gui/theta_cycle_dialog._populate_table.
+def _read_old_scheme_row(row: dict) -> dict | None:
+    """Translate an old (zc_*_smp) row into the six-landmark tuple
+    used by read_cycles_from_csv. Returns None if required columns
+    are missing. Old files were always rising_zc."""
+    try:
+        ref_smp = [
+            int(row["zc_start_smp"]),
+            int(row["peak1_smp"]),
+            int(row["zc_mid_smp"]),
+            int(row["valley_smp"]),
+            int(row["zc_end_smp"]),
+            int(row["peak2_smp"]),
+        ]
+    except (KeyError, ValueError, TypeError):
+        return None
+    return {"ref_smp": ref_smp, "cycle_start_edge": "rising_zc", "row": row}
+
+
+def read_cycles_from_csv(
+    path: str | Path,
+) -> tuple[list[ThetaCycle], str | None, list[str] | None]:
+    """Read a cycle CSV. Returns (cycles, cycle_start_edge, landmark_names).
+
+    cycle_start_edge is read from each row's cycle_start_edge column
+    (new files) or defaulted to "rising_zc" (old files, no such
+    column). landmark_names is always None from the CSV alone -- the
+    dialog fills it from the sidecar when present; here we return None
+    so callers know to look elsewhere.
+
+    Only the *_smp columns are read. The *_s columns are ignored (they
+    depend on the engine's time base at save time). duration_ms is
+    left at 0.0; the dialog recomputes from samples.
     """
     path = Path(path)
     cycles: list[ThetaCycle] = []
+    file_scheme: str | None = None
+
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            tdr = row.get("theta_delta_ratio", "").strip()
-            ftr = row.get("fast_theta_ratio", "").strip()
-            zc_start = int(row["zc_start_smp"])
-            zc_end = int(row["zc_end_smp"])
+            scheme = _detect_scheme_from_row(row)
+            if scheme is not None:
+                file_scheme = scheme
+                try:
+                    ref_smp = [int(row[f"ref_{i}_smp"]) for i in range(1, 7)]
+                except (KeyError, ValueError, TypeError):
+                    continue
+            else:
+                translated = _read_old_scheme_row(row)
+                if translated is None:
+                    continue
+                ref_smp = translated["ref_smp"]
+                file_scheme = translated["cycle_start_edge"]
+
+            tdr = (row.get("theta_delta_ratio") or "").strip()
+            ftr = (row.get("fast_theta_ratio") or "").strip()
+
             cycles.append(ThetaCycle(
                 channel=int(row["channel"]),
-                zero_crossing_start=zc_start,
-                peak1=int(row["peak1_smp"]),
-                zero_crossing_mid=int(row["zc_mid_smp"]),
-                valley=int(row["valley_smp"]),
-                zero_crossing_end=zc_end,
-                peak2=int(row["peak2_smp"]),
+                zero_crossing_start=ref_smp[0],
+                peak1=ref_smp[1],
+                zero_crossing_mid=ref_smp[2],
+                valley=ref_smp[3],
+                zero_crossing_end=ref_smp[4],
+                peak2=ref_smp[5],
                 amplitude=float(row["amp"]),
-                # duration_ms is informational; the dialog recomputes
-                # from samples. Leaving 0.0 here keeps the dataclass
-                # valid while avoiding the illusion of a real value.
                 duration_ms=0.0,
                 theta_delta_ratio=(float(tdr) if tdr else None),
                 fast_theta_ratio=(float(ftr) if ftr else None),
                 manual=False,
             ))
+
     cycles.sort(key=lambda c: (c.channel, c.zero_crossing_start))
-    return cycles
+    return cycles, file_scheme, None

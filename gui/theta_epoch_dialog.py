@@ -388,7 +388,7 @@ class ThetaEpochDialog(QDialog):
         grid.addWidget(QLabel("Delta low (Hz):"), 2, 4); grid.addWidget(self.delta_low_spin, 2, 5)
         self.delta_high_spin = QDoubleSpinBox(); self.delta_high_spin.setRange(0.5, 20.0); self.delta_high_spin.setValue(4.0)
         grid.addWidget(QLabel("Delta high (Hz):"), 3, 0); grid.addWidget(self.delta_high_spin, 3, 1)
-        self.ratio_spin = QDoubleSpinBox(); self.ratio_spin.setRange(0.1, 20.0); self.ratio_spin.setValue(1.5)
+        self.ratio_spin = QDoubleSpinBox(); self.ratio_spin.setRange(0.1, 20.0); self.ratio_spin.setValue(4.0)
         grid.addWidget(QLabel("Ratio threshold:"), 3, 2); grid.addWidget(self.ratio_spin, 3, 3)
         self.min_dur_spin = QDoubleSpinBox(); self.min_dur_spin.setRange(10.0, 5000.0); self.min_dur_spin.setValue(500.0); self.min_dur_spin.setSuffix(" ms")
         grid.addWidget(QLabel("Min duration:"), 3, 4); grid.addWidget(self.min_dur_spin, 3, 5)
