@@ -45,12 +45,14 @@ from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QSpinBox, QCheckBox, QPushButton, QComboBox, QMessageBox, QWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QLineEdit, QFileDialog, QSplitter,
+    QLineEdit, QFileDialog, QToolButton, QSizePolicy,
 )
+
 
 from core.session_sidecar import save_sidecar, load_sidecar
 from core.ripple_detector import RippleDetector, RippleParams, RippleEvent
@@ -60,6 +62,24 @@ from core.trace_engine import TraceEngine
 from gui.ripple_trace_view import RippleTraceViewWidget
 from gui.ripple_triggered_average_dialog import RippleTriggeredAverageDialog
 from core.analysis_folder import (analysis_folder_for, ensure_analysis_folder,)
+
+
+def _pin_button(btn: QPushButton, min_width: int | None = None) -> QPushButton:
+    """Keep a button at its natural width when the dialog resizes.
+
+    Qt's layout manager gives QPushButton a Preferred size policy by
+    default, which lets it grow when the dialog widens. Setting Fixed
+    horizontally pins it to sizeHint().width(); vertical policy is left
+    alone so tall/short rows still look right. If min_width is given,
+    the button's minimum width is raised so it never shrinks below it
+    (useful for labels that change length, e.g. 'Delete Selected
+    Ripple').
+    """
+    btn.setSizePolicy(QSizePolicy.Policy.Fixed, btn.sizePolicy().verticalPolicy())
+    if min_width is not None:
+        btn.setMinimumWidth(int(min_width))
+    return btn
+
 
 class _DetectThread(QThread):
     """Runs detection across all requested channels off the UI thread."""
@@ -203,11 +223,19 @@ class RippleDialog(QDialog):
         self._sample_offset = 0
         self._selected_channel: int | None = None
         self._selected_index: int | None = None
+        # Row index that was deleted most recently. Used by
+        # _step_ripple as the anchor for the NEXT Prev/Next click, so
+        # that after deleting row N, "next" lands on what was row N+1
+        # (now row N) and "prev" lands on what was row N-1. Cleared
+        # whenever the user makes an explicit selection (table click,
+        # inspector click, programmatic selectRow from _step_ripple).
+        self._post_delete_anchor: int | None = None
         self._params: RippleParams | None = None
         self._open_rta_dialogs: list[RippleTriggeredAverageDialog] = []
         self._detect_n_samples = 0
 
         self._open_inspector_dialogs: list = []
+        self._flat_events_snapshot: list[RippleEvent] = []
 
         # ---- Autosave ----
         # Armed after a detection or CSV load. Every event-list mutation
@@ -319,6 +347,7 @@ class RippleDialog(QDialog):
         self.full_range_btn.setAutoDefault(False)
         self.full_range_btn.setDefault(False)
         self.full_range_btn.clicked.connect(self._set_full_available_range)
+        _pin_button(self.full_range_btn, min_width=160)
         col_pairs.append((None, self.full_range_btn))
 
         self.low_freq_spin = QDoubleSpinBox()
@@ -373,11 +402,18 @@ class RippleDialog(QDialog):
         self.exclude_theta_check.setEnabled(False)
         col_pairs.append((None, self.exclude_theta_check))
 
+        
         n_cols = 4
         row = 0
         col = 0
         for label_text, widget in col_pairs:
+            widget.setSizePolicy(
+                QSizePolicy.Policy.Fixed, widget.sizePolicy().verticalPolicy()
+            )
             cell = QWidget()
+            cell.setSizePolicy(
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+            )
             cell_layout = QVBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setSpacing(2)
@@ -393,6 +429,21 @@ class RippleDialog(QDialog):
             if col >= n_cols:
                 col = 0
                 row += 1
+
+        # Terminate the grid with a stretch column so the cells hug the
+        # left edge instead of spreading out to fill the dialog's full
+        # width. Without this, Qt distributes the extra horizontal
+        # space across the grid's columns, producing a visible gap
+        # between every pair of cells.
+        n_rows = row + (1 if col > 0 else 0)
+        for r in range(n_rows):
+            grid.setColumnStretch(n_cols, 1)
+
+        # Also widen the inter-column spacing slightly so adjacent
+        # cells don't touch. The stretch column absorbs the rest.
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        grid.setContentsMargins(0, 0, 0, 0)
 
         return grid
 
@@ -456,12 +507,14 @@ class RippleDialog(QDialog):
         self.prev_ripple_btn.setAutoDefault(False)
         self.prev_ripple_btn.setDefault(False)
         self.prev_ripple_btn.clicked.connect(self._go_to_prev_ripple)
+        _pin_button(self.prev_ripple_btn, min_width=120)
         row.addWidget(self.prev_ripple_btn)
 
         self.next_ripple_btn = QPushButton("Next Ripple \u25ba")
         self.next_ripple_btn.setAutoDefault(False)
         self.next_ripple_btn.setDefault(False)
         self.next_ripple_btn.clicked.connect(self._go_to_next_ripple)
+        _pin_button(self.next_ripple_btn, min_width=120)
         row.addWidget(self.next_ripple_btn)
 
         row.addWidget(QLabel("Window (s):"))
@@ -492,6 +545,7 @@ class RippleDialog(QDialog):
             "to cancel without creating one."
         )
         self.add_ripple_btn.toggled.connect(self._on_add_ripple_toggled)
+        _pin_button(self.add_ripple_btn, min_width=100)
         row.addWidget(self.add_ripple_btn)
 
         self.delete_ripple_btn = QPushButton("Delete Selected Ripple")
@@ -502,6 +556,7 @@ class RippleDialog(QDialog):
             "available via the Delete key on the trace view)."
         )
         self.delete_ripple_btn.clicked.connect(self._on_delete_selected_ripple)
+        _pin_button(self.delete_ripple_btn, min_width=150)
         row.addWidget(self.delete_ripple_btn)
 
         row.addStretch(1)
@@ -590,6 +645,7 @@ class RippleDialog(QDialog):
             "Ripple View work without re-running detection."
         )
         self.export_all_btn.clicked.connect(self._on_export_all_clicked)
+        _pin_button(self.export_all_btn, min_width=70)
         row.addWidget(self.export_all_btn)
 
 
@@ -602,6 +658,7 @@ class RippleDialog(QDialog):
             "detected ones."
         )
         self.load_btn.clicked.connect(self._on_load_clicked)
+        _pin_button(self.load_btn, min_width=70)
         row.addWidget(self.load_btn)
 
         row.addStretch(1)
@@ -620,6 +677,7 @@ class RippleDialog(QDialog):
             "reference."
         )
         self.rta_btn.clicked.connect(self._on_open_rta_clicked)
+        _pin_button(self.rta_btn, min_width=190)
         row.addWidget(self.rta_btn)
 
         self.inspector_btn = QPushButton("Single Ripple View...")
@@ -632,6 +690,7 @@ class RippleDialog(QDialog):
             "Average, but without averaging."
         )
         self.inspector_btn.clicked.connect(self._on_open_inspector_clicked)
+        _pin_button(self.inspector_btn, min_width=150)
         row.addWidget(self.inspector_btn)
 
         row.addStretch(1)
@@ -733,15 +792,6 @@ class RippleDialog(QDialog):
             self._open_inspector_dialogs.remove(dialog)
 
     def _on_inspector_reject(self, channel: int, start_sample: int, end_sample: int):
-        """Remove the identified ripple from events_by_channel, refresh
-        the table, push to the trace view overlay, and tell subscribers
-        (the inspector) that events changed.
-
-        Undo: the removal is pushed onto the trace view's ripple undo
-        stack BEFORE the mutation, so Ctrl+Z on the trace view
-        restores it, and rippleEventsChanged flows back through
-        set_events_from_trace, which re-notifies the inspector.
-        """
         events = self.events_by_channel.get(int(channel), [])
         match_idx = None
         for i, ev in enumerate(events):
@@ -752,13 +802,35 @@ class RippleDialog(QDialog):
         if match_idx is None:
             return
 
-        # Snapshot for undo, before mutation.
+        # Remember the row index of the event in the FLAT ordering
+        # (which is what Prev/Next traverse), not its per-channel
+        # index, before the list shrinks.
+        flat_before = self._flat_events()
+        deleted_flat_row: int | None = None
+        for row, ev in enumerate(flat_before):
+            if (int(ev.channel) == int(channel)
+                    and int(ev.start_sample) == int(start_sample)
+                    and int(ev.end_sample) == int(end_sample)):
+                deleted_flat_row = row
+                break
+
         try:
             self.trace_view._ripple_push_undo_snapshot()
         except Exception:
             pass
 
         events.pop(match_idx)
+
+        # Set the anchor to the deleted row's index. After the list
+        # shrinks, that index is occupied by what was the NEXT event,
+        # so "next" from here lands on the successor (correct), and
+        # "prev" lands on the predecessor (correct). Clamped to the
+        # new last index if the deleted one was the last.
+        if deleted_flat_row is not None:
+            self._post_delete_anchor = deleted_flat_row
+        else:
+            self._post_delete_anchor = None
+
         self._populate_summary_table()
         self._push_overlay_to_trace_view()
         self.eventsChanged.emit()
@@ -1017,10 +1089,15 @@ class RippleDialog(QDialog):
         )
 
     def set_events_from_trace(self, events: list[RippleEvent]):
-        """Slot for trace_view.rippleEventsChanged -- keeps
-        events_by_channel (and therefore the summary table / CSV export)
-        in sync after an in-place edit made directly on the trace view
-        (drag boundary, delete, merge, split, add)."""
+        # If the trace view just performed a delete, its
+        # _ripple_selected_event has already been reset to None and the
+        # event is gone from `events`. We cannot recover the deleted
+        # row from `events` alone. However the trace view's delete
+        # path is only reachable from _on_delete_selected_ripple (which
+        # already sets _post_delete_anchor) or from the inspector
+        # (which sets it in _on_inspector_reject), so this slot doesn't
+        # need to set the anchor itself -- it just must NOT clear it.
+
         regrouped: dict[int, list[RippleEvent]] = {}
         for ev in events:
             regrouped.setdefault(ev.channel, []).append(ev)
@@ -1029,10 +1106,6 @@ class RippleDialog(QDialog):
         self.events_by_channel = regrouped
         self._populate_summary_table()
         self.eventsChanged.emit()
-        # A successful edit (or add) coming back from the trace view
-        # means creation mode -- if it was armed -- has already
-        # disarmed itself there; keep the button's checked state in
-        # sync rather than leaving it stuck checked.
         if self.add_ripple_btn.isChecked():
             self.add_ripple_btn.blockSignals(True)
             self.add_ripple_btn.setChecked(False)
@@ -1055,8 +1128,17 @@ class RippleDialog(QDialog):
             self.status_label.setText(f"{len(self.events_by_channel)} channel(s) with ripple data.")
 
     def _on_delete_selected_ripple(self):
+        # Capture the row that's about to be removed BEFORE the delete,
+        # so _step_ripple has an anchor afterwards. The trace view's
+        # delete_selected_ripple_event() uses the same (channel,
+        # start_sample)-sorted flat order this dialog's table does, so
+        # the index transfers 1:1.
+        idx = self._selected_index
+        if idx is not None and 0 <= idx < self.summary_table.rowCount():
+            self._post_delete_anchor = int(idx)
         deleted = self.trace_view.delete_selected_ripple_event()
         if not deleted:
+            self._post_delete_anchor = None
             QMessageBox.information(
                 self, "No ripple selected",
                 "Click a ripple in the main trace view first, then "
@@ -1078,23 +1160,47 @@ class RippleDialog(QDialog):
         detected channel, sorted by (channel, start_sample). Time
         columns are recomputed from the engine on each repopulation, so
         a timestamps file loaded after detection is reflected without
-        reopening the dialog."""
+        reopening the dialog.
+
+        The current selection is preserved by (channel, start_sample)
+        identity across the rebuild. Without this, any event-list
+        mutation (delete, merge, split, undo, load) clears the
+        selection, and the next Prev/Next click has no anchor to step
+        from -- it falls back to "first row", which looks like the
+        navigation reset itself.
+        """
         flat = self._flat_events()
-        # Null the anchor BEFORE touching the widget so the cache can
-        # never disagree with the visible selection, even transiently.
-        self._selected_index = None
+
+        # Capture the selection as an identity, not an index, because
+        # indices shift when events are inserted or removed.
+        prev_selection: tuple[int, int] | None = None
+        rows = self.summary_table.selectionModel().selectedRows() \
+            if self.summary_table.selectionModel() else []
+        if rows:
+            prev_row = int(rows[0].row())
+            old_flat = getattr(self, "_flat_events_snapshot", None)
+            if old_flat is not None and 0 <= prev_row < len(old_flat):
+                ev = old_flat[prev_row]
+                prev_selection = (int(ev.channel), int(ev.start_sample))
+        elif self._selected_index is not None and self._selected_index >= 0:
+            # No table selection but we have a cached anchor -- try to
+            # use it (this happens right after a programmatic
+            # selection was cleared but _selected_index kept).
+            old_flat = getattr(self, "_flat_events_snapshot", None)
+            if old_flat is not None and 0 <= self._selected_index < len(old_flat):
+                ev = old_flat[self._selected_index]
+                prev_selection = (int(ev.channel), int(ev.start_sample))
+
         self.summary_table.blockSignals(True)
         try:
             self.summary_table.setRowCount(len(flat))
 
             def t(smp):
-                # The in-memory event samples are slice-relative, so add
-                # the detection-time offset before asking the engine for
-                # the absolute time.
                 return float(self.engine.sample_to_time(
                     int(smp) + int(self._sample_offset)
                 ))
 
+            new_selection_row: int | None = None
             for row, ev in enumerate(flat):
                 start_smp = int(ev.start_sample) + int(self._sample_offset)
                 end_smp = int(ev.end_sample) + int(self._sample_offset)
@@ -1124,10 +1230,31 @@ class RippleDialog(QDialog):
                         | Qt.AlignmentFlag.AlignVCenter
                     )
                     self.summary_table.setItem(row, col, item)
+
+                if prev_selection is not None \
+                        and (int(ev.channel), int(ev.start_sample)) == prev_selection:
+                    new_selection_row = row
+
             self.summary_table.clearSelection()
-            
+            if new_selection_row is not None:
+                self.summary_table.selectRow(new_selection_row)
+                self._selected_index = new_selection_row
+                self._selected_channel = int(flat[new_selection_row].channel)
+            else:
+                # The previously-selected event no longer exists
+                # (deleted, merged, or replaced by a load). Drop the
+                # anchors so Prev/Next fall back to a deterministic
+                # starting point instead of pointing at a stale row.
+                self._selected_index = None
+                self._selected_channel = None
+
         finally:
             self.summary_table.blockSignals(False)
+
+        # Remember what "row index" meant at this moment, so the next
+        # repopulation can translate the current selection back into an
+        # identity before the rows shift out from under it.
+        self._flat_events_snapshot = list(flat)
 
         # Compact summary above the table.
         n_events = len(flat)
@@ -1142,8 +1269,12 @@ class RippleDialog(QDialog):
     def _on_table_selection_changed(self):
         rows = self.summary_table.selectionModel().selectedRows()
         if not rows:
-            self._selected_channel = None
-            self._selected_index = None
+            # Only drop the anchor if the table itself is empty. A
+            # transient "no rows selected" during a repopulation must
+            # not clear the anchor Prev/Next rely on.
+            if self.summary_table.rowCount() == 0:
+                self._selected_channel = None
+                self._selected_index = None
             return
         row = rows[0].row()
         flat = self._flat_events()
@@ -1156,7 +1287,6 @@ class RippleDialog(QDialog):
         self.trace_view.set_ripple_selected_event(row)
         self._show_channel_in_trace_view(self._selected_channel)
         self._pan_to_event(target)
-        # Ask MainWindow to highlight this channel on the probe map.
         self.eventFocused.emit(self._selected_channel)
         self.status_label.setText(
             f"CH{self._selected_channel} ripple at "
@@ -1215,38 +1345,50 @@ class RippleDialog(QDialog):
         self._step_ripple(direction=1)
 
     def _step_ripple(self, direction: int):
-        """Step Prev/Next through the flat, (channel, start_sample)-
-        sorted list of every ripple across every detected channel --
-        the same order the table shows. Crossing from the last ripple
-        of one channel into the first of the next is intentional: the
-        button means 'next row in the table', not 'next ripple on this
-        channel'.
-
-        The anchor is the table's own selection, not a cached index.
-        Whatever row is visibly highlighted is where the user is; if
-        nothing is selected, direction > 0 starts at row 0 and
-        direction < 0 starts at the last row. When the end (or start)
-        is reached, the selection stays put -- no wrap.
-        """
         flat = self._flat_events()
         if not flat:
             return
 
-        rows = self.summary_table.selectionModel().selectedRows()
-        if rows:
-            current_row = int(rows[0].row())
+        # Anchor priority:
+        #   1. _post_delete_anchor: the row index of the event most
+        #      recently deleted. Because the list has shrunk by one,
+        #      this index is now occupied by what was the deleted
+        #      event's successor. Stepping +1 from here lands on the
+        #      next survivor; stepping -1 lands on the previous
+        #      survivor. This is "the next/prev ripple relative to
+        #      where I was before I deleted."
+        #   2. The table's current selection.
+        #   3. self._selected_index (survives transient clears).
+        #   4. Nothing selected: start from row 0 (next) or last (prev).
+        if self._post_delete_anchor is not None:
+            anchor_row = int(self._post_delete_anchor)
+            self._post_delete_anchor = None
+            if direction > 0:
+                # Next: the anchor slot now holds the deleted event's
+                # successor. Show it (or clamp if the deleted event
+                # was the last one, in which case the anchor slot is
+                # past the end and the new last row is the predecessor).
+                new_row = min(anchor_row, len(flat) - 1)
+            else:
+                # Prev: the predecessor now lives one row before the
+                # anchor slot.
+                new_row = max(0, anchor_row - 1)
         else:
-            current_row = -1 if direction > 0 else len(flat)
-
-        new_row = current_row + direction
-        new_row = max(0, min(new_row, len(flat) - 1))
+            rows = self.summary_table.selectionModel().selectedRows()
+            if rows:
+                current_row = int(rows[0].row())
+            elif self._selected_index is not None and 0 <= self._selected_index < len(flat):
+                current_row = int(self._selected_index)
+            else:
+                current_row = -1 if direction > 0 else len(flat)
+            new_row = current_row + direction
+            new_row = max(0, min(new_row, len(flat) - 1))
 
         target = flat[new_row]
         target_time = float(self.engine.sample_to_time(
             int(target.peak_sample) + int(self._sample_offset)
         ))
 
-        # Pan the trace view to the target's peak time.
         window_duration = max(0.05, self.nav_window_spin.value())
         t_min, _ = self.engine.get_time_range()
         new_start = max(t_min, target_time - window_duration / 2)
@@ -1259,16 +1401,9 @@ class RippleDialog(QDialog):
         self.trace_view._invalidate_cache()
         self.trace_view.update()
 
-        # Ensure the target's channel is drawn (same effect as clicking
-        # the corresponding table row).
         self._show_channel_in_trace_view(int(target.channel))
         self._selected_channel = int(target.channel)
 
-        # Programmatic selection: block the table's signals so that
-        # itemSelectionChanged doesn't fire mid-way through and read a
-        # partially-updated selection. After this returns, the table
-        # reflects the new state; _selected_index is set explicitly so
-        # it can't disagree with what's visible.
         self.summary_table.blockSignals(True)
         self.summary_table.selectRow(new_row)
         self.summary_table.blockSignals(False)
