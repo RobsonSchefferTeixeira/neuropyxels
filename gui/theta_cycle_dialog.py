@@ -19,8 +19,13 @@ Save writes a single CSV (all channels, one table) plus a small
 .dat. Load reads both back, restoring detection parameters, the
 cycle_start_edge scheme, and (for new files) the landmark names.
 
-Editing is minimal: click a cycle's landmark circle on the trace view
-to select it, Delete to remove, Ctrl+Z to undo.
+Editing: click a cycle's landmark circle on the trace view to select
+it, or click its row in the table. Delete removes the selected cycle
+(button, Delete key, or the trace view's own Delete handler), Ctrl+Z
+undoes. Prev/Next Cycle anchors on the table's current selection and
+survives deletes, undos, and repopulations: after a delete, the next
+Prev/Next click lands on what would have been the adjacent survivor
+before the deletion.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QLineEdit, QFileDialog, QToolButton, QSizePolicy,
 )
+from PyQt6.QtGui import QShortcut, QKeySequence
 
 from core.analysis_folder import (
     analysis_folder_for, ensure_analysis_folder,
@@ -116,6 +122,7 @@ class _CollapsibleSection(QWidget):
 
     def set_expanded(self, expanded: bool):
         self._toggle_btn.setChecked(bool(expanded))
+
 
 class _DetectThread(QThread):
     """Runs cycle detection across the requested channels off the UI
@@ -209,6 +216,16 @@ class ThetaCycleDialog(QDialog):
         self.cycles_by_channel: dict[int, list[ThetaCycle]] = {}
         self._selected_channel: int | None = None
         self._selected_index: int | None = None
+
+        # Row index (in the flat, (channel, start)-sorted ordering)
+        # that was deleted most recently. Used by _step_cycle as the
+        # anchor for the NEXT Prev/Next click, so that after deleting
+        # row N, "next" lands on what was row N+1 (now row N) and
+        # "prev" lands on what was row N-1. Cleared whenever the user
+        # makes an explicit selection (table click, trace-view click,
+        # programmatic selectRow from _step_cycle) or when a fresh
+        # detection replaces the cycle set.
+        self._post_delete_anchor: int | None = None
 
         # Analysis-window bookkeeping; initialized so Save/autosave
         # paths never dereference an unset attribute even before any
@@ -342,7 +359,7 @@ class ThetaCycleDialog(QDialog):
         nav_row.addStretch(1)
         layout.addLayout(nav_row)
 
-        # ---- Save / Load ----
+        # ---- Save / Load / Delete ----
         io_row = QHBoxLayout()
         self.export_btn = QPushButton("Save")
         self.export_btn.setAutoDefault(False)
@@ -353,8 +370,30 @@ class ThetaCycleDialog(QDialog):
         self.load_btn.setAutoDefault(False)
         self.load_btn.clicked.connect(self._on_load_clicked)
         io_row.addWidget(self.load_btn)
+
+        self.delete_cycle_btn = QPushButton("Delete Selected Cycle")
+        self.delete_cycle_btn.setAutoDefault(False)
+        self.delete_cycle_btn.setDefault(False)
+        self.delete_cycle_btn.setToolTip(
+            "Remove the currently-selected theta cycle. Also available "
+            "via the Delete key when the table has focus, or when the "
+            "trace view has focus with a cycle selected there.\n"
+            "Ctrl+Z undoes it."
+        )
+        self.delete_cycle_btn.setEnabled(False)
+        self.delete_cycle_btn.clicked.connect(self._on_delete_selected_cycle)
+        io_row.addWidget(self.delete_cycle_btn)
+
         io_row.addStretch(1)
         layout.addLayout(io_row)
+
+        # Keep the Save / Load / Delete buttons at their natural width
+        # so they don't stretch when the dialog is widened, and so a
+        # status-label text change doesn't push them around.
+        for btn in (self.export_btn, self.load_btn, self.delete_cycle_btn):
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Fixed, btn.sizePolicy().verticalPolicy()
+            )
 
         self.status_label = QLabel(
             "Select channels and click Detect Theta Cycles."
@@ -362,10 +401,38 @@ class ThetaCycleDialog(QDialog):
         self.status_label.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(self.status_label)
 
+        # Delete key is scoped to the table via WidgetWithChildrenShortcut:
+        # it fires when the table (or a descendant) has focus, but NOT
+        # while the user is typing in a spinbox elsewhere in the dialog.
+        # The trace view's own Delete handler still works when a cycle
+        # is selected there.
+        self._delete_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Delete), self.table
+        )
+        self._delete_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._delete_shortcut.activated.connect(self._on_delete_selected_cycle)
+
+        # Ctrl+Z is ALSO scoped to the table, not the whole window. If
+        # it were WindowShortcut, it would pre-empt the trace view's own
+        # Ctrl+Z handler (shortcuts fire before the focused widget's
+        # keyPressEvent), which would silently change the trace view's
+        # undo behavior whenever this dialog is open. Scoping to the
+        # table keeps both surfaces consistent: Ctrl+Z in the table
+        # undoes from the dialog, Ctrl+Z in the trace view undoes from
+        # the trace view, and neither steals from the other.
+        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self.table)
+        self._undo_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._undo_shortcut.activated.connect(self._on_undo_cycle_deletion)
+
     def _build_param_grid(self) -> QGridLayout:
         grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        grid.setContentsMargins(0, 0, 0, 0)
         pairs = []
 
         self.channel_edit = QLineEdit()
@@ -423,8 +490,6 @@ class ThetaCycleDialog(QDialog):
             "the theta envelope."
         )
         pairs.append(("Min amp percentile", self.min_amp_spin))
-
-
 
         self.delta_check = QCheckBox("Delta correction")
         self.delta_check.setChecked(True)
@@ -516,8 +581,14 @@ class ThetaCycleDialog(QDialog):
                 col = 0
                 row += 1
 
-        return grid
+        # Terminate the grid with a stretch column so cells hug the
+        # left edge instead of spreading out to fill the dialog's full
+        # width. Without this, Qt distributes extra horizontal space
+        # across the grid's columns, producing a visible gap between
+        # every pair of cells when the dialog widens.
+        grid.setColumnStretch(n_cols, 1)
 
+        return grid
 
     def _build_advanced_section(self) -> QWidget:
         """Collapsible 'Advanced' section: peak-distance bounds,
@@ -530,9 +601,9 @@ class ThetaCycleDialog(QDialog):
         content = self.advanced_section.content_layout()
 
         grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(6)
+        grid.setContentsMargins(0, 0, 0, 0)
 
         pairs = []
 
@@ -615,7 +686,6 @@ class ThetaCycleDialog(QDialog):
         )
         pairs.append((None, self.detrend_check))
 
-
         n_cols = 3
         row = 0
         col = 0
@@ -637,8 +707,12 @@ class ThetaCycleDialog(QDialog):
                 col = 0
                 row += 1
 
+        # Same left-hugging stretch column as the main grid.
+        grid.setColumnStretch(n_cols, 1)
+
         content.addLayout(grid)
         return self.advanced_section
+
     # ------------------------------------------------------------------
     # Landmark scheme label
     # ------------------------------------------------------------------
@@ -782,7 +856,7 @@ class ThetaCycleDialog(QDialog):
         if self.low_spin.value() >= self.high_spin.value():
             QMessageBox.warning(self, "Invalid theta band",
                                 "Theta low must be below theta high.")
-
+            return
 
         # Half-cycle rate must straddle the theta band. If min half
         # rate exceeds the theta band's low edge, no real theta cycle
@@ -805,9 +879,6 @@ class ThetaCycleDialog(QDialog):
                 f"Otherwise a full theta cycle's halves are all slower than "
                 f"the pairing will accept."
             )
-            return
-
-        
             return
 
         params = self._collect_params()
@@ -842,9 +913,12 @@ class ThetaCycleDialog(QDialog):
         self._last_params_for_sidecar = params
 
         # Fresh detection: any previously-loaded scheme/names are no
-        # longer associated with the in-memory cycles.
+        # longer associated with the in-memory cycles, and any pending
+        # post-delete anchor refers to cycles that are about to be
+        # replaced.
         self._loaded_cycle_start_edge = None
         self._loaded_landmark_names = None
+        self._post_delete_anchor = None
         self._refresh_landmark_scheme_label()
 
         self._detect_thread = _DetectThread(
@@ -902,7 +976,6 @@ class ThetaCycleDialog(QDialog):
             sorted(self.cycles_by_channel.keys())
         )
 
-
         self._refresh_export_buttons()
         self._refresh_landmark_scheme_label()
         total = sum(len(v) for v in results.values())
@@ -919,7 +992,6 @@ class ThetaCycleDialog(QDialog):
 
     def _populate_table(self):
         flat = self._flat_cycles()
-        self._selected_index = None
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(len(flat))
@@ -957,6 +1029,12 @@ class ThetaCycleDialog(QDialog):
         finally:
             self.table.blockSignals(False)
 
+        # Nothing is selected after a repopulation, so the Delete
+        # button must be disabled until the user picks a row.
+        self._selected_index = None
+        self._selected_channel = None
+        self.delete_cycle_btn.setEnabled(False)
+
     def _flat_cycles(self) -> list[ThetaCycle]:
         flat: list[ThetaCycle] = []
         for ch in sorted(self.cycles_by_channel.keys()):
@@ -965,21 +1043,36 @@ class ThetaCycleDialog(QDialog):
         return flat
 
     def _push_flat_cycles_to_trace(self):
-        self.trace_view.set_theta_cycles(self._flat_cycles())
-        self.cyclesChanged.emit(self._flat_cycles())
+        flat = self._flat_cycles()
+        self.trace_view.set_theta_cycles(flat)
+        self.cyclesChanged.emit(flat)
 
     def _on_table_selection_changed(self):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
-            self._selected_index = None
+            # Only drop the anchor if the table is genuinely empty. A
+            # transient "no rows selected" during a repopulation must
+            # not clear the selection the Prev/Next buttons rely on.
+            if self.table.rowCount() == 0:
+                self._selected_index = None
+                self._selected_channel = None
+                self.delete_cycle_btn.setEnabled(False)
             return
+
         row = rows[0].row()
         self._selected_index = row
+        self.delete_cycle_btn.setEnabled(True)
 
         flat = self._flat_cycles()
         if not (0 <= row < len(flat)):
             return
         target = flat[row]
+        self._selected_channel = int(target.channel)
+
+        # Explicit user selection supersedes any pending post-delete
+        # anchor: the next Prev/Next should step from THIS row, not
+        # from where a deletion left off.
+        self._post_delete_anchor = None
 
         self.trace_view.set_theta_cycle_selected(row)
         self.cycleSelected.emit(row)
@@ -1020,10 +1113,15 @@ class ThetaCycleDialog(QDialog):
         flat = self._flat_cycles()
         if not (0 <= flat_index < len(flat)):
             return
+        # Explicit trace-view selection supersedes any pending
+        # post-delete anchor for the same reason as a table click.
+        self._post_delete_anchor = None
         self.table.blockSignals(True)
         self.table.selectRow(flat_index)
         self.table.blockSignals(False)
         self._selected_index = flat_index
+        self._selected_channel = int(flat[flat_index].channel)
+        self.delete_cycle_btn.setEnabled(True)
 
     def set_cycles_from_trace(self, cycles: list):
         regrouped: dict[int, list[ThetaCycle]] = {}
@@ -1047,14 +1145,34 @@ class ThetaCycleDialog(QDialog):
         if not flat:
             return
 
-        rows = self.table.selectionModel().selectedRows()
-        if rows:
-            current_row = int(rows[0].row())
+        # Anchor priority:
+        #   1. _post_delete_anchor: the row index of the cycle most
+        #      recently deleted. Because the list shrank by one, this
+        #      index now holds what was the deleted cycle's successor.
+        #      Next -> land on that successor (or clamp to the new last
+        #      row if the deleted cycle was last); Prev -> land on the
+        #      predecessor one row before.
+        #   2. The table's current selection.
+        #   3. self._selected_index (survives transient clears).
+        #   4. Nothing selected: start from row 0 (next) or last (prev).
+        if self._post_delete_anchor is not None:
+            anchor_row = int(self._post_delete_anchor)
+            self._post_delete_anchor = None
+            if direction > 0:
+                new_row = min(anchor_row, len(flat) - 1)
+            else:
+                new_row = max(0, anchor_row - 1)
         else:
-            current_row = -1 if direction > 0 else len(flat)
-
-        new_row = current_row + direction
-        new_row = max(0, min(new_row, len(flat) - 1))
+            rows = self.table.selectionModel().selectedRows()
+            if rows:
+                current_row = int(rows[0].row())
+            elif (self._selected_index is not None
+                  and 0 <= self._selected_index < len(flat)):
+                current_row = int(self._selected_index)
+            else:
+                current_row = -1 if direction > 0 else len(flat)
+            new_row = current_row + direction
+            new_row = max(0, min(new_row, len(flat) - 1))
 
         target = flat[new_row]
         self._ensure_channel_visible(int(target.channel))
@@ -1076,10 +1194,87 @@ class ThetaCycleDialog(QDialog):
         self.table.blockSignals(False)
         self.trace_view.set_theta_cycle_selected(new_row)
         self._selected_index = new_row
+        self._selected_channel = int(target.channel)
+        self.delete_cycle_btn.setEnabled(True)
 
         self.status_label.setText(
             f"Cycle {new_row + 1} of {len(flat)} on CH{target.channel} "
             f"({'(next)' if direction > 0 else '(prev)'})"
+        )
+
+    def _on_delete_selected_cycle(self):
+        """Remove the currently-selected cycle from the in-memory list,
+        rebuild the table, push the new flat list to the trace view,
+        and schedule an autosave.
+
+        Deletion is routed through the trace view's
+        delete_selected_theta_cycle() when possible, so the undo stack,
+        the trace-view highlight, and the thetaCyclesChanged signal
+        stay consistent with how the trace view's own Delete key
+        behaves. When the trace view does not have this cycle selected
+        (e.g. the user selected it in the table but not on the trace),
+        the dialog mutates its own state directly and mirrors the
+        signal sequence the trace view would have emitted.
+        """
+        if self._selected_index is None:
+            return
+        flat = self._flat_cycles()
+        if not (0 <= self._selected_index < len(flat)):
+            return
+
+        target = flat[self._selected_index]
+        deleted_row = int(self._selected_index)
+
+        # If the trace view's selected index matches ours, prefer its
+        # delete path so undo works transparently.
+        trace_selected = getattr(self.trace_view, "_theta_cycle_selected", None)
+        if trace_selected == self._selected_index:
+            # Set the anchor BEFORE the trace view emits
+            # thetaCyclesChanged, since that signal triggers
+            # set_cycles_from_trace which repopulates the table and
+            # would otherwise wipe any selection we set afterwards.
+            self._post_delete_anchor = deleted_row
+            deleted = self.trace_view.delete_selected_theta_cycle()
+            if deleted:
+                self.status_label.setText(
+                    f"Deleted cycle on CH{target.channel}. "
+                    f"Ctrl+Z to undo."
+                )
+                return
+            # The trace view refused the delete (its selection had
+            # already changed). Clear the anchor we optimistically set
+            # and fall through to the direct-mutation path below.
+            self._post_delete_anchor = None
+
+        # Fallback: mutate the dialog's own state. Push an undo
+        # snapshot onto the trace view first so Ctrl+Z still reverts.
+        try:
+            self.trace_view._cycle_push_undo()
+        except Exception:
+            pass
+
+        removed = False
+        for cycles in self.cycles_by_channel.values():
+            for i, c in enumerate(cycles):
+                if c is target:
+                    cycles.pop(i)
+                    removed = True
+                    break
+            if removed:
+                break
+        if not removed:
+            # The flat list and cycles_by_channel had diverged. Do not
+            # claim a deletion that didn't happen.
+            return
+
+        self._post_delete_anchor = deleted_row
+        self._populate_table()
+        self._push_flat_cycles_to_trace()
+        self._refresh_export_buttons()
+        self._schedule_autosave()
+        self.status_label.setText(
+            f"Deleted cycle on CH{target.channel}. "
+            f"Ctrl+Z to undo."
         )
 
     # ------------------------------------------------------------------
@@ -1244,6 +1439,10 @@ class ThetaCycleDialog(QDialog):
         self._loaded_cycle_start_edge = loaded_scheme
         self._loaded_landmark_names = sidecar_landmarks
 
+        # A fresh load replaces the entire cycle set: any pending
+        # post-delete anchor refers to cycles that no longer exist.
+        self._post_delete_anchor = None
+
         # Reflect the loaded scheme in the combo so a user editing
         # afterwards sees the correct controls.
         if loaded_scheme is not None:
@@ -1253,7 +1452,9 @@ class ThetaCycleDialog(QDialog):
 
         self._populate_table()
         self._push_flat_cycles_to_trace()
-        self.trace_view.set_theta_cycle_overlay_channels(sorted(self.cycles_by_channel.keys()))
+        self.trace_view.set_theta_cycle_overlay_channels(
+            sorted(self.cycles_by_channel.keys())
+        )
         self._refresh_export_buttons()
         self._refresh_landmark_scheme_label()
 
@@ -1310,7 +1511,6 @@ class ThetaCycleDialog(QDialog):
         self.half_cycle_high_spin.blockSignals(True)
         self.half_cycle_high_spin.setValue(float(hc_hi))
         self.half_cycle_high_spin.blockSignals(False)
-
 
         self.filter_order_spin.blockSignals(True)
         self.filter_order_spin.setValue(int(params.filter_order))
@@ -1377,6 +1577,10 @@ class ThetaCycleDialog(QDialog):
             return
         flat = self._flat_cycles()
         if not flat:
+            # Intentional: never write an empty file, so an accidental
+            # delete-all-then-close does not wipe a good on-disk
+            # result. The user must click Save manually to persist an
+            # empty set.
             return
         folder = ensure_analysis_folder(self.engine)
         if folder is None:
@@ -1414,9 +1618,28 @@ class ThetaCycleDialog(QDialog):
         )
 
     # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+
+    def _on_undo_cycle_deletion(self):
+        # Undo restores whatever the trace view's stack last snapshotted
+        # (which is also what a trace-view-side Ctrl+Z would restore).
+        # Clear the post-delete anchor so the next Prev/Next does not
+        # try to land on a slot that refers to a set no longer present.
+        if self.trace_view._cycle_undo():
+            self._post_delete_anchor = None
+            self.status_label.setText("Undid cycle deletion.")
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
+
     def closeEvent(self, event):
+        if hasattr(self, "_delete_shortcut"):
+            self._delete_shortcut.setEnabled(False)
+        if hasattr(self, "_undo_shortcut"):
+            self._undo_shortcut.setEnabled(False)
+
         if self._detect_thread is not None and self._detect_thread.isRunning():
             self._detect_thread.wait(2000)
 
