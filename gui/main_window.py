@@ -1114,6 +1114,17 @@ class MainWindow(QMainWindow):
                                 "Load a continuous.dat file first.")
             return
 
+        # Single-instance: if a dialog is already open, bring it to
+        # the front rather than creating a second one. The theta-cycle
+        # dialog owns a single filtered-overlay state on the trace
+        # view, so two instances would fight over it.
+        if self._open_theta_cycle_dialogs:
+            existing = self._open_theta_cycle_dialogs[0]
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+
         probe_data = self._probes["probes"][self._current_probe_key]
         selected = self.probe_map.get_selected_channels()
         dialog = ThetaCycleDialog(

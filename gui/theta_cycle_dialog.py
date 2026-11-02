@@ -50,6 +50,71 @@ from core.trace_engine import TraceEngine
 from gui.theta_cycle_trace_view import ThetaCycleTraceViewWidget
 
 
+class _CollapsibleSection(QWidget):
+    """A titled, collapsible container. Used for the 'Advanced' section
+    so the dialog stays readable without hiding controls the user
+    needs access to.
+
+    Emits `toggled(bool)` on expand/collapse, matching
+    QGroupBox.toggled, so downstream code doesn't need to special-case
+    this widget type.
+    """
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, title: str, expanded: bool = False, parent=None):
+        super().__init__(parent)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._toggle_btn = QToolButton()
+        self._toggle_btn.setText(title)
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(bool(expanded))
+        self._toggle_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self._toggle_btn.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._toggle_btn.setStyleSheet(
+            "QToolButton {"
+            "  border: none;"
+            "  padding: 2px 4px;"
+            "  font-weight: bold;"
+            "  color: #ccc;"
+            "}"
+            "QToolButton:hover { color: #fff; }"
+        )
+        self._toggle_btn.toggled.connect(self._on_toggled)
+        outer.addWidget(self._toggle_btn)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(12, 4, 4, 4)
+        self._content_layout.setSpacing(4)
+        self._content.setVisible(bool(expanded))
+        outer.addWidget(self._content)
+
+    def _on_toggled(self, checked: bool):
+        self._toggle_btn.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+        self._content.setVisible(checked)
+        self.toggled.emit(checked)
+
+    def content_layout(self) -> QVBoxLayout:
+        """Layout to which the caller adds widgets."""
+        return self._content_layout
+
+    def is_expanded(self) -> bool:
+        return self._toggle_btn.isChecked()
+
+    def set_expanded(self, expanded: bool):
+        self._toggle_btn.setChecked(bool(expanded))
+
 class _DetectThread(QThread):
     """Runs cycle detection across the requested channels off the UI
     thread. Emits results as {channel: list[ThetaCycle]}."""
@@ -736,6 +801,16 @@ class ThetaCycleDialog(QDialog):
         self.cycles_by_channel = results
         self._populate_table()
         self._push_flat_cycles_to_trace()
+        # The filtered overlay is only shown for channels the dialog
+        # just ran on. This means channels that returned zero cycles
+        # are still covered (their filtered trace is the diagnostic
+        # value), but channels that were never included in this
+        # detection run are not.
+        self.trace_view.set_theta_cycle_overlay_channels(
+            sorted(self.cycles_by_channel.keys())
+        )
+
+
         self._refresh_export_buttons()
         self._refresh_landmark_scheme_label()
         total = sum(len(v) for v in results.values())
@@ -1086,6 +1161,7 @@ class ThetaCycleDialog(QDialog):
 
         self._populate_table()
         self._push_flat_cycles_to_trace()
+        self.trace_view.set_theta_cycle_overlay_channels(sorted(self.cycles_by_channel.keys()))
         self._refresh_export_buttons()
         self._refresh_landmark_scheme_label()
 
@@ -1239,7 +1315,6 @@ class ThetaCycleDialog(QDialog):
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
-
     def closeEvent(self, event):
         if self._detect_thread is not None and self._detect_thread.isRunning():
             self._detect_thread.wait(2000)
@@ -1269,3 +1344,4 @@ class ThetaCycleDialog(QDialog):
 
         self.trace_view.clear_theta_cycles()
         super().closeEvent(event)
+        self.finished.emit(self.result())

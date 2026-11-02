@@ -99,6 +99,7 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
         # Undo stack for deletions.
         self._theta_cycle_undo_stack: list[list[ThetaCycle]] = []
         self._theta_cycle_undo_max = 50
+        self._theta_cycle_overlay_channels: list[int] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,7 +135,20 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
             peak = 1.0
         self._cycle_reference_amplitude[channel] = peak
         return peak
-    
+
+    def set_theta_cycle_overlay_channels(self, channels: list[int]):
+        """Which channels the theta-cycle overlay is currently drawing for.
+        Set by the theta-cycle dialog when detection runs (or a CSV is
+        loaded). Cleared by clear_theta_cycles(). An empty list means the
+        overlay is completely inactive, and neither the filtered trace nor
+        any markers are drawn."""
+        self._theta_cycle_overlay_channels = list(int(c) for c in channels)
+        self.update()
+
+    def clear_theta_cycle_overlay_channels(self):
+        self._theta_cycle_overlay_channels = []
+        self.update()
+            
     def set_theta_cycles(self, cycles: list[ThetaCycle] | None):
         self.theta_cycles = list(cycles or [])
         self._theta_cycle_selected = None
@@ -151,6 +165,7 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
         self._theta_cycle_undo_stack.clear()
         self._invalidate_cycle_trace_cache()
         self._invalidate_cycle_reference()
+        self._theta_cycle_overlay_channels = []
         self.update()
 
     def set_theta_cycle_band(self, low_freq: float, high_freq: float):
@@ -241,10 +256,15 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
     def _get_cycle_filtered_trace(self, channel: int) -> np.ndarray | None:
         if channel not in self.channels:
             return None
-        if not any(c.channel == channel for c in self.theta_cycles):
-            return None
-
+        # NOTE: no longer bails when the channel has zero cycles. The
+        # filtered trace is drawn as context; the `theta_cycles` list
+        # only controls whether the landmark circles and the selected-
+        # cycle highlight are drawn. A user staring at a channel where
+        # detection found nothing needs to see the filtered signal to
+        # understand whether theta is present at all.
         key = self._current_cycle_trace_cache_key()
+        
+
         if key != self._cycle_trace_cache_key:
             self._invalidate_cycle_trace_cache()
             self._cycle_trace_cache_key = key
@@ -371,9 +391,15 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
     def paintEvent(self, event):
         super().paintEvent(event)
 
-        if not self.show_theta_cycles or not self.theta_cycles:
+        # The overlay is only drawn when the theta-cycle dialog has
+        # explicitly activated it for at least one channel. Just having
+        # channels selected in the trace view is not enough -- the user
+        # may never have opened the theta-cycle panel.
+        if not self.show_theta_cycles:
             return
         if not self._sorted_channels:
+            return
+        if not self._theta_cycle_overlay_channels:
             return
 
         painter = QPainter(self)
@@ -391,19 +417,37 @@ class ThetaCycleTraceViewWidget(ThetaEpochTraceViewWidget):
         plot_top = rect.top()
         plot_bottom = self._get_plot_bounds()[2]
 
-        # Group cycles by channel so the filtered trace is fetched and
-        # drawn once per channel, not once per cycle.
+        # Only draw for channels the overlay is active on, intersected
+        # with the ones currently visible in the trace view. A channel
+        # with cycles but not visible gets skipped (as before); a
+        # visible channel that the dialog never ran on gets skipped
+        # too (new -- this is the fix for "don't plot unless the panel
+        # ran on it").
         by_channel: dict[int, list[tuple[int, ThetaCycle]]] = {}
         for i, c in enumerate(self.theta_cycles):
             by_channel.setdefault(c.channel, []).append((i, c))
 
-        for channel, indexed_cycles in by_channel.items():
+        visible = set(self._sorted_channels)
+        overlay_channels = set(self._theta_cycle_overlay_channels)
+
+        # Order: preserve _sorted_channels order for determinism.
+        channels_to_draw = [
+            ch for ch in self._sorted_channels
+            if ch in visible and ch in overlay_channels
+        ]
+
+        for channel in channels_to_draw:
+            indexed_cycles = by_channel.get(channel, [])
+            
             geom = self._cycle_channel_geometry(channel)
             if geom is None:
                 continue
             _, _, channel_height, y_center = geom
 
             filtered = self._get_cycle_filtered_trace(channel)
+            
+
+
             if filtered is None or filtered.size == 0:
                 continue
 

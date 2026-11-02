@@ -353,6 +353,40 @@ class ThetaCycleDetector:
             return None
         return int(start + hits[0])
 
+
+    @staticmethod
+    def _find_rising_zc_last(
+        theta_signal: np.ndarray, start: int, end: int
+    ) -> int | None:
+        """Last index i in [start, end) such that theta_signal[i-1]
+        < 0 <= theta_signal[i] (a rising crossing)."""
+        start = max(1, int(start))
+        end = min(len(theta_signal), int(end))
+        if end <= start:
+            return None
+        prev_vals = theta_signal[start - 1:end - 1]
+        curr_vals = theta_signal[start:end]
+        hits = np.where((prev_vals < 0) & (curr_vals >= 0))[0]
+        if hits.size == 0:
+            return None
+        return int(start + hits[-1])
+
+    @staticmethod
+    def _find_falling_zc_last(
+        theta_signal: np.ndarray, start: int, end: int
+    ) -> int | None:
+        start = max(1, int(start))
+        end = min(len(theta_signal), int(end))
+        if end <= start:
+            return None
+        prev_vals = theta_signal[start - 1:end - 1]
+        curr_vals = theta_signal[start:end]
+        hits = np.where((prev_vals > 0) & (curr_vals <= 0))[0]
+        if hits.size == 0:
+            return None
+        return int(start + hits[-1])
+
+    
     # ------------------------------------------------------------------
     # Strict-pairing candidates
     # ------------------------------------------------------------------
@@ -482,19 +516,17 @@ class ThetaCycleDetector:
         out: list[tuple[int, int, int, int, int, int]] = []
         for p1, v, p2 in triples:
             a1_lo = max(0, p1 - max_pv)
-            zc_r1 = ThetaCycleDetector._find_rising_zc(
-                theta_signal, a1_lo, p1
-            )
+            #zc_r1 = ThetaCycleDetector._find_rising_zc(theta_signal, a1_lo, p1)
+            zc_r1 = ThetaCycleDetector._find_rising_zc_last(theta_signal, a1_lo, p1)
+
             if zc_r1 is None:
                 continue
-            zc_f1 = ThetaCycleDetector._find_falling_zc(
-                theta_signal, p1, v
-            )
+            zc_f1 = ThetaCycleDetector._find_falling_zc(theta_signal, p1, v)
+
             if zc_f1 is None:
                 continue
-            zc_r2 = ThetaCycleDetector._find_rising_zc(
-                theta_signal, v, p2
-            )
+            zc_r2 = ThetaCycleDetector._find_rising_zc(theta_signal, v, p2)
+
             if zc_r2 is None:
                 continue
             # Strictness: no wrong-sign excursions.
@@ -542,19 +574,17 @@ class ThetaCycleDetector:
         for v1, p, v2 in triples:
             # v1 is a valley, p is the peak between v1 and v2,
             # v2 is the following valley.
-            zc_f1 = ThetaCycleDetector._find_falling_zc(
-                theta_signal, max(0, v1 - max_pv), v1
-            )
+            zc_f1 = ThetaCycleDetector._find_falling_zc(theta_signal, max(0, v1 - max_pv), v1)
+
+
             if zc_f1 is None:
                 continue
-            zc_r2 = ThetaCycleDetector._find_rising_zc(
-                theta_signal, v1, p
-            )
+            zc_r2 = ThetaCycleDetector._find_rising_zc(theta_signal, v1, p)
+
             if zc_r2 is None:
                 continue
-            zc_f2 = ThetaCycleDetector._find_falling_zc(
-                theta_signal, p, v2
-            )
+            zc_f2 = ThetaCycleDetector._find_falling_zc(theta_signal, p, v2)
+
             if zc_f2 is None:
                 continue
             out.append((zc_f1, v1, zc_r2, p, zc_f2, v2))
@@ -729,9 +759,7 @@ class ThetaCycleDetector:
             # Valley-peak-valley triples with the SAME strict
             # guarantees; the builder fills ref_1..ref_6 directly
             # from the original signal, no inversion, no swap.
-            refs = self._build_falling_zc_cycles(
-                vpv_triples, theta_signal, max_pv,
-            )
+            refs = self._build_falling_zc_cycles(vpv_triples, theta_signal, max_pv,)
 
         elif mode == "peak":
             # Fill ref_6 = zc_falling_2 using the NEXT cycle's valley.
@@ -745,9 +773,8 @@ class ThetaCycleDetector:
                     continue
                 _next_p1, next_v, _next_p2 = pvp_triples[k + 1]
                 p1, zc_f1, v, zc_r2, p2, _placeholder = item
-                zc_f2 = self._find_falling_zc(
-                    theta_signal, p2, next_v
-                )
+                zc_f2 = self._find_falling_zc(theta_signal, p2, next_v)
+                
                 if zc_f2 is None:
                     continue
                 refs.append((p1, zc_f1, v, zc_r2, p2, zc_f2))
