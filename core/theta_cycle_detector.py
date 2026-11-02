@@ -14,49 +14,62 @@ differences from the reference, all intentional:
     and all returned sample indices are raw sample indices. This is
     the same convention as ripple and theta-epoch detection.
 
-  * Theta band, delta band, and peak/valley distance bounds are all
-    configurable. The reference hardcodes the distance bounds
-    (13 Hz / 6 Hz); here they're configurable with wider defaults
-    (2.5 / 15.0) so slow theta is not rejected by the pairing
-    geometry alone.
+  * Theta band, delta band, and half-cycle distance bounds are all
+    configurable. The reference hardcodes peak/valley bounds; here
+    they're configurable with wider defaults (2.5 / 15.0 Hz half-cycle
+    rates) so slow theta is not rejected by geometry alone.
 
   * Delta band defaults to [0.5 Hz, theta_low_freq] rather than
     [0, theta_low_freq]. A pure lowpass down to DC picks up slow
     drift and movement artifact, which inflates the delta envelope
-    and rejects genuine theta cycles. 0.5 Hz is above most of that
-    slow content while still including physiological delta.
+    and rejects genuine theta cycles.
 
-  * Delta and fast corrections are computed as per-cycle RATIOS
-    (mean theta envelope vs mean delta / fast envelope over the
-    cycle's one-oscillation span), not as global percentile gates.
-    A per-cycle ratio encodes the question the user actually cares
-    about: at this moment, does theta dominate the competing band?
+  * Delta and fast corrections are computed as per-cycle RATIOS, not
+    as global percentile gates.
+
+Half-cycle semantics
+--------------------
+`half_cycle_low_freq` / `half_cycle_high_freq` bound the DURATION of
+each of the two half-cycles that make up a candidate theta cycle. In
+every cycle-start convention the six landmark slots are ordered so
+that ref_1, ref_3, ref_5 are the "boundary" landmarks (crossings or
+extrema) between halves:
+
+    half-cycle 1 = [ref_1, ref_3]
+    half-cycle 2 = [ref_3, ref_5]
+
+So one pair of bounds (min_hc, max_hc) covers both halves in every
+mode:
+
+    min_hc = round(sr / half_cycle_high_freq)   # fastest accepted half
+    max_hc = round(sr / half_cycle_low_freq)    # slowest accepted half
+
+A candidate is rejected if EITHER half is shorter than min_hc or
+longer than max_hc. This catches "one fast half + one slow half"
+deformations whose total duration happens to fit the theta band but
+whose halves are individually outside the accepted rate.
+
+The pairing stage still uses min_pv / max_pv bounds derived from the
+same two rates, without the /2 factor that the old peak-to-valley
+semantics used -- under the new semantics the two rates bound half-
+cycle durations directly.
 
 Cycle start conventions
 -----------------------
 Four start conventions are supported, and the six landmark fields on
 ThetaCycle are populated in CHRONOLOGICAL order under each convention:
 
-  rising_zc:  [zc_rising_1,  peak1,   zc_falling_1, valley_1, zc_rising_2, peak2]
-  falling_zc: [zc_falling_1, valley_1, zc_rising_2, peak2,   zc_falling_2, valley_2]
-  peak:       [peak1,        zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2]
-  valley:     [valley_1,     zc_rising_2, peak2, zc_falling_2, valley_2, zc_rising_3]
+  rising_zc:  [zc_rising_1, peak1, zc_falling_1, valley_1, zc_rising_2, peak2]
+  falling_zc: [zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2, valley_2]
+  peak:       [peak1, zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2]
+  valley:     [valley_1, zc_rising_2, peak2, zc_falling_2, valley_2, zc_rising_3]
 
 In every case ref_1 through ref_5 span one full oscillation; ref_6 is
 the first landmark of the NEXT cycle's opening. Cycles for which ref_6
-cannot be found (last cycle on a channel, or the trailing zero
-crossing falls outside the analyzed signal) are DROPPED -- the
-six-landmark invariant is preserved strictly.
+cannot be found are DROPPED.
 
 The ratio span used for delta/fast corrections is always [ref_1,
 ref_5], one full oscillation.
-
-Landmark search is explicit per mode. There is no signal-negation
-trick: each mode searches the original filtered signal for exactly
-the crossings and extrema its six-slot scheme requires, in the
-intervals between the strict-pairing candidates. This guarantees the
-six populated values are chronologically ordered by construction,
-which a signal-inversion approach did not.
 
 No GUI dependency.
 """
@@ -71,11 +84,6 @@ from scipy.signal import butter, sosfiltfilt, detrend as scipy_detrend
 from core.filters import hilbert  # pads to next power of 2, matches reference
 
 
-# Names of the six landmark slots, in chronological order, for each
-# supported start convention. The index into this list corresponds
-# to ref_1..ref_6 in the CSV / sidecar. "rising" means the signal
-# goes negative -> positive at that crossing; "falling" means
-# positive -> negative.
 LANDMARK_NAMES_BY_MODE: dict[str, list[str]] = {
     "rising_zc": [
         "zc_rising_1", "peak1", "zc_falling_1",
@@ -95,12 +103,33 @@ LANDMARK_NAMES_BY_MODE: dict[str, list[str]] = {
     ],
 }
 
+LANDMARK_DESCRIPTIONS: dict[str, str] = {
+    "zc_rising_1":  "rising zero crossing entering the first peak",
+    "peak1":        "first peak of the cycle",
+    "zc_falling_1": "falling zero crossing between peak1 and valley_1",
+    "valley_1":     "trough of the cycle",
+    "zc_rising_2":  "rising zero crossing leaving valley_1",
+    "peak2":        "second peak of the cycle",
+    "zc_falling_2": "falling zero crossing between peak2 and valley_2",
+    "valley_2":     "trough of the next cycle",
+    "zc_rising_3":  "rising zero crossing leaving valley_2",
+}
+
 VALID_CYCLE_START_EDGES = tuple(LANDMARK_NAMES_BY_MODE.keys())
 
 
 @dataclass
 class ThetaCycleParams:
-    """All tunable parameters for one cycle detection run."""
+    """All tunable parameters for one cycle detection run.
+
+    Note on backward compatibility
+    ------------------------------
+    Older sessions stored ``peak_low_freq`` / ``peak_high_freq``. The
+    __init__ override below accepts either spelling and maps the old
+    names to the new fields, so old sidecars load cleanly. Writes
+    (asdict) always use the new names, so a save-then-load round-trip
+    upgrades the file's schema on disk.
+    """
     channels: list[int]
     start_time: float = 0.0
     end_time: float = 10.0
@@ -114,10 +143,12 @@ class ThetaCycleParams:
     # ---- Peak/valley amplitude floor ----
     min_theta_peak_percentile: float = 15.0
 
-    # ---- Peak-to-peak / peak-to-valley distance bounds (Hz) ----
-    # None means "use the detector's default" (2.5 / 15.0 Hz).
-    peak_low_freq: float | None = None
-    peak_high_freq: float | None = None
+    # ---- Half-cycle rate bounds (Hz) ----
+    # Bounds the duration of EACH of the two half-cycles per candidate
+    # cycle. See module docstring for the full semantics. None means
+    # "use the detector's default" (2.5 / 15.0 Hz).
+    half_cycle_low_freq: float | None = None
+    half_cycle_high_freq: float | None = None
 
     # ---- Delta correction ----
     delta_correction: bool = True
@@ -135,6 +166,62 @@ class ThetaCycleParams:
 
     # ---- Theta-epoch containment filter ----
     epoch_intervals: list[tuple[int, int]] = field(default_factory=list)
+
+    def __init__(
+        self,
+        channels: list[int],
+        start_time: float = 0.0,
+        end_time: float = 10.0,
+        low_freq: float = 4.0,
+        high_freq: float = 12.0,
+        filter_order: int = 4,
+        detrend: bool = True,
+        min_theta_peak_percentile: float = 15.0,
+        half_cycle_low_freq: float | None = None,
+        half_cycle_high_freq: float | None = None,
+        delta_correction: bool = True,
+        delta_low_freq: float = 0.5,
+        delta_high_freq: float | None = None,
+        theta_delta_ratio_min: float = 1.5,
+        fast_correction: bool = False,
+        fast_low_freq: float = 170.0,
+        fast_theta_ratio_max: float = 0.5,
+        cycle_start_edge: str = "rising_zc",
+        epoch_intervals: list[tuple[int, int]] | None = None,
+        *,
+        # Legacy keyword aliases. Accepted for sidecars written before
+        # the rename; ignored if the corresponding new field is also
+        # provided. Not carried as dataclass fields (see dataclass
+        # body above) so asdict() never emits them.
+        peak_low_freq: float | None = None,
+        peak_high_freq: float | None = None,
+    ):
+        self.channels = channels
+        self.start_time = start_time
+        self.end_time = end_time
+        self.low_freq = low_freq
+        self.high_freq = high_freq
+        self.filter_order = filter_order
+        self.detrend = detrend
+        self.min_theta_peak_percentile = min_theta_peak_percentile
+
+        # New field wins if both old and new are provided.
+        if half_cycle_low_freq is None and peak_low_freq is not None:
+            half_cycle_low_freq = peak_low_freq
+        if half_cycle_high_freq is None and peak_high_freq is not None:
+            half_cycle_high_freq = peak_high_freq
+        self.half_cycle_low_freq = half_cycle_low_freq
+        self.half_cycle_high_freq = half_cycle_high_freq
+
+        self.delta_correction = delta_correction
+        self.delta_low_freq = delta_low_freq
+        self.delta_high_freq = delta_high_freq
+        self.theta_delta_ratio_min = theta_delta_ratio_min
+        self.fast_correction = fast_correction
+        self.fast_low_freq = fast_low_freq
+        self.fast_theta_ratio_max = fast_theta_ratio_max
+        self.cycle_start_edge = cycle_start_edge
+        self.epoch_intervals = list(epoch_intervals or [])
 
 
 @dataclass
@@ -158,7 +245,6 @@ class ThetaCycle:
     manual: bool = False
 
     def landmarks(self) -> list[int]:
-        """Six landmark sample indices in ref_1..ref_6 order."""
         return [
             self.zero_crossing_start,
             self.peak1,
@@ -169,13 +255,22 @@ class ThetaCycle:
         ]
 
 
-def _effective_peak_bounds(params: ThetaCycleParams) -> tuple[float, float]:
-    """Return (peak_low_freq, peak_high_freq), defaulting to the wider
-    (2.5 / 15.0 Hz) bounds so that narrowing the theta band does not,
-    on its own, reject slow cycles at the pairing stage."""
-    pl = params.peak_low_freq if params.peak_low_freq is not None else 2.5
-    ph = params.peak_high_freq if params.peak_high_freq is not None else 15.0
-    return float(pl), float(ph)
+def _effective_half_cycle_bounds(
+    params: ThetaCycleParams,
+) -> tuple[float, float]:
+    """Return (half_cycle_low_freq, half_cycle_high_freq), defaulting
+    to (2.5, 15.0)."""
+    lo = (
+        params.half_cycle_low_freq
+        if params.half_cycle_low_freq is not None
+        else 2.5
+    )
+    hi = (
+        params.half_cycle_high_freq
+        if params.half_cycle_high_freq is not None
+        else 15.0
+    )
+    return float(lo), float(hi)
 
 
 def _effective_delta_high(params: ThetaCycleParams) -> float:
@@ -321,9 +416,6 @@ class ThetaCycleDetector:
     def _find_rising_zc(
         theta_signal: np.ndarray, start: int, end: int
     ) -> int | None:
-        """First index i in [start, end) such that theta_signal[i-1]
-        < 0 <= theta_signal[i] (a rising crossing). Returns None if
-        no such crossing exists."""
         start = max(1, int(start))
         end = min(len(theta_signal), int(end))
         if end <= start:
@@ -339,9 +431,6 @@ class ThetaCycleDetector:
     def _find_falling_zc(
         theta_signal: np.ndarray, start: int, end: int
     ) -> int | None:
-        """First index i in [start, end) such that theta_signal[i-1]
-        > 0 >= theta_signal[i] (a falling crossing). Returns None if
-        no such crossing exists."""
         start = max(1, int(start))
         end = min(len(theta_signal), int(end))
         if end <= start:
@@ -353,13 +442,17 @@ class ThetaCycleDetector:
             return None
         return int(start + hits[0])
 
-
     @staticmethod
     def _find_rising_zc_last(
         theta_signal: np.ndarray, start: int, end: int
     ) -> int | None:
-        """Last index i in [start, end) such that theta_signal[i-1]
-        < 0 <= theta_signal[i] (a rising crossing)."""
+        """Last rising crossing in [start, end). See _build_rising_zc_cycles
+        for why the pre-crossing search must pick the LAST crossing,
+        not the first: at very permissive half_cycle_low_freq the
+        window [p1 - max_pv, p1) can contain several crossings, and
+        only the last one is the immediate pre-p1 crossing that the
+        strictness check (no negative sample between zc and p1)
+        requires."""
         start = max(1, int(start))
         end = min(len(theta_signal), int(end))
         if end <= start:
@@ -386,7 +479,6 @@ class ThetaCycleDetector:
             return None
         return int(start + hits[-1])
 
-    
     # ------------------------------------------------------------------
     # Strict-pairing candidates
     # ------------------------------------------------------------------
@@ -399,10 +491,6 @@ class ThetaCycleDetector:
         max_pv: int,
         max_pp: int,
     ) -> list[tuple[int, int, int]]:
-        """Return (peak1, valley, peak2) triples where peak1 and
-        peak2 are real detected peaks flanking a valley within
-        [min_pv, max_pv] of the valley, and (peak2 - peak1) <= max_pp.
-        De-duplicated by peak1, sorted by peak1 ascending."""
         triples: list[tuple[int, int, int]] = []
         for v in valley_idx:
             before = peak_idx[(peak_idx > v - max_pv) & (peak_idx < v)]
@@ -417,7 +505,6 @@ class ThetaCycleDetector:
                 continue
             triples.append((p1, int(v), p2))
 
-        # De-duplicate by peak1 (multiple valleys can pick the same p1).
         seen_p1: set[int] = set()
         unique: list[tuple[int, int, int]] = []
         for p1, v, p2 in triples:
@@ -442,21 +529,33 @@ class ThetaCycleDetector:
         fast_amp: np.ndarray | None,
         sample_rate: float,
         params: ThetaCycleParams,
+        min_hc: int,
+        max_hc: int,
     ) -> ThetaCycle | None:
-        """Given a strictly-chronological 6-tuple, apply the ratio
-        filters and either produce a ThetaCycle or return None. The
-        six-tuple positions map to ThetaCycle's six fields in order
-        (ref_1 -> zero_crossing_start, ..., ref_6 -> peak2).
-        """
-        # Sanity: chronological order and positive span.
+        """Apply the half-cycle shape filter, the chronological-order
+        guard, the ratio filters, and build a ThetaCycle. Positions
+        map to ThetaCycle's six fields in order (ref_1 ->
+        zero_crossing_start, ..., ref_6 -> peak2)."""
         if any(
             ref_tuple[i] >= ref_tuple[i + 1]
             for i in range(5)
         ):
             return None
+
         span_start = int(ref_tuple[0])
         span_end = int(ref_tuple[4])
         if span_end <= span_start:
+            return None
+
+        # ---- Half-cycle shape filter ----
+        # The two halves are [ref_1, ref_3] and [ref_3, ref_5] in every
+        # cycle-start mode (see module docstring). Reject if either is
+        # outside [min_hc, max_hc].
+        hc1 = int(ref_tuple[2]) - int(ref_tuple[0])
+        hc2 = int(ref_tuple[4]) - int(ref_tuple[2])
+        if hc1 < min_hc or hc1 > max_hc:
+            return None
+        if hc2 < min_hc or hc2 > max_hc:
             return None
 
         eps = 1e-12
@@ -504,32 +603,24 @@ class ThetaCycleDetector:
         theta_signal: np.ndarray,
         max_pv: int,
     ) -> list[tuple[int, int, int, int, int, int]]:
-        """rising_zc mode: for each (p1, v, p2) triple, find
-        zc_rising_1 in [p1 - max_pv, p1), zc_falling_1 in [p1, v),
-        zc_rising_2 in [v, p2). All three crossings must be present
-        and the intermediate samples must not violate the expected
-        sign (rising_zc's strictness guarantee).
-
-        ref_6 = peak2. No cycle-chaining needed: the six landmarks
-        are all inside this cycle.
-        """
         out: list[tuple[int, int, int, int, int, int]] = []
         for p1, v, p2 in triples:
             a1_lo = max(0, p1 - max_pv)
-            #zc_r1 = ThetaCycleDetector._find_rising_zc(theta_signal, a1_lo, p1)
-            zc_r1 = ThetaCycleDetector._find_rising_zc_last(theta_signal, a1_lo, p1)
-
+            zc_r1 = ThetaCycleDetector._find_rising_zc_last(
+                theta_signal, a1_lo, p1
+            )
             if zc_r1 is None:
                 continue
-            zc_f1 = ThetaCycleDetector._find_falling_zc(theta_signal, p1, v)
-
+            zc_f1 = ThetaCycleDetector._find_falling_zc(
+                theta_signal, p1, v
+            )
             if zc_f1 is None:
                 continue
-            zc_r2 = ThetaCycleDetector._find_rising_zc(theta_signal, v, p2)
-
+            zc_r2 = ThetaCycleDetector._find_rising_zc(
+                theta_signal, v, p2
+            )
             if zc_r2 is None:
                 continue
-            # Strictness: no wrong-sign excursions.
             if np.any(theta_signal[zc_r1:p1] < 0):
                 continue
             if np.any(theta_signal[zc_f1 + 1:v] > 0):
@@ -545,46 +636,21 @@ class ThetaCycleDetector:
         theta_signal: np.ndarray,
         max_pv: int,
     ) -> list[tuple[int, int, int, int, int, int]]:
-        """falling_zc mode: for each (p1, v, p2) triple, the six
-        landmarks are:
-
-          ref_1 = zc_falling_1 in [p1 - max_pv, p1)    (into p1)
-          ref_2 = valley_1    = p1                     (local min)
-          ref_3 = zc_rising_2 in (p1, v)               (out of valley_1)
-          ref_4 = peak2       = v                      (local max)
-          ref_5 = zc_falling_2 in (v, p2)              (out of peak2)
-          ref_6 = valley_2    = p2                     (next local min)
-
-        Note: in this scheme p1 is a valley (not a peak) and v is a
-        peak. The strict pairing over the *original* signal produced
-        peaks around valleys, which is the wrong polarity for
-        falling_zc. So we search the original signal for VALLEY-
-        PEak-VALLEY triples instead: the same strict pairing logic,
-        with peaks and valleys swapped.
-        """
-        # The caller has already given us peak-centred triples from
-        # the standard strict pairing. For falling_zc we need
-        # valley-centred triples. Rebuild here from the same detected
-        # peaks and valleys, but swapped: this function's `triples`
-        # argument is (v_left, peak, v_right) triples under the
-        # falling_zc polarity, NOT (p1, v, p2). To keep the interface
-        # uniform, we do the swap upstream in detect() and pass the
-        # valley-centred triples to this function.
         out: list[tuple[int, int, int, int, int, int]] = []
         for v1, p, v2 in triples:
-            # v1 is a valley, p is the peak between v1 and v2,
-            # v2 is the following valley.
-            zc_f1 = ThetaCycleDetector._find_falling_zc(theta_signal, max(0, v1 - max_pv), v1)
-
-
+            zc_f1 = ThetaCycleDetector._find_falling_zc_last(
+                theta_signal, max(0, v1 - max_pv), v1
+            )
             if zc_f1 is None:
                 continue
-            zc_r2 = ThetaCycleDetector._find_rising_zc(theta_signal, v1, p)
-
+            zc_r2 = ThetaCycleDetector._find_rising_zc(
+                theta_signal, v1, p
+            )
             if zc_r2 is None:
                 continue
-            zc_f2 = ThetaCycleDetector._find_falling_zc(theta_signal, p, v2)
-
+            zc_f2 = ThetaCycleDetector._find_falling_zc(
+                theta_signal, p, v2
+            )
             if zc_f2 is None:
                 continue
             out.append((zc_f1, v1, zc_r2, p, zc_f2, v2))
@@ -594,29 +660,7 @@ class ThetaCycleDetector:
     def _build_peak_cycles(
         triples: list[tuple[int, int, int]],
         theta_signal: np.ndarray,
-    ) -> list[tuple[int, int, int, int, int, int, int]]:
-        """peak mode: for each (p1, v, p2) triple,
-
-          ref_1 = peak1        = p1
-          ref_2 = zc_falling_1 in [p1, v)
-          ref_3 = valley_1     = v
-          ref_4 = zc_rising_2  in [v, p2)
-          ref_5 = peak2        = p2
-          ref_6 = zc_falling_2 (between p2 and the NEXT cycle's valley)
-
-        We return a 7-tuple with the extra final element being
-        `None` if zc_falling_2 can't be found in this cycle's
-        trailing samples before the next p1 (i.e. the pair
-        (p1, p2, v) is not extendable). Caller filters.
-
-        The `zc_falling_2` search window is [p2, end_of_signal) but
-        truncated to before the next cycle's valley would start. We
-        don't know the next valley here -- the caller patches ref_6
-        using the next triple.
-        """
-        # We return a partial 6-tuple plus the raw search inputs so
-        # the caller can fill ref_6 using the next cycle. The
-        # placeholder `-1` in slot 5 means "fill from next cycle".
+    ) -> list[tuple[int, int, int, int, int, int]]:
         out: list[tuple[int, int, int, int, int, int]] = []
         for p1, v, p2 in triples:
             zc_f1 = ThetaCycleDetector._find_falling_zc(theta_signal, p1, v)
@@ -633,19 +677,6 @@ class ThetaCycleDetector:
         valley_pairs: list[tuple[int, int, int]],
         theta_signal: np.ndarray,
     ) -> list[tuple[int, int, int, int, int, int]]:
-        """valley mode: for each (v1, p, v2) triple,
-
-          ref_1 = valley_1     = v1
-          ref_2 = zc_rising_2  in [v1, p)
-          ref_3 = peak2        = p
-          ref_4 = zc_falling_2 in [p, v2)
-          ref_5 = valley_2     = v2
-          ref_6 = zc_rising_3  (after v2, into next cycle)
-
-        ref_6 is the next triple's ref_2 (the rising crossing after
-        v2), filled in by the caller from the following triple.
-        Placeholder -1 in slot 5 signals "fill from next cycle".
-        """
         out: list[tuple[int, int, int, int, int, int]] = []
         for v1, p, v2 in valley_pairs:
             zc_r2 = ThetaCycleDetector._find_rising_zc(theta_signal, v1, p)
@@ -681,24 +712,28 @@ class ThetaCycleDetector:
             )
 
         # ---- Theta band, detrended ----
-        theta_signal = self._bandpass(
-            signal, sample_rate, params.low_freq, params.high_freq,
-            params.filter_order,
-        )
+        theta_signal = self._bandpass(signal, sample_rate, params.low_freq, params.high_freq,params.filter_order,)
+        
         if params.detrend:
             theta_signal = scipy_detrend(theta_signal)
 
         theta_amp = np.abs(hilbert(theta_signal))
-        min_amp = float(
-            np.percentile(theta_amp, params.min_theta_peak_percentile)
-        )
+        min_amp = float(np.percentile(theta_amp, params.min_theta_peak_percentile))
 
-        # ---- Distance bounds ----
-        peak_low_freq, peak_high_freq = _effective_peak_bounds(params)
-        min_pp = int(round((1.0 / peak_high_freq) * sample_rate))
-        max_pp = int(round((1.0 / peak_low_freq) * sample_rate))
-        min_pv = int(round((1.0 / peak_high_freq) * sample_rate / 2.0))
-        max_pv = int(round((1.0 / peak_low_freq) * sample_rate / 2.0))
+        # ---- Half-cycle rate bounds -> sample-duration bounds ----
+        hc_low_freq, hc_high_freq = _effective_half_cycle_bounds(params)
+        min_hc = int(round((1.0 / hc_high_freq) * sample_rate))
+        max_hc = int(round((1.0 / hc_low_freq) * sample_rate))
+
+        # Pairing stage: min_pv/max_pv bound the peak-to-valley search
+        # radius. The distance is at most one half-cycle (peak to
+        # valley), so min_pv/max_pv take the same duration bounds as
+        # min_hc/max_hc. max_pp bounds the full cycle: at most two
+        # half-cycles.
+        min_pv = min_hc
+        max_pv = max_hc
+        max_pp = 2 * max_hc
+        min_pp = max(1, min_hc)
 
         # ---- Candidate peaks and valleys ----
         peak_idx = self._detect_peaks(
@@ -710,11 +745,6 @@ class ThetaCycleDetector:
         if peak_idx.size == 0 or valley_idx.size == 0:
             return []
 
-        # ---- Strict pairing (peak-valley-peak, and valley-peak-valley) ----
-        # The first list is what rising_zc and peak modes need.
-        # The second list is what falling_zc and valley modes need.
-        # Both are strict: real extremum on each side, distance bounds
-        # respected.
         pvp_triples = self._strict_pairing(
             peak_idx, valley_idx, min_pv, max_pv, max_pp,
         )
@@ -754,43 +784,29 @@ class ThetaCycleDetector:
             refs = self._build_rising_zc_cycles(
                 pvp_triples, theta_signal, max_pv,
             )
-
         elif mode == "falling_zc":
-            # Valley-peak-valley triples with the SAME strict
-            # guarantees; the builder fills ref_1..ref_6 directly
-            # from the original signal, no inversion, no swap.
-            refs = self._build_falling_zc_cycles(vpv_triples, theta_signal, max_pv,)
-
+            refs = self._build_falling_zc_cycles(
+                vpv_triples, theta_signal, max_pv,
+            )
         elif mode == "peak":
-            # Fill ref_6 = zc_falling_2 using the NEXT cycle's valley.
-            # We need the search window [p2, next_v) so it's clear
-            # which falling crossing belongs to this cycle rather
-            # than the one after. If p2 is the last peak2, drop.
             partial = self._build_peak_cycles(pvp_triples, theta_signal)
             for k, item in enumerate(partial):
                 if k + 1 >= len(pvp_triples):
-                    # No next cycle: cannot determine ref_6 boundary.
                     continue
                 _next_p1, next_v, _next_p2 = pvp_triples[k + 1]
                 p1, zc_f1, v, zc_r2, p2, _placeholder = item
                 zc_f2 = self._find_falling_zc(theta_signal, p2, next_v)
-                
                 if zc_f2 is None:
                     continue
                 refs.append((p1, zc_f1, v, zc_r2, p2, zc_f2))
-
         elif mode == "valley":
-            # Fill ref_6 = zc_rising_3 using the NEXT cycle's peak.
-            # The search window is [v2, next_peak).
             partial = self._build_valley_cycles(vpv_triples, theta_signal)
             for k, item in enumerate(partial):
                 if k + 1 >= len(vpv_triples):
                     continue
                 _next_v1, next_p, _next_v2 = vpv_triples[k + 1]
                 v1, zc_r2, p, zc_f2, v2, _placeholder = item
-                zc_r3 = self._find_rising_zc(
-                    theta_signal, v2, next_p
-                )
+                zc_r3 = self._find_rising_zc(theta_signal, v2, next_p)
                 if zc_r3 is None:
                     continue
                 refs.append((v1, zc_r2, p, zc_f2, v2, zc_r3))
@@ -810,11 +826,12 @@ class ThetaCycleDetector:
                 fast_amp=fast_amp,
                 sample_rate=sample_rate,
                 params=params,
+                min_hc=min_hc,
+                max_hc=max_hc,
             )
             if cycle is not None:
                 out.append(cycle)
 
-        # ---- Optional epoch-containment filter ----
         if params.epoch_intervals:
             merged = _merge_intervals(params.epoch_intervals)
             out = [c for c in out if _cycle_inside_any_interval(c, merged)]

@@ -29,12 +29,14 @@ import dataclasses
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QSpinBox, QCheckBox, QPushButton, QComboBox, QMessageBox, QWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QLineEdit, QFileDialog,
+    QLineEdit, QFileDialog, QToolButton, QSizePolicy,
 )
+
 from core.analysis_folder import (
     analysis_folder_for, ensure_analysis_folder,
 )
@@ -267,6 +269,7 @@ class ThetaCycleDialog(QDialog):
         layout.setSpacing(6)
 
         layout.addLayout(self._build_param_grid())
+        layout.addWidget(self._build_advanced_section())
 
         btn_row = QHBoxLayout()
         self.detect_btn = QPushButton("Detect Theta Cycles")
@@ -362,10 +365,13 @@ class ThetaCycleDialog(QDialog):
     def _build_param_grid(self) -> QGridLayout:
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
+        grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         pairs = []
 
         self.channel_edit = QLineEdit()
         self.channel_edit.setPlaceholderText("e.g. 12,13,14")
+        self.channel_edit.setFixedWidth(140)
+
         pairs.append(("Channels", self.channel_edit))
 
         self.start_spin = QDoubleSpinBox()
@@ -418,54 +424,7 @@ class ThetaCycleDialog(QDialog):
         )
         pairs.append(("Min amp percentile", self.min_amp_spin))
 
-        # ---- New spinboxes: peak-distance bounds ----
-        self.peak_low_spin = QDoubleSpinBox()
-        self.peak_low_spin.setRange(0.5, 10.0)
-        self.peak_low_spin.setSingleStep(0.1)
-        self.peak_low_spin.setDecimals(2)
-        self.peak_low_spin.setValue(2.5)
-        self.peak_low_spin.setSuffix(" Hz")
-        self.peak_low_spin.setToolTip(
-            "Lower bound of the accepted instantaneous frequency "
-            "implied by inter-peak distance. Widening lowers the "
-            "maximum accepted peak-to-peak spacing; a value of 2.5 Hz "
-            "allows cycles as slow as ~2.5 Hz to pair."
-        )
-        pairs.append(("Peak low (Hz)", self.peak_low_spin))
 
-        self.peak_high_spin = QDoubleSpinBox()
-        self.peak_high_spin.setRange(5.0, 30.0)
-        self.peak_high_spin.setSingleStep(0.5)
-        self.peak_high_spin.setDecimals(2)
-        self.peak_high_spin.setValue(15.0)
-        self.peak_high_spin.setSuffix(" Hz")
-        self.peak_high_spin.setToolTip(
-            "Upper bound of the accepted instantaneous frequency "
-            "implied by inter-peak distance. Raising it allows faster "
-            "cycles (or noisier peak spacing) to pair."
-        )
-        pairs.append(("Peak high (Hz)", self.peak_high_spin))
-
-        self.filter_order_spin = QSpinBox()
-        self.filter_order_spin.setRange(2, 8)
-        self.filter_order_spin.setValue(4)
-        self.filter_order_spin.setToolTip(
-            "Butterworth order for the theta, delta, and fast band "
-            "filters. 4 is conventional; 2 widens the effective "
-            "passband; higher orders sharpen the cutoff but slow "
-            "detection on long windows."
-        )
-        pairs.append(("Filter order", self.filter_order_spin))
-
-        self.detrend_check = QCheckBox("Detrend")
-        self.detrend_check.setChecked(True)
-        self.detrend_check.setToolTip(
-            "Remove a linear trend from the filtered signals before "
-            "computing envelopes. Turn off if the signal is already "
-            "detrended or if you suspect the linear fit is stripping "
-            "slow theta itself."
-        )
-        pairs.append((None, self.detrend_check))
 
         self.delta_check = QCheckBox("Delta correction")
         self.delta_check.setChecked(True)
@@ -523,6 +482,100 @@ class ThetaCycleDialog(QDialog):
         )
         pairs.append(("Cycle start", self.edge_combo))
 
+        n_cols = 4
+        row = 0
+        col = 0
+        for label_text, widget in pairs:
+            # Every control keeps its natural width regardless of how
+            # wide the dialog is resized to. Fixed here prevents the
+            # control from growing horizontally; Qt still uses the
+            # widget's sizeHint for its actual width.
+            widget.setSizePolicy(
+                QSizePolicy.Policy.Fixed, widget.sizePolicy().verticalPolicy()
+            )
+            cell = QWidget()
+            # Fixed width policy: the cell does not grow horizontally
+            # when the dialog is widened. It grows vertically only to
+            # fit its own contents (label above, widget below).
+            cell.setSizePolicy(
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+            )
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(2)
+            if label_text is not None:
+                lbl = QLabel(label_text)
+                lbl.setStyleSheet("color: #aaa; font-size: 10px;")
+                cell_layout.addWidget(lbl)
+            else:
+                cell_layout.addStretch(0)
+            cell_layout.addWidget(widget)
+            grid.addWidget(cell, row, col)
+            col += 1
+            if col >= n_cols:
+                col = 0
+                row += 1
+
+        return grid
+
+
+    def _build_advanced_section(self) -> QWidget:
+        """Collapsible 'Advanced' section: peak-distance bounds,
+        filter order, and trace display controls. Placed here so the
+        dialog's main grid stays compact."""
+
+        self.advanced_section = _CollapsibleSection(
+            "Advanced", expanded=False, parent=self,
+        )
+        content = self.advanced_section.content_layout()
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        grid.setVerticalSpacing(6)
+
+        pairs = []
+
+        self.half_cycle_low_spin = QDoubleSpinBox()
+        self.half_cycle_low_spin.setRange(0.5, 10.0)
+        self.half_cycle_low_spin.setSingleStep(0.1)
+        self.half_cycle_low_spin.setDecimals(2)
+        self.half_cycle_low_spin.setValue(2.5)
+        self.half_cycle_low_spin.setSuffix(" Hz")
+        self.half_cycle_low_spin.setToolTip(
+            "Slowest accepted half-cycle rate. Each theta cycle has "
+            "two half-cycles (see the Landmark scheme label); a "
+            "candidate is rejected if either half is slower than "
+            "this. Lower = permissive; raise to reject unusually "
+            "slow halves."
+        )
+        pairs.append(("Min half-cycle rate (Hz)", self.half_cycle_low_spin))
+
+        self.half_cycle_high_spin = QDoubleSpinBox()
+        self.half_cycle_high_spin.setRange(5.0, 30.0)
+        self.half_cycle_high_spin.setSingleStep(0.5)
+        self.half_cycle_high_spin.setDecimals(2)
+        self.half_cycle_high_spin.setValue(15.0)
+        self.half_cycle_high_spin.setSuffix(" Hz")
+        self.half_cycle_high_spin.setToolTip(
+            "Fastest accepted half-cycle rate. A candidate is "
+            "rejected if either half is faster than this. Raise to "
+            "admit faster halves; lower to reject noisy short "
+            "excursions."
+        )
+        pairs.append(("Max half-cycle rate (Hz)", self.half_cycle_high_spin))
+
+        self.filter_order_spin = QSpinBox()
+        self.filter_order_spin.setRange(2, 8)
+        self.filter_order_spin.setValue(4)
+        self.filter_order_spin.setToolTip(
+            "Butterworth order for the theta, delta, and fast band "
+            "filters. 4 is conventional; 2 widens the effective "
+            "passband; higher orders sharpen the cutoff but slow "
+            "detection on long windows."
+        )
+        pairs.append(("Filter order", self.filter_order_spin))
+
         self.trace_gain_spin = QDoubleSpinBox()
         self.trace_gain_spin.setRange(0.05, 100.0)
         self.trace_gain_spin.setSingleStep(0.1)
@@ -533,7 +586,9 @@ class ThetaCycleDialog(QDialog):
             "Multiplier on the fixed reference scale of the theta-"
             "filtered overlay."
         )
-        self.trace_gain_spin.valueChanged.connect(self._on_trace_gain_changed)
+        self.trace_gain_spin.valueChanged.connect(
+            self._on_trace_gain_changed
+        )
         pairs.append(("Trace gain", self.trace_gain_spin))
 
         self.trace_width_spin = QDoubleSpinBox()
@@ -550,7 +605,18 @@ class ThetaCycleDialog(QDialog):
         )
         pairs.append(("Trace width", self.trace_width_spin))
 
-        n_cols = 4
+        self.detrend_check = QCheckBox("Detrend")
+        self.detrend_check.setChecked(True)
+        self.detrend_check.setToolTip(
+            "Remove a linear trend from the filtered signals before "
+            "computing envelopes. Turn off if the signal is already "
+            "detrended or if you suspect the linear fit is stripping "
+            "slow theta itself."
+        )
+        pairs.append((None, self.detrend_check))
+
+
+        n_cols = 3
         row = 0
         col = 0
         for label_text, widget in pairs:
@@ -571,8 +637,8 @@ class ThetaCycleDialog(QDialog):
                 col = 0
                 row += 1
 
-        return grid
-
+        content.addLayout(grid)
+        return self.advanced_section
     # ------------------------------------------------------------------
     # Landmark scheme label
     # ------------------------------------------------------------------
@@ -682,8 +748,8 @@ class ThetaCycleDialog(QDialog):
             filter_order=int(self.filter_order_spin.value()),
             detrend=bool(self.detrend_check.isChecked()),
             min_theta_peak_percentile=self.min_amp_spin.value(),
-            peak_low_freq=float(self.peak_low_spin.value()),
-            peak_high_freq=float(self.peak_high_spin.value()),
+            half_cycle_low_freq=float(self.half_cycle_low_spin.value()),
+            half_cycle_high_freq=float(self.half_cycle_high_spin.value()),
             delta_correction=self.delta_check.isChecked(),
             delta_low_freq=self.delta_low_spin.value(),
             delta_high_freq=self.delta_high_spin.value(),
@@ -716,6 +782,32 @@ class ThetaCycleDialog(QDialog):
         if self.low_spin.value() >= self.high_spin.value():
             QMessageBox.warning(self, "Invalid theta band",
                                 "Theta low must be below theta high.")
+
+
+        # Half-cycle rate must straddle the theta band. If min half
+        # rate exceeds the theta band's low edge, no real theta cycle
+        # can pair; if max half rate falls below the theta band's high
+        # edge, likewise.
+        if self.half_cycle_low_spin.value() > self.low_spin.value():
+            QMessageBox.warning(
+                self, "Half-cycle band too narrow",
+                f"Min half-cycle rate ({self.half_cycle_low_spin.value()} Hz) "
+                f"must be at or below theta low ({self.low_spin.value()} Hz). "
+                f"Otherwise a full theta cycle's halves are all faster than "
+                f"the pairing will accept."
+            )
+            return
+        if self.half_cycle_high_spin.value() < self.high_spin.value():
+            QMessageBox.warning(
+                self, "Half-cycle band too narrow",
+                f"Max half-cycle rate ({self.half_cycle_high_spin.value()} Hz) "
+                f"must be at or above theta high ({self.high_spin.value()} Hz). "
+                f"Otherwise a full theta cycle's halves are all slower than "
+                f"the pairing will accept."
+            )
+            return
+
+        
             return
 
         params = self._collect_params()
@@ -1202,14 +1294,23 @@ class ThetaCycleDialog(QDialog):
         # Peak-distance bounds: default 2.5 / 15.0 if the sidecar
         # stored None (which happens for old sidecars and for
         # sessions that never exposed the fields).
-        pl = params.peak_low_freq if params.peak_low_freq is not None else 2.5
-        ph = params.peak_high_freq if params.peak_high_freq is not None else 15.0
-        self.peak_low_spin.blockSignals(True)
-        self.peak_low_spin.setValue(float(pl))
-        self.peak_low_spin.blockSignals(False)
-        self.peak_high_spin.blockSignals(True)
-        self.peak_high_spin.setValue(float(ph))
-        self.peak_high_spin.blockSignals(False)
+        hc_lo = (
+            params.half_cycle_low_freq
+            if params.half_cycle_low_freq is not None
+            else 2.5
+        )
+        hc_hi = (
+            params.half_cycle_high_freq
+            if params.half_cycle_high_freq is not None
+            else 15.0
+        )
+        self.half_cycle_low_spin.blockSignals(True)
+        self.half_cycle_low_spin.setValue(float(hc_lo))
+        self.half_cycle_low_spin.blockSignals(False)
+        self.half_cycle_high_spin.blockSignals(True)
+        self.half_cycle_high_spin.setValue(float(hc_hi))
+        self.half_cycle_high_spin.blockSignals(False)
+
 
         self.filter_order_spin.blockSignals(True)
         self.filter_order_spin.setValue(int(params.filter_order))
