@@ -971,24 +971,6 @@ class MainWindow(QMainWindow):
         self._apply_focus_neighborhood(unit_id)
 
 
-    def _on_focused_unit_changed(self, unit_id: int):
-        """Apply or clear focus for the given unit id. -1 means no
-        unit is selected (either deselected or focus mode is off)."""
-        if unit_id < 0:
-            if self.phy_units_panel.focus_mode_enabled():
-                # User deselected inside focus mode -- clear the view
-                # so it's obvious nothing is focused right now.
-                if self.trace_view is not None:
-                    self.trace_view.set_raster_units([])
-                    self.trace_view.set_channels([])
-                if self.probe_map is not None:
-                    self.probe_map.set_selected_channels([])
-                if hasattr(self, "selected_list"):
-                    self.selected_list.clear()
-            return
-        if not self.phy_units_panel.focus_mode_enabled():
-            return
-        self._apply_focus_neighborhood(unit_id)
 
     def _apply_focus_neighborhood(self, unit_id: int):
         """Look up the unit's channel, compute its neighborhood, and
