@@ -51,9 +51,8 @@ from core.theta_cycle_detector import (
     ThetaCycleDetector, ThetaCycleParams, ThetaCycle,
     LANDMARK_NAMES_BY_MODE, VALID_CYCLE_START_EDGES,
 )
-from core.theta_cycle_export import (
-    export_cycles_to_csv, read_cycles_from_csv,
-)
+from core.theta_cycle_export import export_cycles_to_csv, read_cycles_from_csv
+
 from core.trace_engine import TraceEngine
 from gui.theta_cycle_trace_view import ThetaCycleTraceViewWidget
 
@@ -217,33 +216,13 @@ class ThetaCycleDialog(QDialog):
         self._selected_channel: int | None = None
         self._selected_index: int | None = None
 
-        # Row index (in the flat, (channel, start)-sorted ordering)
-        # that was deleted most recently. Used by _step_cycle as the
-        # anchor for the NEXT Prev/Next click, so that after deleting
-        # row N, "next" lands on what was row N+1 (now row N) and
-        # "prev" lands on what was row N-1. Cleared whenever the user
-        # makes an explicit selection (table click, trace-view click,
-        # programmatic selectRow from _step_cycle) or when a fresh
-        # detection replaces the cycle set.
         self._post_delete_anchor: int | None = None
 
-        # Analysis-window bookkeeping; initialized so Save/autosave
-        # paths never dereference an unset attribute even before any
-        # detect or load has run.
         self._sample_offset = 0
         self._detect_n_samples = 0
         self._last_params_for_sidecar = None
 
-        # Scheme of the currently-loaded cycle set, if it came from a
-        # Load (as opposed to a Detect). Used when saving so loaded
-        # cycles are re-labeled with the scheme that produced them,
-        # even if the user has since changed the combo.
         self._loaded_cycle_start_edge: str | None = None
-
-        # Cached landmark-names list associated with the loaded set,
-        # or None. Read back from the sidecar on Load, saved back on
-        # Save. Cleared on Detect (fresh detection derives names from
-        # the combo).
         self._loaded_landmark_names: list[str] | None = None
 
         # ---- Autosave ----
@@ -452,14 +431,12 @@ class ThetaCycleDialog(QDialog):
         self.end_spin.setValue(10.0)
         pairs.append(("End (s)", self.end_spin))
 
-        self.full_range_btn = QPushButton("Full available range")
-        self.full_range_btn.setToolTip(
-            "Set the analysis interval to the minimum and maximum "
-            "available time."
-        )
+        self.full_range_btn = QPushButton("Full range")
+        self.full_range_btn.setToolTip("Set the analysis interval to the minimum and maximum ""available time.")
         self.full_range_btn.setAutoDefault(False)
         self.full_range_btn.setDefault(False)
         self.full_range_btn.clicked.connect(self._set_full_available_range)
+        self.full_range_btn.setFixedWidth(70)
         pairs.append((None, self.full_range_btn))
 
         self.only_in_epochs_check = QCheckBox("Only inside theta epochs")
@@ -551,20 +528,10 @@ class ThetaCycleDialog(QDialog):
         row = 0
         col = 0
         for label_text, widget in pairs:
-            # Every control keeps its natural width regardless of how
-            # wide the dialog is resized to. Fixed here prevents the
-            # control from growing horizontally; Qt still uses the
-            # widget's sizeHint for its actual width.
-            widget.setSizePolicy(
-                QSizePolicy.Policy.Fixed, widget.sizePolicy().verticalPolicy()
-            )
+            widget.setSizePolicy(QSizePolicy.Policy.Fixed, widget.sizePolicy().verticalPolicy())
             cell = QWidget()
-            # Fixed width policy: the cell does not grow horizontally
-            # when the dialog is widened. It grows vertically only to
-            # fit its own contents (label above, widget below).
-            cell.setSizePolicy(
-                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-            )
+            cell.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
             cell_layout = QVBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setSpacing(2)
@@ -573,19 +540,17 @@ class ThetaCycleDialog(QDialog):
                 lbl.setStyleSheet("color: #aaa; font-size: 10px;")
                 cell_layout.addWidget(lbl)
             else:
-                cell_layout.addStretch(0)
+                spacer_label = QLabel(" ")
+                spacer_label.setStyleSheet("color: transparent; font-size: 10px;")
+                cell_layout.addWidget(spacer_label)
             cell_layout.addWidget(widget)
+
             grid.addWidget(cell, row, col)
             col += 1
             if col >= n_cols:
                 col = 0
                 row += 1
 
-        # Terminate the grid with a stretch column so cells hug the
-        # left edge instead of spreading out to fill the dialog's full
-        # width. Without this, Qt distributes extra horizontal space
-        # across the grid's columns, producing a visible gap between
-        # every pair of cells when the dialog widens.
         grid.setColumnStretch(n_cols, 1)
 
         return grid
@@ -699,7 +664,9 @@ class ThetaCycleDialog(QDialog):
                 lbl.setStyleSheet("color: #aaa; font-size: 10px;")
                 cell_layout.addWidget(lbl)
             else:
-                cell_layout.addStretch(0)
+                spacer_label = QLabel(" ")
+                spacer_label.setStyleSheet("color: transparent; font-size: 10px;")
+                cell_layout.addWidget(spacer_label)
             cell_layout.addWidget(widget)
             grid.addWidget(cell, row, col)
             col += 1

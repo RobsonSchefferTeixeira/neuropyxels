@@ -13,17 +13,14 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QPushButton, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QLineEdit, QFileDialog, QProgressBar, QSizePolicy
+    QAbstractItemView, QLineEdit, QFileDialog, QProgressBar, QSizePolicy, QWidget
 )
 
 from core.theta_epoch_detector import ThetaEpochDetector, ThetaEpochParams, ThetaEpoch
 from core.trace_engine import TraceEngine
 from core.filters import bandpass_filter, notch_filter
-from core.analysis_folder import (
-    analysis_folder_for, ensure_analysis_folder,
-)
+from core.analysis_folder import analysis_folder_for, ensure_analysis_folder
 from core.session_sidecar import save_sidecar, load_sidecar
-
 
 def _pin_button(btn: QPushButton, min_width: int | None = None) -> QPushButton:
     """Keep a button at its natural width when the dialog resizes.
@@ -287,13 +284,26 @@ class ThetaEpochDialog(QDialog):
         layout.setSpacing(6)
         layout.addLayout(self._build_param_grid())
 
+        # ---- Button group in its own fixed-width container ----
+        # Wrapping the buttons in a QWidget with Fixed horizontal size
+        # policy removes them entirely from the layout's stretch
+        # negotiation. Once the container is Fixed, the outer
+        # QHBoxLayout below only sees two items: [container (Fixed)]
+        # and [stretch (expandable)], so nothing inside the container
+        # can move when the dialog is resized -- the stretch absorbs
+        # all slack and the container stays put.
+        btn_group = QWidget()
+        btn_group.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        btn_group_layout = QHBoxLayout(btn_group)
+        btn_group_layout.setContentsMargins(0, 0, 0, 0)
+        btn_group_layout.setSpacing(4)
 
-
-        btn_row = QHBoxLayout()
         self.detect_btn = QPushButton("Detect Theta Epochs")
         self.detect_btn.clicked.connect(self._on_detect_clicked)
         _pin_button(self.detect_btn, min_width=150)
-        btn_row.addWidget(self.detect_btn)
+        btn_group_layout.addWidget(self.detect_btn)
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
@@ -301,46 +311,51 @@ class ThetaEpochDialog(QDialog):
         self.cancel_btn.setDefault(False)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         _pin_button(self.cancel_btn, min_width=80)
-        btn_row.addWidget(self.cancel_btn)
+        btn_group_layout.addWidget(self.cancel_btn)
 
         self.export_btn = QPushButton("Save")
         self.export_btn.setAutoDefault(False)
         self.export_btn.setDefault(False)
-        self.export_btn.clicked.connect(self._on_save_clicked) 
+        self.export_btn.clicked.connect(self._on_save_clicked)
         self.export_btn.setEnabled(False)
         _pin_button(self.export_btn, min_width=70)
-        btn_row.addWidget(self.export_btn)
+        btn_group_layout.addWidget(self.export_btn)
 
         self.load_btn = QPushButton("Load")
         self.load_btn.setAutoDefault(False)
         self.load_btn.setDefault(False)
         self.load_btn.clicked.connect(self._on_load_clicked)
         _pin_button(self.load_btn, min_width=70)
-        btn_row.addWidget(self.load_btn)
+        btn_group_layout.addWidget(self.load_btn)
 
         self.prev_epoch_btn = QPushButton("\u25c4 Prev Epoch")
         self.prev_epoch_btn.setAutoDefault(False)
         self.prev_epoch_btn.setDefault(False)
         self.prev_epoch_btn.clicked.connect(lambda: self._step_epoch(-1))
         _pin_button(self.prev_epoch_btn, min_width=120)
-        btn_row.addWidget(self.prev_epoch_btn)
+        btn_group_layout.addWidget(self.prev_epoch_btn)
 
         self.next_epoch_btn = QPushButton("Next Epoch \u25ba")
         self.next_epoch_btn.setAutoDefault(False)
         self.next_epoch_btn.setDefault(False)
         self.next_epoch_btn.clicked.connect(lambda: self._step_epoch(+1))
         _pin_button(self.next_epoch_btn, min_width=120)
-        btn_row.addWidget(self.next_epoch_btn)
+        btn_group_layout.addWidget(self.next_epoch_btn)
 
-        btn_row.addWidget(QLabel("Window (s):"))
+        btn_group_layout.addWidget(QLabel("Window (s):"))
         self.nav_window_spin = QDoubleSpinBox()
         self.nav_window_spin.setDecimals(2)
         self.nav_window_spin.setRange(0.05, 60.0)
         self.nav_window_spin.setValue(5.0)
-        btn_row.addWidget(self.nav_window_spin)
+        btn_group_layout.addWidget(self.nav_window_spin)
 
-        btn_row.addStretch()
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.addWidget(btn_group)   # Fixed-size, no negotiation
+        btn_row.addStretch(1)          # absorbs ALL extra width
         layout.addLayout(btn_row)
+
+        # ---- Results table, status, progress
 
         self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels([
@@ -373,6 +388,8 @@ class ThetaEpochDialog(QDialog):
     def _build_param_grid(self) -> QGridLayout:
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+        grid.setContentsMargins(0, 0, 0, 0)
 
         self.channel_edit = QLineEdit()
         self.channel_edit.setPlaceholderText("e.g. 12,13,14")
@@ -391,26 +408,46 @@ class ThetaEpochDialog(QDialog):
         grid.addWidget(QLabel("End (s):"), 0, 4)
         grid.addWidget(self.end_spin, 0, 5)
 
-        self.full_range_btn = QPushButton("Full available range")
+        # "Full range" sits on the SAME row as Start/End, immediately
+        # to the right of the End spinbox. It's an action on the End
+        # field, so it belongs beside it, not below it and not on its
+        # own row. The leading spacer in the wrapping cell drops it to
+        # vertical center with the spinbox it sits beside.
+        self.full_range_btn = QPushButton("Full range")
         self.full_range_btn.setToolTip(
-            "Set the analysis interval to the minimum and maximum available time."
+            "Set the analysis interval to the minimum and maximum "
+            "available time."
         )
         self.full_range_btn.setAutoDefault(False)
         self.full_range_btn.setDefault(False)
         self.full_range_btn.clicked.connect(self._set_full_available_range)
-        _pin_button(self.full_range_btn, min_width=160)
-        grid.addWidget(self.full_range_btn, 1, 4, 1, 2)
+        _pin_button(self.full_range_btn, min_width=90)
 
+        # No label above the button (there's no title to give it),
+        # but give it a top margin equal to the label row's height so
+        # its baseline lines up with the spinboxes next to it.
+        full_range_cell = QWidget()
+        fr_layout = QHBoxLayout(full_range_cell)
+        fr_layout.setContentsMargins(0, 0, 0, 0)
+        fr_layout.addWidget(self.full_range_btn)
+        fr_layout.setAlignment(
+            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft
+        )
+        grid.addWidget(full_range_cell, 0, 6)
+
+        # ---- Available-range info line (row 1) ----
         self.range_info_label = QLabel("")
         self.range_info_label.setStyleSheet("color: #888; font-size: 9px;")
-        grid.addWidget(self.range_info_label, 1, 0, 1, 4)
+        grid.addWidget(self.range_info_label, 1, 0, 1, 7)
 
+        # ---- Rest of the parameter grid starts at row 2 ----
         self.theta_low_spin = QDoubleSpinBox(); self.theta_low_spin.setRange(1.0, 50.0); self.theta_low_spin.setValue(4.0)
         grid.addWidget(QLabel("Theta low (Hz):"), 2, 0); grid.addWidget(self.theta_low_spin, 2, 1)
         self.theta_high_spin = QDoubleSpinBox(); self.theta_high_spin.setRange(2.0, 50.0); self.theta_high_spin.setValue(12.0)
         grid.addWidget(QLabel("Theta high (Hz):"), 2, 2); grid.addWidget(self.theta_high_spin, 2, 3)
         self.delta_low_spin = QDoubleSpinBox(); self.delta_low_spin.setRange(0.1, 10.0); self.delta_low_spin.setValue(1.0)
         grid.addWidget(QLabel("Delta low (Hz):"), 2, 4); grid.addWidget(self.delta_low_spin, 2, 5)
+
         self.delta_high_spin = QDoubleSpinBox(); self.delta_high_spin.setRange(0.5, 20.0); self.delta_high_spin.setValue(4.0)
         grid.addWidget(QLabel("Delta high (Hz):"), 3, 0); grid.addWidget(self.delta_high_spin, 3, 1)
         self.ratio_spin = QDoubleSpinBox(); self.ratio_spin.setRange(0.1, 20.0); self.ratio_spin.setValue(4.0)
@@ -453,8 +490,11 @@ class ThetaEpochDialog(QDialog):
         _pin_button(self.add_epoch_btn, min_width=150)
         grid.addWidget(self.add_epoch_btn, 5, 2, 1, 2)
 
-        grid.setColumnStretch(6, 1)
-        
+        # Terminate the grid with a stretch column so cells hug the
+        # left edge instead of spreading out to fill the dialog's
+        # full width. Column 7 is the first unused one.
+        grid.setColumnStretch(7, 1)
+
         return grid
     
     def _refresh_export_buttons(self):

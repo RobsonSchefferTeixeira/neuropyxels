@@ -340,14 +340,12 @@ class RippleDialog(QDialog):
         self.end_spin.setValue(10.0)
         col_pairs.append(("End (s)", self.end_spin))
 
-        self.full_range_btn = QPushButton("Full available range")
-        self.full_range_btn.setToolTip(
-            "Set the analysis interval to the minimum and maximum available time."
-        )
+        self.full_range_btn = QPushButton("Full range")
+        self.full_range_btn.setToolTip("Set the analysis interval to the minimum and maximum available time.")
         self.full_range_btn.setAutoDefault(False)
         self.full_range_btn.setDefault(False)
         self.full_range_btn.clicked.connect(self._set_full_available_range)
-        _pin_button(self.full_range_btn, min_width=160)
+        _pin_button(self.full_range_btn, min_width=90)
         col_pairs.append((None, self.full_range_btn))
 
         self.low_freq_spin = QDoubleSpinBox()
@@ -400,7 +398,7 @@ class RippleDialog(QDialog):
             "amplitude threshold baseline AND candidate detection."
         )
         self.exclude_theta_check.setEnabled(False)
-        col_pairs.append((None, self.exclude_theta_check))
+        
 
         
         n_cols = 4
@@ -417,30 +415,34 @@ class RippleDialog(QDialog):
             cell_layout = QVBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setSpacing(2)
+
+
             if label_text is not None:
                 lbl = QLabel(label_text)
                 lbl.setStyleSheet("color: #aaa; font-size: 10px;")
                 cell_layout.addWidget(lbl)
             else:
-                cell_layout.addStretch(0)
+                spacer_label = QLabel(" ")
+                spacer_label.setStyleSheet("color: transparent; font-size: 10px;")
+                cell_layout.addWidget(spacer_label)
             cell_layout.addWidget(widget)
+
+
             grid.addWidget(cell, row, col)
             col += 1
             if col >= n_cols:
                 col = 0
                 row += 1
 
-        # Terminate the grid with a stretch column so the cells hug the
-        # left edge instead of spreading out to fill the dialog's full
-        # width. Without this, Qt distributes the extra horizontal
-        # space across the grid's columns, producing a visible gap
-        # between every pair of cells.
-        n_rows = row + (1 if col > 0 else 0)
-        for r in range(n_rows):
-            grid.setColumnStretch(n_cols, 1)
+        if col > 0:
+            row += 1
+
+        grid.addWidget(self.exclude_theta_check, row, 0, 1, n_cols)
+
 
         # Also widen the inter-column spacing slightly so adjacent
         # cells don't touch. The stretch column absorbs the rest.
+        grid.setColumnStretch(n_cols, 1)
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(6)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -498,7 +500,7 @@ class RippleDialog(QDialog):
         self.show_filtered_check.toggled.connect(self._on_overlay_visibility_changed)
         row.addWidget(self.show_filtered_check)
 
-        row.addStretch(1)
+        row.addStretch(1) 
         return row
 
     def _build_nav_row(self) -> QHBoxLayout:
