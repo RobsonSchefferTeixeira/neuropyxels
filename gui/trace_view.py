@@ -1075,7 +1075,19 @@ class TraceViewWidget(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+
+        # Channels whose color was set through the options panel also
+        # need their channel_colors entry cleared otherwise a green
+        # trace stays green after "reset all customizations".
+        channels_with_options_color = {
+            ch for ch, opts in self._channel_options.items()
+            if opts.color is not None
+        }
+
         self._channel_options.clear()
+        for ch in channels_with_options_color:
+            self.channel_colors.pop(ch, None)
+
         if self._channel_options_panel is not None:
             self._channel_options_panel.close()
             self._channel_options_panel = None
@@ -1817,9 +1829,14 @@ class TraceViewWidget(QWidget):
 
     def _on_channel_options_changed(self, channel: int, opts: ChannelOptions):
         self._channel_options[channel] = opts
+        if opts.color is None:
+            self.channel_colors.pop(channel, None)
+        else:
+            self.channel_colors[channel] = QColor(opts.color)
         self._refresh_csd_status_for(channel)
         self._invalidate_cache()
         self.update()
+
 
     def _refresh_csd_status_for(self, channel: int):
         """Compute whether CSD is available for this channel at its

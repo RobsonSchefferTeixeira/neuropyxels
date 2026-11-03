@@ -178,22 +178,13 @@ class TraceStylePanel(QWidget):
 
         layout.addWidget(line_group)
 
-        # Per-channel colors
+        # Per-channel colors now live on each channel's own options
+        # panel (opened by clicking the channel-number button on the
+        # trace view). This group is reduced to the reset action --
+        # the per-channel picker that used to be here has been removed
+        # so there's only one place to set a channel's color.
         channel_group = QGroupBox("Per-Channel Colors")
         channel_layout = QVBoxLayout(channel_group)
-
-        channel_select_layout = QHBoxLayout()
-        channel_select_layout.addWidget(QLabel("Channel:"))
-        self.channel_combo = QComboBox()
-        self.channel_combo.setMinimumWidth(100)
-        self.channel_combo.currentIndexChanged.connect(self._on_channel_selected)
-        channel_select_layout.addWidget(self.channel_combo)
-        channel_select_layout.addStretch()
-        channel_layout.addLayout(channel_select_layout)
-
-        self.channel_color_btn = ColorButton(color="#3498db", label="Color:")
-        self.channel_color_btn.colorChanged.connect(self.on_channel_color_changed)
-        channel_layout.addWidget(self.channel_color_btn)
 
         self.reset_colors_btn = QPushButton("Reset All Colors")
         self.reset_colors_btn.clicked.connect(self.on_reset_colors)
@@ -239,28 +230,8 @@ class TraceStylePanel(QWidget):
             self.grid_checkbox.setChecked(self.trace_view.show_grid)
             self.speed_spin.setValue(self.trace_view.animation_speed)
 
-            self._update_channel_combo()
 
-    def _update_channel_combo(self):
-        """Update the channel combo box with currently selected channels."""
-        self.channel_combo.clear()
-        if self.trace_view and self.trace_view.channels:
-            for ch in self.trace_view.channels:
-                self.channel_combo.addItem(f"CH{ch}", ch)
-            self.channel_combo.setEnabled(False)
-        else:
-            self.channel_combo.addItem("No channels", None)
-            self.channel_combo.setEnabled(False)
 
-    def _on_channel_selected(self, index: int):
-        """Handle channel selection in the combo box."""
-        if index >= 0:
-            channel = self.channel_combo.itemData(index)
-            if channel is not None and self.trace_view:
-                color = self.trace_view.channel_colors.get(
-                    channel, self.trace_view.default_trace_color
-                )
-                self.channel_color_btn.set_color(color)
 
     def on_trace_color_changed(self, color: QColor):
         if self.trace_view:
@@ -282,16 +253,20 @@ class TraceStylePanel(QWidget):
         if self.trace_view:
             self.trace_view.set_trace_width(value)
 
-    def on_channel_color_changed(self, color: QColor):
-        if self.trace_view and self.channel_combo.currentIndex() >= 0:
-            channel = self.channel_combo.currentData()
-            if channel is not None:
-                self.trace_view.set_channel_color(channel, color)
+    def reset_channel_colors(self):
+        self.channel_colors.clear()
+        # Also clear any per-channel color stored on a ChannelOptions
+        # entry, so a reopened options panel doesn't show a stale
+        # custom color while the trace itself has already been reset.
+        for opts in self._channel_options.values():
+            if opts.color is not None:
+                opts.color = None
+        self.update()
 
     def on_reset_colors(self):
         if self.trace_view:
             self.trace_view.reset_channel_colors()
-            self.trace_view.set_trace_color("#3498db")
+            self.trace_view.set_trace_color("#ffffff")
             self.trace_view.set_background_color("#1e1e1e")
             self.trace_view.set_grid_color("#555555")
             self._sync_from_view()
@@ -1444,7 +1419,6 @@ class MainWindow(QMainWindow):
             ("Trace Controls", self.trace_controls_dock),
             ("Spectrogram Controls", self.spectrogram_controls_dock),
             ("Probe Map", self.probe_map_dock),
-            ("Selected Channels", self.selected_channels_dock),
             ("Display Settings", self.display_settings_dock),
             ("Export Data", self.export_data_dock),
         ]
@@ -1895,8 +1869,6 @@ class MainWindow(QMainWindow):
 
         self._update_analysis_actions_enabled()
 
-        if hasattr(self, 'trace_style_panel'):
-            self.trace_style_panel.update_channels()
 
         self._update_status(
             f"Loaded {path.name}  —  {new_engine.total_duration:.1f}s, "
@@ -2106,8 +2078,6 @@ class MainWindow(QMainWindow):
         self.trace_view.set_full_probe_geometry(depths, shank_map, xcoords)
 
         self._update_analysis_actions_enabled()
-        if hasattr(self, "trace_style_panel"):
-            self.trace_style_panel.update_channels()
 
         self._update_status(
             f"Loaded {path.name} against custom definition '{defn.name}'  —  "
@@ -2199,8 +2169,6 @@ class MainWindow(QMainWindow):
         if self.engine.data_loaded:
             self.trace_view.set_channels(channels)
 
-        if hasattr(self, 'trace_style_panel'):
-            self.trace_style_panel.update_channels()
 
         self._update_status(f"{len(channels)} channels selected")
 

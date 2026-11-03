@@ -25,8 +25,9 @@ from dataclasses import dataclass, field
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QCheckBox,
-    QDoubleSpinBox, QGroupBox, QSizePolicy,
+    QDoubleSpinBox, QGroupBox, QSizePolicy,QColorDialog,QPushButton
 )
+from PyQt6.QtGui import QColor
 
 
 @dataclass
@@ -46,6 +47,8 @@ class ChannelOptions:
     csd_distance: float = 30.0
     csd_gain: float = 1.0
 
+    color: QColor | None = None
+
     def is_default(self) -> bool:
         """True if this is exactly the default state (raw on at gain 1,
         everything else off)."""
@@ -54,6 +57,7 @@ class ChannelOptions:
             and not self.show_filtered
             and not self.show_csd
             and self.raw_gain == 1.0
+            and self.color is None
         )
 
     def filter_band_invalid(self) -> bool:
@@ -109,6 +113,7 @@ class ChannelOptionsPanel(QWidget):
     # UI
     # ------------------------------------------------------------------
 
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -117,6 +122,33 @@ class ChannelOptionsPanel(QWidget):
         header = QLabel(f"Channel {self.channel}")
         header.setStyleSheet("font-weight: bold; color: #fff;")
         layout.addWidget(header)
+
+        # ---- Per-channel trace color ----
+        color_group = QGroupBox("Trace color")
+        color_layout = QHBoxLayout(color_group)
+        color_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.color_button = QPushButton()
+        self.color_button.setFixedSize(80, 24)
+        self.color_button.setToolTip(
+            "Color used for this channel's Raw trace. Filtered and CSD "
+            "modes derive their own tints from this base color."
+        )
+        self.color_button.clicked.connect(self._on_pick_color)
+        color_layout.addWidget(self.color_button)
+
+        self.reset_color_button = QPushButton("Reset")
+        self.reset_color_button.setAutoDefault(False)
+        self.reset_color_button.setDefault(False)
+        self.reset_color_button.setToolTip(
+            "Use the trace view's default color for this channel."
+        )
+        self.reset_color_button.clicked.connect(self._on_reset_color)
+        color_layout.addWidget(self.reset_color_button)
+
+        color_layout.addStretch(1)
+        layout.addWidget(color_group)
+
 
         # ---- Raw ----
         raw_group = QGroupBox("Raw")
@@ -236,15 +268,61 @@ class ChannelOptionsPanel(QWidget):
 
 
 
-        # 1. Paired-range priming: low/high spinboxes start consistent.
-        #self._on_filter_low_edited(self.filter_low_spin.value())
-        #if hasattr(self, "csd_low_spin"):
-        #    self._on_csd_low_edited(self.csd_low_spin.value())
+    def _on_pick_color(self):
+        
+        current = self._options.color
+        if current is None:
+            # Fall back to the trace view's default so the dialog opens
+            # on a meaningful swatch rather than black.
+            current = self._effective_default_color()
+        chosen = QColorDialog.getColor(current, self, "Channel Color")
+        if not chosen.isValid():
+            return
+        self._options.color = chosen
+        self._update_color_button()
+        self._on_any_changed()
 
-        # 2. Enabled-state sync: greys out sub-controls whose parent
-        # checkbox is off (Filtered unchecked → its spinboxes disabled,
-        # etc.).
-        #self._update_enabled_states()
+    def _on_reset_color(self):
+        if self._options.color is None:
+            return
+        self._options.color = None
+        self._update_color_button()
+        self._on_any_changed()
+
+    def _effective_default_color(self) -> QColor:
+        """Whatever the trace view would paint this channel with if
+        ChannelOptions.color is None. Asked of the parent so the panel
+        doesn't have to duplicate the lookup."""
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "get_trace_color"):
+            try:
+                return QColor(parent.get_trace_color(self.channel))
+            except Exception:
+                pass
+        return QColor("#ffffff")
+
+    def _update_color_button(self):
+        color = self._options.color
+        if color is None:
+            # Show the effective default as a lighter swatch so the
+            # user can tell "default" apart from "customized to exactly
+            # this color". The style sheet overrides the button's
+            # background either way.
+            color = self._effective_default_color()
+            text = "default"
+        else:
+            text = color.name()
+        self.color_button.setText(text)
+        self.color_button.setStyleSheet(
+            f"QPushButton {{"
+            f"  background-color: {color.name()};"
+            f"  color: {'black' if color.lightness() > 128 else 'white'};"
+            f"  border: 1px solid #555;"
+            f"  border-radius: 3px;"
+            f"  font-size: 10px;"
+            f"}}"
+        )
+
 
 
     '''
@@ -349,7 +427,7 @@ class ChannelOptionsPanel(QWidget):
         self.csd_high_spin.blockSignals(False)
         self.csd_distance_spin.blockSignals(False)
         self.csd_gain_spin.blockSignals(False)
-
+        self._update_color_button()        
         self._update_enabled_states()
 
     def _update_enabled_states(self):
