@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
 from core.amplitude_power import AmplitudePowerAnalyzer, AmplitudePowerParams
 from core.trace_engine import TraceEngine
 from core.colormaps import COLORMAP_NAMES, resolve_name, get_pg_colormap
-
+from gui.plot_utils import attach_double_click_fit
 
 BG_COLOR = "#1e1e1e"
 GRID_COLOR = (255, 255, 255, 15)
@@ -161,6 +161,23 @@ class AmplitudePowerDialog(QDialog):
         self.scatter.sigHovered.connect(self._on_hover)
         self.plot_widget.addItem(self.scatter)
 
+
+        def _refit():
+            x = self.analyzer.xcoords
+            y = self.analyzer.ycoords
+            if len(x) == 0:
+                return
+            pad_x = max((x.max() - x.min()) * 0.15, 30)
+            pad_y = max((y.max() - y.min()) * 0.03, 30)
+            self.plot_widget.getViewBox().setRange(
+                xRange=(x.min() - pad_x, x.max() + pad_x),
+                yRange=(y.min() - pad_y, y.max() + pad_y),
+                padding=0,
+            )
+
+        attach_double_click_fit(self.plot_widget, fit_callback=_refit)
+
+        
         self.colorbar = pg.ColorBarItem(colorMap=pg.colormap.get("viridis"), interactive=False)
         # Deliberately not bound via setImageItem: ColorBarItem's binding
         # path assumes an ImageItem (it calls img.setLevels(...) on

@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 
 from core.psd_analyzer import PsdAnalyzer, PsdParams
 from core.trace_engine import TraceEngine
-
+from gui.plot_utils import attach_double_click_fit
 
 BG_COLOR = "#1e1e1e"
 CURVE_COLOR = "#5ad1ff"
@@ -102,6 +102,9 @@ class PsdDialog(QDialog):
         self.plot_widget.setMouseEnabled(x=True, y=True)
         self.curve = self.plot_widget.plot([], [], pen=pg.mkPen(CURVE_COLOR, width=1.6))
         layout.addWidget(self.plot_widget, stretch=1)
+
+        attach_double_click_fit(self.plot_widget, fit_callback=self._reset_view_to_axis_limits)
+
 
         self.status_label = QLabel("Set parameters and click Compute PSD.")
         self.status_label.setStyleSheet("color: #888; font-size: 10px;")
@@ -312,16 +315,28 @@ class PsdDialog(QDialog):
 
     def mouseDoubleClickEvent(self, event):
         """Double-click anywhere in the dialog resets the plot view to
-        the axis-limit settings the last Compute applied. If both axes
-        are set to auto, this simply triggers a fresh auto-range."""
+        the axis-limit settings the last Compute applied. Delegated to
+        the same handler the plot's own double-click calls, so the two
+        paths stay identical."""
         if self._last_result is None:
             super().mouseDoubleClickEvent(event)
+            return
+        self._reset_view_to_axis_limits()
+        event.accept()
+
+    def _reset_view_to_axis_limits(self):
+        """Restore the view to the axis-limit settings the last Compute
+        applied. If both axes are set to auto, this triggers a fresh
+        auto-range (fit-to-data), which is what the user expects from a
+        double-click."""
+        if self._last_result is None:
             return
 
         x_log = bool(self.x_log_checkbox.isChecked())
 
         if self.x_auto_checkbox.isChecked():
             self.plot_widget.enableAutoRange(axis="x")
+            self.plot_widget.autoRange()  # force the range to actually update
         else:
             x_min = float(self.x_min_spin.value())
             x_max = float(self.x_max_spin.value())
@@ -329,23 +344,19 @@ class PsdDialog(QDialog):
                 if x_log:
                     safe_min = max(x_min, 1e-3)
                     self.plot_widget.setXRange(
-                        np.log10(safe_min),
-                        np.log10(x_max),
-                        padding=0.0,
+                        np.log10(safe_min), np.log10(x_max), padding=0.0,
                     )
                 else:
                     self.plot_widget.setXRange(x_min, x_max, padding=0.0)
 
         if self.y_auto_checkbox.isChecked():
             self.plot_widget.enableAutoRange(axis="y")
+            self.plot_widget.autoRange()
         else:
             y_min = float(self.y_min_spin.value())
             y_max = float(self.y_max_spin.value())
             if y_max > y_min:
                 self.plot_widget.setYRange(y_min, y_max, padding=0.0)
-
-        event.accept()
-        
     # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------

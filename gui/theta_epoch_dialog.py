@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
     QPushButton, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QLineEdit, QFileDialog, QProgressBar,
+    QAbstractItemView, QLineEdit, QFileDialog, QProgressBar, QSizePolicy
 )
 
 from core.theta_epoch_detector import ThetaEpochDetector, ThetaEpochParams, ThetaEpoch
@@ -23,6 +23,23 @@ from core.analysis_folder import (
     analysis_folder_for, ensure_analysis_folder,
 )
 from core.session_sidecar import save_sidecar, load_sidecar
+
+
+def _pin_button(btn: QPushButton, min_width: int | None = None) -> QPushButton:
+    """Keep a button at its natural width when the dialog resizes.
+
+    Qt's layout manager gives QPushButton a Preferred size policy by
+    default, which lets it grow when the dialog widens. Setting Fixed
+    horizontally pins it to sizeHint().width(); vertical policy is left
+    alone so tall/short rows still look right. If min_width is given,
+    the button's minimum width is raised so it never shrinks below it
+    (useful for labels whose text can be short but which want a stable
+    footprint).
+    """
+    btn.setSizePolicy(QSizePolicy.Policy.Fixed, btn.sizePolicy().verticalPolicy())
+    if min_width is not None:
+        btn.setMinimumWidth(int(min_width))
+    return btn
 
 class _DetectThread(QThread):
     """Runs theta epoch detection off the UI thread."""
@@ -270,9 +287,12 @@ class ThetaEpochDialog(QDialog):
         layout.setSpacing(6)
         layout.addLayout(self._build_param_grid())
 
+
+
         btn_row = QHBoxLayout()
         self.detect_btn = QPushButton("Detect Theta Epochs")
         self.detect_btn.clicked.connect(self._on_detect_clicked)
+        _pin_button(self.detect_btn, min_width=150)
         btn_row.addWidget(self.detect_btn)
 
         self.cancel_btn = QPushButton("Cancel")
@@ -280,31 +300,36 @@ class ThetaEpochDialog(QDialog):
         self.cancel_btn.setAutoDefault(False)
         self.cancel_btn.setDefault(False)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
+        _pin_button(self.cancel_btn, min_width=80)
         btn_row.addWidget(self.cancel_btn)
 
         self.export_btn = QPushButton("Save")
         self.export_btn.setAutoDefault(False)
         self.export_btn.setDefault(False)
-        self.export_btn.clicked.connect(self._on_save_clicked)
+        self.export_btn.clicked.connect(self._on_save_clicked) 
         self.export_btn.setEnabled(False)
+        _pin_button(self.export_btn, min_width=70)
         btn_row.addWidget(self.export_btn)
 
         self.load_btn = QPushButton("Load")
         self.load_btn.setAutoDefault(False)
         self.load_btn.setDefault(False)
         self.load_btn.clicked.connect(self._on_load_clicked)
+        _pin_button(self.load_btn, min_width=70)
         btn_row.addWidget(self.load_btn)
 
         self.prev_epoch_btn = QPushButton("\u25c4 Prev Epoch")
         self.prev_epoch_btn.setAutoDefault(False)
         self.prev_epoch_btn.setDefault(False)
         self.prev_epoch_btn.clicked.connect(lambda: self._step_epoch(-1))
+        _pin_button(self.prev_epoch_btn, min_width=120)
         btn_row.addWidget(self.prev_epoch_btn)
 
         self.next_epoch_btn = QPushButton("Next Epoch \u25ba")
         self.next_epoch_btn.setAutoDefault(False)
         self.next_epoch_btn.setDefault(False)
         self.next_epoch_btn.clicked.connect(lambda: self._step_epoch(+1))
+        _pin_button(self.next_epoch_btn, min_width=120)
         btn_row.addWidget(self.next_epoch_btn)
 
         btn_row.addWidget(QLabel("Window (s):"))
@@ -313,7 +338,6 @@ class ThetaEpochDialog(QDialog):
         self.nav_window_spin.setRange(0.05, 60.0)
         self.nav_window_spin.setValue(5.0)
         btn_row.addWidget(self.nav_window_spin)
-
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -374,6 +398,7 @@ class ThetaEpochDialog(QDialog):
         self.full_range_btn.setAutoDefault(False)
         self.full_range_btn.setDefault(False)
         self.full_range_btn.clicked.connect(self._set_full_available_range)
+        _pin_button(self.full_range_btn, min_width=160)
         grid.addWidget(self.full_range_btn, 1, 4, 1, 2)
 
         self.range_info_label = QLabel("")
@@ -411,6 +436,7 @@ class ThetaEpochDialog(QDialog):
         self.delete_btn.setAutoDefault(False)
         self.delete_btn.setDefault(False)
         self.delete_btn.clicked.connect(self._delete_selected_epoch)
+        _pin_button(self.delete_btn, min_width=160)
         grid.addWidget(self.delete_btn, 5, 0, 1, 2)
 
         self.add_epoch_btn = QPushButton("Add Theta Epoch")
@@ -424,7 +450,11 @@ class ThetaEpochDialog(QDialog):
         )
         self.add_epoch_btn.setEnabled(self.trace_view is not None)
         self.add_epoch_btn.toggled.connect(self._on_add_epoch_toggled)
+        _pin_button(self.add_epoch_btn, min_width=150)
         grid.addWidget(self.add_epoch_btn, 5, 2, 1, 2)
+
+        grid.setColumnStretch(6, 1)
+        
         return grid
     
     def _refresh_export_buttons(self):

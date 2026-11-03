@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
 )
 import colorsys
 
-
+from gui.plot_utils import attach_double_click_fit
 
 # ---------------------------------------------------------------------------
 # Visual constants (tuned to look like Phy2 / Kilosort4)
@@ -258,8 +258,6 @@ class ProbeMapWidget(QWidget):
         coords = probe_data["coordinates"]
         shanks = probe_data.get("shanks", {})
 
-
-
         self.channels = np.asarray(coords["channels"], dtype=np.int64)
         self.xcoords = np.asarray(coords["x"], dtype=np.float64)
         self.ycoords = np.asarray(coords["y"], dtype=np.float64)
@@ -437,7 +435,8 @@ class ProbeMapWidget(QWidget):
         # Mouse interaction
         self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
         self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
-
+        attach_double_click_fit(self.plot_widget, fit_callback=self._auto_range)
+        
         self._update_status()
 
     def _on_label_size_changed(self, value):

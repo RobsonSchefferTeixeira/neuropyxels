@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
 from core.phase_amplitude import PhaseAmplitudeAnalyzer, PhaseAmplitudeParams
 from core.trace_engine import TraceEngine
 from core.colormaps import COLORMAP_NAMES, resolve_name, get_pg_colormap
-
+from gui.plot_utils import attach_double_click_fit
 
 class _ComputeThread(QThread):
     """Runs PhaseAmplitudeAnalyzer.compute() off the UI thread."""
@@ -118,9 +118,16 @@ class PhaseAmplitudeDialog(QDialog):
         self.colorbar = pg.ColorBarItem(colorMap=pg.colormap.get("viridis"))
         self.colorbar.setImageItem(self.image_item, insert_in=self.plot_widget.plotItem)
 
-        self.sine_curve = self.plot_widget.plot(
-            pen=pg.mkPen((255, 255, 255, 180), width=2, style=Qt.PenStyle.DashLine)
-        )
+        self.sine_curve = self.plot_widget.plot(pen=pg.mkPen((255, 255, 255, 180), width=2, style=Qt.PenStyle.DashLine))
+
+        def _refit():
+            if self._last_results is None:
+                return
+            freqs = self._last_results["frequencies"]
+            self.plot_widget.setXRange(0, 720, padding=0)
+            self.plot_widget.setYRange(float(freqs[0]), float(freqs[-1]), padding=0)
+
+        attach_double_click_fit(self.plot_widget, fit_callback=_refit)
 
         layout.addWidget(self.plot_widget, stretch=1)
 
