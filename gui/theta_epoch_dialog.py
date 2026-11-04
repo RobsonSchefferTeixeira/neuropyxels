@@ -597,19 +597,9 @@ class ThetaEpochDialog(QDialog):
             QMessageBox.warning(self, "Invalid time range", "End time must be greater than start time.")
             return
 
-        params = ThetaEpochParams(
-            theta_low=self.theta_low_spin.value(),
-            theta_high=self.theta_high_spin.value(),
-            delta_low=self.delta_low_spin.value(),
-            delta_high=self.delta_high_spin.value(),
-            ratio_threshold=self.ratio_spin.value(),
-            min_duration_ms=self.min_dur_spin.value(),
-            merge_gap_ms=self.merge_gap_spin.value(),
-            power_window_ms=self.power_window_spin.value(),
-            power_overlap=self.power_overlap_spin.value() / 100.0,
-        )
-
+        params = self._collect_params()
         self._last_params_for_sidecar = params
+
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting...")
         self.cancel_btn.setEnabled(True)
@@ -984,6 +974,9 @@ class ThetaEpochDialog(QDialog):
         params = getattr(self, "_last_params_for_sidecar", None)
         if params is not None:
             return params
+        return self._collect_params()
+
+    def _collect_params(self) -> ThetaEpochParams:
         return ThetaEpochParams(
             theta_low=self.theta_low_spin.value(),
             theta_high=self.theta_high_spin.value(),
@@ -994,8 +987,9 @@ class ThetaEpochDialog(QDialog):
             merge_gap_ms=self.merge_gap_spin.value(),
             power_window_ms=self.power_window_spin.value(),
             power_overlap=self.power_overlap_spin.value() / 100.0,
+            channels_text=self.channel_edit.text().strip(),
         )
-
+    
     def _on_load_clicked(self):
         if not self.engine.data_loaded:
             QMessageBox.warning(self, "No data loaded", "Load continuous.dat first.")
@@ -1097,10 +1091,15 @@ class ThetaEpochDialog(QDialog):
 
 
     def _apply_sidecar(self, sidecar: dict):
-        """Restore detection params from a loaded sidecar into the
-        spinboxes. The epochs themselves are already loaded; this just
-        makes the UI reflect the parameters that produced them, so a
-        subsequent re-detection uses the same settings."""
+        """Restore every detection parameter on the panel from a loaded
+        sidecar.
+
+        Field fallbacks for old (v1) sidecars: any key missing from
+        sidecar["params"] gets its dataclass default, which is exactly
+        the state a v1-era panel had. The channels field is
+        reconstructed from sidecar["channels"] if the verbatim
+        channels_text isn't present.
+        """
         params_dict = sidecar.get("params") or {}
         try:
             params = ThetaEpochParams(**params_dict)
@@ -1110,24 +1109,64 @@ class ThetaEpochDialog(QDialog):
 
         self._last_params_for_sidecar = params
 
-        # Push into the spinboxes. Each blockSignals so the
-        # valueChanged handlers don't fire and clear state.
-        for spin, value in (
-            (self.theta_low_spin, params.theta_low),
-            (self.theta_high_spin, params.theta_high),
-            (self.delta_low_spin, params.delta_low),
-            (self.delta_high_spin, params.delta_high),
-            (self.ratio_spin, params.ratio_threshold),
-            (self.min_dur_spin, params.min_duration_ms),
-            (self.merge_gap_spin, params.merge_gap_ms),
-            (self.power_window_spin, params.power_window_ms),
-        ):
+        def _set_spin(spin, value):
             spin.blockSignals(True)
-            spin.setValue(float(value))
-            spin.blockSignals(False)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(False)
 
-        self.power_overlap_spin.blockSignals(True)
-        self.power_overlap_spin.setValue(float(params.power_overlap) * 100.0)
-        self.power_overlap_spin.blockSignals(False)
+        # ---- Numeric params ----
+        _set_spin(self.theta_low_spin, params.theta_low)
+        _set_spin(self.theta_high_spin, params.theta_high)
+        _set_spin(self.delta_low_spin, params.delta_low)
+        _set_spin(self.delta_high_spin, params.delta_high)
+        _set_spin(self.ratio_spin, params.ratio_threshold)
+        _set_spin(self.min_dur_spin, params.min_duration_ms)
+        _set_spin(self.merge_gap_spin, params.merge_gap_ms)
+        _set_spin(self.power_window_spin, params.power_window_ms)
+        _set_spin(self.power_overlap_spin, params.power_overlap * 100.0)
 
+        # ---- Channel text ----
+        channels_text = (params.channels_text or "").strip()
+        if not channels_text:
+            sidecar_channels = sidecar.get("channels") or []
+            channels_text = ",".join(str(int(c)) for c in sidecar_channels)
+        self.channel_edit.blockSignals(True)
+        try:
+            self.channel_edit.setText(channels_text)
+        finally:
+            self.channel_edit.blockSignals(False)
+
+        # ---- Analysis window (Start / End spinboxes) ----
+        analysis_start = int(sidecar.get("analysis_start_sample", 0))
+        analysis_end = int(sidecar.get("analysis_end_sample", 0))
+        self._sample_offset = analysis_start
+
+        if analysis_end > analysis_start:
+            try:
+                start_time = float(self.engine.sample_to_time(analysis_start))
+                end_time = float(self.engine.sample_to_time(analysis_end - 1))
+            except Exception:
+                start_time = end_time = None
+            if start_time is not None and end_time is not None:
+                self.start_spin.blockSignals(True)
+                self.end_spin.blockSignals(True)
+                try:
+                    self.start_spin.setValue(start_time)
+                    self.end_spin.setValue(end_time)
+                finally:
+                    self.start_spin.blockSignals(False)
+                    self.end_spin.blockSignals(False)
+
+        # Propagate the restored merge gap to the trace view without
+        # having to fire the widget's own signal (which _set_spin
+        # blocked). This keeps the trace view's min-merge-gap consistent
+        # with the panel, so a subsequent edit on the trace view uses
+        # the loaded value.
+        try:
+            self.mergeGapChanged.emit(float(self.merge_gap_spin.value()))
+        except Exception:
+            pass
+        
         self._refresh_export_buttons()
