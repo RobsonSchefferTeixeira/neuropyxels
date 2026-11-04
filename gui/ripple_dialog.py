@@ -914,6 +914,10 @@ class RippleDialog(QDialog):
             boundary_threshold_sd=self.boundary_sd_spin.value(),
             min_duration_ms=None if self.min_dur_spin.value() == 0.0 else self.min_dur_spin.value(),
             max_duration_ms=None if self.max_dur_spin.value() == 0.0 else self.max_dur_spin.value(),
+            use_csd=self.csd_check.isChecked(),
+            csd_spacing_um=self.csd_spacing_spin.value(),
+            exclude_theta=self.exclude_theta_check.isChecked(),
+            channels_text=self.channel_edit.text().strip(),
         )
 
     def _theta_global_exclusion_intervals(self) -> list[tuple[int, int]]:
@@ -1562,14 +1566,14 @@ class RippleDialog(QDialog):
 
 
     def _apply_sidecar(self, sidecar: dict, events: list[RippleEvent]):
-        """Restore detection params, sample offset, and per-channel
-        envelope / filtered signals from a loaded sidecar.
+        """Restore every detection parameter on the panel from a loaded
+        sidecar, then recompute the envelope / filtered signals over
+        the recorded analysis window so the trace overlay matches what
+        was on screen at save time.
 
-        The envelope and filtered signal are recomputed from
-        engine.data over the recorded analysis window, matching the
-        algorithm the detector used. Both are bit-identical to what
-        the original detection produced because the filter is
-        deterministic and the input slice is the same.
+        Field fallbacks for old (v1) sidecars: any key missing from
+        sidecar["params"] gets its dataclass default (False / 30.0 /
+        ""), which is exactly the state a v1-era panel had.
         """
         params_dict = sidecar.get("params") or {}
         try:
@@ -1579,33 +1583,98 @@ class RippleDialog(QDialog):
                   f"from sidecar: {exc}")
             return
 
-        # Also restore the spinbox values so the UI shows the loaded
-        # session's settings -- otherwise a subsequent detection would
-        # silently use different parameters than what produced the CSV.
-        self.low_freq_spin.setValue(float(self._params.low_freq))
-        self.high_freq_spin.setValue(float(self._params.high_freq))
-        self.envelope_combo.setCurrentText(str(self._params.envelope_method))
-        self.peak_sd_spin.setValue(float(self._params.peak_threshold_sd))
-        self.boundary_sd_spin.setValue(float(self._params.boundary_threshold_sd))
-        self.min_dur_spin.setValue(
-            float(self._params.min_duration_ms) if self._params.min_duration_ms else 0.0
-        )
-        self.max_dur_spin.setValue(
-            float(self._params.max_duration_ms) if self._params.max_duration_ms else 0.0
-        )
+        p = self._params
 
-        self._sample_offset = int(sidecar.get("analysis_start_sample", 0))
+        def _set_spin(spin, value):
+            spin.blockSignals(True)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(False)
 
+        def _set_combo(combo, text):
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentText(str(text))
+            finally:
+                combo.blockSignals(False)
+
+        def _set_check(check, value):
+            check.blockSignals(True)
+            try:
+                check.setChecked(bool(value))
+            finally:
+                check.blockSignals(False)
+
+        # ---- Numeric params ----
+        _set_spin(self.low_freq_spin, p.low_freq)
+        _set_spin(self.high_freq_spin, p.high_freq)
+        _set_spin(self.peak_sd_spin, p.peak_threshold_sd)
+        _set_spin(self.boundary_sd_spin, p.boundary_threshold_sd)
+        _set_spin(
+            self.min_dur_spin,
+            float(p.min_duration_ms) if p.min_duration_ms else 0.0,
+        )
+        _set_spin(
+            self.max_dur_spin,
+            float(p.max_duration_ms) if p.max_duration_ms else 0.0,
+        )
+        _set_combo(self.envelope_combo, p.envelope_method)
+
+        # ---- CSD ----
+        _set_check(self.csd_check, p.use_csd)
+        _set_spin(self.csd_spacing_spin, p.csd_spacing_um)
+        # Keep the spacing spinbox's enabled state consistent with the
+        # restored checkbox.
+        self.csd_spacing_spin.setEnabled(self.csd_check.isChecked())
+
+        # ---- Theta exclusion ----
+        _set_check(self.exclude_theta_check, p.exclude_theta)
+        # Enabled state depends on whether theta epochs currently exist
+        # on the trace view. Re-run that gate with the new checkbox
+        # state so a sidecar saved with exclude_theta=True doesn't sit
+        # enabled-but-inert if the trace view has no epochs right now.
+        self._refresh_theta_exclusion_availability()
+
+        # ---- Channel text ----
+        # Prefer the verbatim stored string. If absent (v1 sidecar),
+        # reconstruct a comma-separated list from the sidecar's channel
+        # list so the field isn't left empty.
+        channels_text = (p.channels_text or "").strip()
+        if not channels_text:
+            sidecar_channels = sidecar.get("channels") or []
+            channels_text = ",".join(str(int(c)) for c in sidecar_channels)
+        self.channel_edit.blockSignals(True)
+        try:
+            self.channel_edit.setText(channels_text)
+        finally:
+            self.channel_edit.blockSignals(False)
+
+        # ---- Analysis window (Start / End spinboxes) ----
         analysis_start = int(sidecar.get("analysis_start_sample", 0))
         analysis_end = int(sidecar.get("analysis_end_sample", 0))
+        self._sample_offset = analysis_start
+
+        if analysis_end > analysis_start:
+            try:
+                start_time = float(self.engine.sample_to_time(analysis_start))
+                end_time = float(self.engine.sample_to_time(analysis_end - 1))
+            except Exception:
+                start_time = end_time = None
+            if start_time is not None and end_time is not None:
+                self.start_spin.blockSignals(True)
+                self.end_spin.blockSignals(True)
+                try:
+                    self.start_spin.setValue(start_time)
+                    self.end_spin.setValue(end_time)
+                finally:
+                    self.start_spin.blockSignals(False)
+                    self.end_spin.blockSignals(False)
+
+        # ---- Recompute per-channel envelope / filtered signals ----
         if analysis_end <= analysis_start:
-            # Nothing to recompute; the events are still usable but
-            # the overlay will be missing.
             return
 
-        # Recompute the per-channel signals over the exact same window
-        # the detector used. For each channel that appears in the
-        # sidecar's channel list, slice engine.data and re-filter.
         for ch in sidecar.get("channels", []):
             ch = int(ch)
             try:
@@ -1616,10 +1685,10 @@ class RippleDialog(QDialog):
                 continue
             try:
                 filtered = self.detector.apply_ripple_filter(
-                    signal, self.engine.sr, self._params
+                    signal, self.engine.sr, p
                 )
                 envelope = self.detector.compute_envelope(
-                    filtered, self.engine.sr, self._params
+                    filtered, self.engine.sr, p
                 )
             except Exception as exc:
                 print(f"[ripple-load] could not filter CH{ch}: {exc}")
@@ -1628,6 +1697,7 @@ class RippleDialog(QDialog):
             self._filtered_by_channel[ch] = filtered
             self._envelope_by_channel[ch] = envelope
             
+                        
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------

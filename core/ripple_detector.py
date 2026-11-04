@@ -61,7 +61,10 @@ class RippleParams:
     boundary_threshold_sd: float = 1.0  # start/end where envelope crosses mean + N*SD
     min_duration_ms: float | None = 15.0
     max_duration_ms: float | None = 500.0
-
+    use_csd: bool = False
+    csd_spacing_um: float = 30.0
+    exclude_theta: bool = False
+    channels_text: str = ""
 
 @dataclass
 class RippleEvent:

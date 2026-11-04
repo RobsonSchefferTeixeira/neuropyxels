@@ -48,7 +48,7 @@ from typing import Any
 
 
 SIDECAR_SUFFIX = ".meta.json"
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 
 def sidecar_path_for(csv_path: str | Path) -> Path:

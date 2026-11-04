@@ -36,7 +36,7 @@ class ThetaEpochParams:
     power_overlap: float = 0.50     # Fractional overlap between power windows
     filter_order: int = 4
     use_csd: bool = False
-
+    channels_text: str = ""
 
 @dataclass
 class ThetaEpoch:
