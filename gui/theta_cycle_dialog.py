@@ -799,6 +799,9 @@ class ThetaCycleDialog(QDialog):
             fast_low_freq=self.fast_low_spin.value(),
             fast_theta_ratio_max=self.fast_ratio_spin.value(),
             cycle_start_edge=self.edge_combo.currentText(),
+            channels_text=self.channel_edit.text().strip(),
+            trace_gain=float(self.trace_gain_spin.value()),
+            trace_width=float(self.trace_width_spin.value()),
         )
 
     def _on_detect_clicked(self):
@@ -1383,9 +1386,7 @@ class ThetaCycleDialog(QDialog):
             lm = sidecar.get("landmark_names")
             if isinstance(lm, list) and len(lm) == 6:
                 sidecar_landmarks = [str(x) for x in lm]
-            self._sample_offset = int(
-                sidecar.get("analysis_start_sample", 0)
-            )
+            self._sample_offset = int(sidecar.get("analysis_start_sample", 0))
             start_n = int(sidecar.get("analysis_start_sample", 0))
             end_n = int(sidecar.get("analysis_end_sample", 0))
             self._detect_n_samples = max(0, end_n - start_n)
@@ -1432,11 +1433,13 @@ class ThetaCycleDialog(QDialog):
         self._autosave_armed = True
 
     def _apply_sidecar(self, sidecar: dict):
-        """Restore detection params and the theta band from a sidecar,
-        including the four new spinboxes. Fields absent from the
-        sidecar fall back to the widget's default; this makes old
-        sidecars (saved before the peak-lows / filter-order / detrend
-        controls existed) load cleanly."""
+        """Restore every detection parameter and every panel widget
+        that carries user-configured state from a loaded sidecar.
+
+        Field fallbacks for old (v1) sidecars: any key missing from
+        sidecar["params"] gets its dataclass default, which is exactly
+        the state a v1-era panel had.
+        """
         params_dict = sidecar.get("params") or {}
         try:
             params = ThetaCycleParams(**params_dict)
@@ -1446,61 +1449,105 @@ class ThetaCycleDialog(QDialog):
 
         self._last_params_for_sidecar = params
 
-        for spin, value in (
-            (self.low_spin, params.low_freq),
-            (self.high_spin, params.high_freq),
-            (self.min_amp_spin, params.min_theta_peak_percentile),
-            (self.delta_low_spin, params.delta_low_freq),
-            (self.delta_ratio_spin, params.theta_delta_ratio_min),
-            (self.fast_low_spin, params.fast_low_freq),
-            (self.fast_ratio_spin, params.fast_theta_ratio_max),
-        ):
+        def _set_spin(spin, value):
             spin.blockSignals(True)
-            spin.setValue(float(value))
-            spin.blockSignals(False)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(False)
 
-        # Peak-distance bounds: default 2.5 / 15.0 if the sidecar
-        # stored None (which happens for old sidecars and for
-        # sessions that never exposed the fields).
-        hc_lo = (
-            params.half_cycle_low_freq
-            if params.half_cycle_low_freq is not None
-            else 2.5
-        )
-        hc_hi = (
-            params.half_cycle_high_freq
-            if params.half_cycle_high_freq is not None
-            else 15.0
-        )
-        self.half_cycle_low_spin.blockSignals(True)
-        self.half_cycle_low_spin.setValue(float(hc_lo))
-        self.half_cycle_low_spin.blockSignals(False)
-        self.half_cycle_high_spin.blockSignals(True)
-        self.half_cycle_high_spin.setValue(float(hc_hi))
-        self.half_cycle_high_spin.blockSignals(False)
+        # ---- Main numeric params ----
+        _set_spin(self.low_spin, params.low_freq)
+        _set_spin(self.high_spin, params.high_freq)
+        _set_spin(self.min_amp_spin, params.min_theta_peak_percentile)
+        _set_spin(self.delta_low_spin, params.delta_low_freq)
+        _set_spin(self.delta_ratio_spin, params.theta_delta_ratio_min)
+        _set_spin(self.fast_low_spin, params.fast_low_freq)
+        _set_spin(self.fast_ratio_spin, params.fast_theta_ratio_max)
 
+        # ---- Half-cycle bounds (default 2.5 / 15.0 when None) ----
+        hc_lo = params.half_cycle_low_freq if params.half_cycle_low_freq is not None else 2.5
+        hc_hi = params.half_cycle_high_freq if params.half_cycle_high_freq is not None else 15.0
+        _set_spin(self.half_cycle_low_spin, hc_lo)
+        _set_spin(self.half_cycle_high_spin, hc_hi)
+
+        # ---- Advanced params ----
         self.filter_order_spin.blockSignals(True)
-        self.filter_order_spin.setValue(int(params.filter_order))
-        self.filter_order_spin.blockSignals(False)
+        try:
+            self.filter_order_spin.setValue(int(params.filter_order))
+        finally:
+            self.filter_order_spin.blockSignals(False)
 
         self.detrend_check.blockSignals(True)
-        self.detrend_check.setChecked(bool(params.detrend))
-        self.detrend_check.blockSignals(False)
+        try:
+            self.detrend_check.setChecked(bool(params.detrend))
+        finally:
+            self.detrend_check.blockSignals(False)
 
         if params.delta_high_freq is not None:
-            self.delta_high_spin.blockSignals(True)
-            self.delta_high_spin.setValue(float(params.delta_high_freq))
-            self.delta_high_spin.blockSignals(False)
+            _set_spin(self.delta_high_spin, params.delta_high_freq)
 
-        self.delta_check.setChecked(bool(params.delta_correction))
-        self.fast_check.setChecked(bool(params.fast_correction))
-        self.edge_combo.setCurrentText(str(params.cycle_start_edge))
+        self.delta_check.blockSignals(True)
+        try:
+            self.delta_check.setChecked(bool(params.delta_correction))
+        finally:
+            self.delta_check.blockSignals(False)
 
+        self.fast_check.blockSignals(True)
+        try:
+            self.fast_check.setChecked(bool(params.fast_correction))
+        finally:
+            self.fast_check.blockSignals(False)
+
+        self.edge_combo.blockSignals(True)
+        try:
+            self.edge_combo.setCurrentText(str(params.cycle_start_edge))
+        finally:
+            self.edge_combo.blockSignals(False)
+
+        # ---- Trace-view display controls ----
+        # setValue with signals UNBLOCKED here so the trace view picks
+        # up the restored gain/width via the existing valueChanged ->
+        # set_theta_cycle_gain / set_theta_cycle_trace_width wiring.
+        self.trace_gain_spin.setValue(float(params.trace_gain))
+        self.trace_width_spin.setValue(float(params.trace_width))
+
+        # ---- Channel text ----
+        channels_text = (params.channels_text or "").strip()
+        if not channels_text:
+            sidecar_channels = sidecar.get("channels") or []
+            channels_text = ",".join(str(int(c)) for c in sidecar_channels)
+        self.channel_edit.blockSignals(True)
+        try:
+            self.channel_edit.setText(channels_text)
+        finally:
+            self.channel_edit.blockSignals(False)
+
+        # ---- Analysis window (Start / End spinboxes) ----
+        analysis_start = int(sidecar.get("analysis_start_sample", 0))
+        analysis_end = int(sidecar.get("analysis_end_sample", 0))
+
+        if analysis_end > analysis_start:
+            try:
+                start_time = float(self.engine.sample_to_time(analysis_start))
+                end_time = float(self.engine.sample_to_time(analysis_end - 1))
+            except Exception:
+                start_time = end_time = None
+            if start_time is not None and end_time is not None:
+                self.start_spin.blockSignals(True)
+                self.end_spin.blockSignals(True)
+                try:
+                    self.start_spin.setValue(start_time)
+                    self.end_spin.setValue(end_time)
+                finally:
+                    self.start_spin.blockSignals(False)
+                    self.end_spin.blockSignals(False)
+
+        # ---- Propagate theta band to the trace view overlay ----
         if self.trace_view is not None:
             self.trace_view.set_theta_cycle_band(
                 params.low_freq, params.high_freq,
             )
-
     # ------------------------------------------------------------------
     # Export-button state / autosave
     # ------------------------------------------------------------------

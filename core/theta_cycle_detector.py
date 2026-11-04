@@ -167,6 +167,19 @@ class ThetaCycleParams:
     # ---- Theta-epoch containment filter ----
     epoch_intervals: list[tuple[int, int]] = field(default_factory=list)
 
+    # ---- Channel text (verbatim) ----
+    # The exact string the user typed into the channel field. Stored
+    # verbatim (not as a parsed list) so a Load restores it exactly,
+    # including channels that produced no cycles.
+    channels_text: str = ""
+
+    # ---- Trace-view display controls ----
+    # Multiplier and stroke width for the theta-cycle overlay on the
+    # trace view. Not detection parameters -- restoring them on Load
+    # just puts the overlay back the way it was when the user saved.
+    trace_gain: float = 1.0
+    trace_width: float = 1.0
+
     def __init__(
         self,
         channels: list[int],
@@ -188,6 +201,9 @@ class ThetaCycleParams:
         fast_theta_ratio_max: float = 0.5,
         cycle_start_edge: str = "rising_zc",
         epoch_intervals: list[tuple[int, int]] | None = None,
+        channels_text: str = "",
+        trace_gain: float = 1.0,
+        trace_width: float = 1.0,
         *,
         # Legacy keyword aliases. Accepted for sidecars written before
         # the rename; ignored if the corresponding new field is also
@@ -222,7 +238,9 @@ class ThetaCycleParams:
         self.fast_theta_ratio_max = fast_theta_ratio_max
         self.cycle_start_edge = cycle_start_edge
         self.epoch_intervals = list(epoch_intervals or [])
-
+        self.channels_text = str(channels_text)
+        self.trace_gain = float(trace_gain)
+        self.trace_width = float(trace_width)
 
 @dataclass
 class ThetaCycle:
