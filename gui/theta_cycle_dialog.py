@@ -1286,12 +1286,8 @@ class ThetaCycleDialog(QDialog):
 
         csv_path = folder / "theta_cycles.csv"
         flat = self._flat_cycles()
-        scheme = self._current_export_scheme()
         try:
-            export_cycles_to_csv(
-                flat, self.engine, csv_path,
-                cycle_start_edge=scheme,
-            )
+            export_cycles_to_csv(flat, self.engine, csv_path,)
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return
@@ -1340,18 +1336,38 @@ class ThetaCycleDialog(QDialog):
             )
             return
 
+        # ---- 1. Read the sidecar FIRST, so its scheme can be handed to
+        # the CSV reader. The CSV no longer carries the scheme itself, so
+        # without the sidecar the reader has no way to know what ref_1
+        # through ref_6 mean.
         sidecar = None
         try:
             sidecar = load_sidecar(csv_path)
         except Exception as exc:
             QMessageBox.warning(
                 self, "Sidecar unreadable",
-                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}"
+                f"Could not read the sidecar for {csv_path.name}:\n\n{exc}\n\n"
+                "The cycle positions will load, but their landmark scheme "
+                "cannot be recovered without the sidecar."
             )
             sidecar = None
 
+        sidecar_scheme: str | None = None
+        sidecar_landmarks: list[str] | None = None
+        if sidecar is not None:
+            sidecar_scheme = (
+                (sidecar.get("params") or {}).get("cycle_start_edge")
+            )
+            lm = sidecar.get("landmark_names")
+            if isinstance(lm, list) and len(lm) == 6:
+                sidecar_landmarks = [str(x) for x in lm]
+
+        # ---- 2. Read the CSV, passing the sidecar's scheme so the
+        # returned cycles are labeled correctly.
         try:
-            cycles, csv_scheme, _ = read_cycles_from_csv(csv_path)
+            cycles, csv_scheme, _ = read_cycles_from_csv(
+                csv_path, cycle_start_edge=sidecar_scheme,
+            )
         except Exception as exc:
             QMessageBox.critical(
                 self, "Failed to load",
@@ -1373,19 +1389,45 @@ class ThetaCycleDialog(QDialog):
             regrouped[ch].sort(key=lambda c: c.zero_crossing_start)
         self.cycles_by_channel = regrouped
 
-        # Determine the scheme and landmark_names for the loaded set.
-        # The sidecar is authoritative when present; otherwise we fall
-        # back to whatever the CSV itself claims.
-        sidecar_scheme = None
-        sidecar_landmarks = None
+        # ---- 3. Determine the scheme actually in use. Prefer the sidecar
+        # (authoritative, has landmark_names). If neither the sidecar nor
+        # a legacy `zc_*` CSV column supplies one, warn the user that the
+        # ref_N columns can't be interpreted.
+        if sidecar_scheme is not None:
+            loaded_scheme = sidecar_scheme
+        elif csv_scheme is not None:
+            # Legacy `zc_*`-column file: always rising_zc.
+            loaded_scheme = csv_scheme
+        else:
+            QMessageBox.warning(
+                self, "Missing sidecar",
+                f"{csv_path.name} has no readable .meta.json sidecar, so the "
+                f"meaning of the ref_1..ref_6 landmark columns cannot be "
+                f"determined. The cycle boundaries will be loaded and drawn "
+                f"as numeric positions, but the per-landmark labels assume "
+                f"'rising_zc'. Re-save the cycles from the original detection "
+                f"session if you need the correct scheme."
+            )
+            loaded_scheme = "rising_zc"
+
+        # ---- 4. Cross-check sidecar vs CSV if both claim a scheme
+        # (only possible for legacy CSVs, whose CSV-side scheme is always
+        # rising_zc). Prefer sidecar.
+        if sidecar_scheme is not None and csv_scheme is not None \
+                and sidecar_scheme != csv_scheme:
+            print(
+                f"[theta-cycle-load] scheme mismatch: sidecar="
+                f"{sidecar_scheme!r} csv={csv_scheme!r}; using sidecar."
+            )
+
+        self._loaded_cycle_start_edge = loaded_scheme
+        self._loaded_landmark_names = sidecar_landmarks
+
+        # ---- 5. Apply the sidecar (panel params + analysis window). Do
+        # this AFTER the CSV has been read, so the sidecar's own
+        # sample_offset bookkeeping doesn't race the CSV read.
         if sidecar is not None:
             self._apply_sidecar(sidecar)
-            sidecar_scheme = (
-                (sidecar.get("params") or {}).get("cycle_start_edge")
-            )
-            lm = sidecar.get("landmark_names")
-            if isinstance(lm, list) and len(lm) == 6:
-                sidecar_landmarks = [str(x) for x in lm]
             self._sample_offset = int(sidecar.get("analysis_start_sample", 0))
             start_n = int(sidecar.get("analysis_start_sample", 0))
             end_n = int(sidecar.get("analysis_end_sample", 0))
@@ -1394,24 +1436,11 @@ class ThetaCycleDialog(QDialog):
             self._sample_offset = 0
             self._detect_n_samples = 0
 
-        # Cross-check sidecar vs CSV; prefer sidecar.
-        if sidecar_scheme is not None and csv_scheme is not None \
-                and sidecar_scheme != csv_scheme:
-            print(
-                f"[theta-cycle-load] scheme mismatch: sidecar="
-                f"{sidecar_scheme!r} csv={csv_scheme!r}; using sidecar."
-            )
-        loaded_scheme = (
-            sidecar_scheme if sidecar_scheme is not None else csv_scheme
-        )
-        self._loaded_cycle_start_edge = loaded_scheme
-        self._loaded_landmark_names = sidecar_landmarks
-
-        # A fresh load replaces the entire cycle set: any pending
+        # ---- 6. A fresh load replaces the entire cycle set: any pending
         # post-delete anchor refers to cycles that no longer exist.
         self._post_delete_anchor = None
 
-        # Reflect the loaded scheme in the combo so a user editing
+        # ---- 7. Reflect the loaded scheme in the combo so a user editing
         # afterwards sees the correct controls.
         if loaded_scheme is not None:
             self.edge_combo.blockSignals(True)
@@ -1432,6 +1461,7 @@ class ThetaCycleDialog(QDialog):
         self.status_label.setText(status)
         self._autosave_armed = True
 
+        
     def _apply_sidecar(self, sidecar: dict):
         """Restore every detection parameter and every panel widget
         that carries user-configured state from a loaded sidecar.
@@ -1601,12 +1631,8 @@ class ThetaCycleDialog(QDialog):
             return
 
         csv_path = folder / "theta_cycles.csv"
-        scheme = self._current_export_scheme()
         try:
-            export_cycles_to_csv(
-                flat, self.engine, csv_path,
-                cycle_start_edge=scheme,
-            )
+            export_cycles_to_csv(flat, self.engine, csv_path)
         except Exception as exc:
             print(f"[theta-cycle-autosave] CSV write failed: {exc}")
             return

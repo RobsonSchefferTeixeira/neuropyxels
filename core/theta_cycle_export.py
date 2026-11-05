@@ -6,19 +6,21 @@ CSV export / import for detected or edited theta cycles.
 Column conventions
 ------------------
 The six landmark columns are POSITIONAL: ref_1_smp .. ref_6_smp. What
-each position means depends on the file's cycle_start_edge:
+each position means depends on the file's cycle_start_edge, which is
+stored in the sidecar (params.cycle_start_edge and landmark_names),
+NOT in the CSV. The CSV alone is not self-describing: without the
+sidecar, there is no way to know whether ref_2 is a peak, a valley, or
+a zero crossing.
 
   rising_zc : zc_rising_1, peak1, zc_falling_1, valley_1, zc_rising_2, peak2
   falling_zc: zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2, valley_2
   peak      : peak1, zc_falling_1, valley_1, zc_rising_2, peak2, zc_falling_2
   valley    : valley_1, zc_rising_2, peak2, zc_falling_2, valley_2, zc_rising_3
 
-The CSV carries a cycle_start_edge column so a naked file is
-self-identifying per row. The sidecar (theta_cycles.meta.json) also
-carries a "landmark_names" list of six strings, matching the file's
-scheme. A reader with both has an unambiguous view; a reader with
-only the CSV can consult the cycle_start_edge column and this
-docstring to reconstruct the interpretation.
+Legacy CSVs written before the ref_N convention (with zc_start_smp,
+peak1_smp, ... columns) are still readable; those were always
+rising_zc, so read_cycles_from_csv reports that scheme regardless of
+any external input.
 
 Every *_smp column is an ABSOLUTE sample index into the original
 .dat file. Every *_s column is derived at export time from the
@@ -40,7 +42,7 @@ from core.theta_cycle_detector import (
 
 
 # Columns shared by every scheme.
-_STATIC_HEAD = ["channel", "cycle_start_edge"]
+_STATIC_HEAD = ["channel"]
 _STATIC_TAIL = [
     "duration_smp",
     "duration_s",
@@ -64,14 +66,13 @@ def _landmark_names_for(mode: str) -> list[str]:
     return list(LANDMARK_NAMES_BY_MODE.get(mode, []))
 
 
-def _to_row(cycle: ThetaCycle, engine, cycle_start_edge: str) -> dict:
+def _to_row(cycle: ThetaCycle, engine) -> dict:
     landmarks = cycle.landmarks()
     ref_smp = [int(x) for x in landmarks]
     duration_smp = ref_smp[4] - ref_smp[0]
 
     row = {
         "channel": int(cycle.channel),
-        "cycle_start_edge": str(cycle_start_edge),
     }
     for i, smp in enumerate(ref_smp, start=1):
         row[f"ref_{i}_smp"] = smp
@@ -97,21 +98,16 @@ def export_cycles_to_csv(
     cycles: Sequence[ThetaCycle],
     engine,
     output_path: str | Path,
-    cycle_start_edge: str = "rising_zc",
 ) -> Path:
-    """Write one row per cycle. The cycle_start_edge argument is
-    written to every row and determines the meaning of the six
-    ref_N columns (see module docstring)."""
-    if cycle_start_edge not in VALID_CYCLE_START_EDGES:
-        raise ValueError(
-            f"cycle_start_edge must be one of "
-            f"{VALID_CYCLE_START_EDGES}, got {cycle_start_edge!r}"
-        )
-
+    """Write one row per cycle. The meaning of the six ref_N columns
+    (which landmark is ref_1, ref_2, ...) is NOT carried in the CSV;
+    it lives in the sidecar's params.cycle_start_edge / landmark_names.
+    A CSV without its sidecar has no way to interpret ref_N.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = [_to_row(c, engine, cycle_start_edge) for c in cycles]
+    rows = [_to_row(c, engine) for c in cycles]
     rows.sort(key=lambda r: (r["channel"], r["ref_1_smp"]))
 
     with open(output_path, "w", newline="") as f:
@@ -127,26 +123,15 @@ def export_cycles_per_channel(
     engine,
     output_dir: str | Path,
     filename_template: str = "theta_cycles_channel{channel}.csv",
-    cycle_start_edge: str = "rising_zc",
 ) -> list[Path]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for channel, cycles in cycles_by_channel.items():
         path = output_dir / filename_template.format(channel=channel)
-        export_cycles_to_csv(
-            cycles, engine, path, cycle_start_edge=cycle_start_edge
-        )
+        export_cycles_to_csv(cycles, engine, path)
         written.append(path)
     return written
-
-
-def _detect_scheme_from_row(row: dict) -> str | None:
-    """Read cycle_start_edge from the row if present and valid."""
-    value = (row.get("cycle_start_edge") or "").strip()
-    if value in VALID_CYCLE_START_EDGES:
-        return value
-    return None
 
 
 def _read_old_scheme_row(row: dict) -> dict | None:
@@ -169,39 +154,46 @@ def _read_old_scheme_row(row: dict) -> dict | None:
 
 def read_cycles_from_csv(
     path: str | Path,
+    cycle_start_edge: str | None = None,
 ) -> tuple[list[ThetaCycle], str | None, list[str] | None]:
     """Read a cycle CSV. Returns (cycles, cycle_start_edge, landmark_names).
 
-    cycle_start_edge is read from each row's cycle_start_edge column
-    (new files) or defaulted to "rising_zc" (old files, no such
-    column). landmark_names is always None from the CSV alone -- the
-    dialog fills it from the sidecar when present; here we return None
-    so callers know to look elsewhere.
+    cycle_start_edge must be supplied by the caller from the sidecar
+    (sidecar["params"]["cycle_start_edge"]); the CSV itself no longer
+    carries it. If not supplied, the reader returns cycles with the
+    scheme set to None, which means the caller cannot interpret the
+    ref_N columns correctly -- callers that need the scheme should pass
+    it explicitly.
 
-    Only the *_smp columns are read. The *_s columns are ignored (they
-    depend on the engine's time base at save time). duration_ms is
-    left at 0.0; the dialog recomputes from samples.
+    Legacy zc_*_smp-column files (written before the ref_N convention)
+    are still readable; those were always rising_zc, and the function
+    reports that as the scheme regardless of the cycle_start_edge
+    argument.
+
+    landmark_names is always None from the CSV alone -- the dialog
+    fills it from the sidecar.
     """
     path = Path(path)
     cycles: list[ThetaCycle] = []
-    file_scheme: str | None = None
+    file_scheme: str | None = cycle_start_edge
 
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
+        header = reader.fieldnames or []
+        is_legacy = "zc_start_smp" in header
+
         for row in reader:
-            scheme = _detect_scheme_from_row(row)
-            if scheme is not None:
-                file_scheme = scheme
-                try:
-                    ref_smp = [int(row[f"ref_{i}_smp"]) for i in range(1, 7)]
-                except (KeyError, ValueError, TypeError):
-                    continue
-            else:
+            if is_legacy:
                 translated = _read_old_scheme_row(row)
                 if translated is None:
                     continue
                 ref_smp = translated["ref_smp"]
                 file_scheme = translated["cycle_start_edge"]
+            else:
+                try:
+                    ref_smp = [int(row[f"ref_{i}_smp"]) for i in range(1, 7)]
+                except (KeyError, ValueError, TypeError):
+                    continue
 
             tdr = (row.get("theta_delta_ratio") or "").strip()
             ftr = (row.get("fast_theta_ratio") or "").strip()

@@ -220,7 +220,7 @@ class ExportDataPanel(QWidget):
         # ---- Notch: enabled checkbox + frequency spinbox ----
         notch_col = QHBoxLayout()
         self.notch_check = QCheckBox("Notch")
-        self.notch_check.setChecked(True)
+        self.notch_check.setChecked(False)
         self.notch_check.setToolTip(
             "Enable or disable the notch filter. When off, no notch is "
             "applied regardless of the frequency below."
