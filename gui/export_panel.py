@@ -109,13 +109,14 @@ class ExportDataPanel(QWidget):
         self._suggest_timer.setSingleShot(True)
         self._suggest_timer.setInterval(250)
         self._suggest_timer.timeout.connect(self._apply_suggestion)
+        self._last_export_filename = "filtered"
 
         self._build_ui()
         self._sync_time_range_from_engine()
         self._refresh_selection_label()
         self._refresh_target_sr_hint()
         self._on_notch_toggled(self.notch_check.isChecked())
-        
+        self.filename_edit.setText(self._last_export_filename)
     # ------------------------------------------------------------------
     # Public API (called by MainWindow)
     # ------------------------------------------------------------------
@@ -313,6 +314,17 @@ class ExportDataPanel(QWidget):
         self.browse_btn.clicked.connect(self._on_browse_clicked)
         out_layout.addWidget(self.browse_btn, 1, 3)
 
+        out_layout.addWidget(QLabel("Filename:"), 2, 0)
+        self.filename_edit = QLineEdit("filtered")
+        self.filename_edit.setPlaceholderText("filtered")
+        self.filename_edit.setToolTip(
+            "Base name for the exported file, without extension. "
+            "The extension is chosen by the Format dropdown. "
+            "When 'One file per channel' is checked, each per-channel "
+            "file is named <filename>_ch<channel>.<ext>."
+        )
+        out_layout.addWidget(self.filename_edit, 2, 1, 1, 3)
+
         layout.addWidget(out_group)
 
         # ---- Run ----
@@ -474,10 +486,10 @@ class ExportDataPanel(QWidget):
         fmt = self.format_combo.currentText()
         ext = fmt
         folder = Path(self.folder_edit.text())
-        if self.per_channel_check.isChecked():
-            out_path = folder / f"filtered.{ext}"  # parent of per-channel files
-        else:
-            out_path = folder / f"filtered.{ext}"
+        base_name = self.filename_edit.text().strip() or "filtered"
+        out_path = folder / f"{base_name}.{ext}"
+
+
 
         order = int(self.order_spin.value())
         if order not in SUPPORTED_FILTER_ORDERS:
@@ -533,6 +545,23 @@ class ExportDataPanel(QWidget):
             QMessageBox.warning(self, "Cannot export", str(exc))
             return
 
+        # Overwrite check: figure out which output files would be
+        # created, and warn if any of them already exist.
+        existing = self._existing_output_paths(params)
+        if existing:
+            names = "\n".join(str(p) for p in existing[:8])
+            if len(existing) > 8:
+                names += f"\n… and {len(existing) - 8} more"
+            reply = QMessageBox.question(
+                self, "Overwrite existing file(s)?",
+                f"The following file(s) already exist and will be "
+                f"overwritten:\n\n{names}\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         self.export_btn.setEnabled(False)
         self.export_btn.setText("Exporting…")
         self.progress_bar.setValue(0)
@@ -544,6 +573,21 @@ class ExportDataPanel(QWidget):
         self._export_thread.failed.connect(self._on_failed)
         self._export_thread.start()
 
+    def _existing_output_paths(self, params) -> list[Path]:
+        if not params.per_channel:
+            return [params.output_path] if params.output_path.exists() else []
+
+        ext = params.target_format
+        out_dir = Path(params.output_path).parent
+        base_stem = Path(params.output_path).stem or "filtered"
+        existing: list[Path] = []
+        for ch in params.channels:
+            path = out_dir / f"{base_stem}_ch{ch}.{ext}"
+            if path.exists():
+                existing.append(path)
+        return existing
+
+    
     def _on_progress(self, done: int, total: int):
         pct = int(round(100 * done / max(1, total)))
         self.progress_bar.setValue(pct)
@@ -553,6 +597,7 @@ class ExportDataPanel(QWidget):
         self.export_btn.setEnabled(True)
         self.export_btn.setText("Export")
         self.progress_bar.setValue(100)
+        self._last_export_filename = self.filename_edit.text().strip() or "filtered"
         n_files = len(result.written_paths)
         first = result.written_paths[0] if result.written_paths else "?"
         self.status_label.setText(

@@ -31,6 +31,7 @@ before the deletion.
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -1318,21 +1319,23 @@ class ThetaCycleDialog(QDialog):
             QMessageBox.warning(self, "No data", "No data is currently loaded.")
             return
 
-        folder = analysis_folder_for(self.engine)
-        if folder is None:
-            QMessageBox.warning(
-                self, "Cannot load",
-                "No data file is loaded, so there is no folder to load "
-                "the analysis from."
-            )
+        default_folder = analysis_folder_for(self.engine)
+        start_dir = str(default_folder) if default_folder is not None else ""
+
+        csv_path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Theta Cycles",
+            start_dir,
+            "Theta-cycle CSV (*.csv);;All files (*)",
+        )
+        if not csv_path_str:
             return
 
-        csv_path = folder / "theta_cycles.csv"
+        csv_path = Path(csv_path_str)
         if not csv_path.exists():
-            QMessageBox.information(
-                self, "Nothing to load",
-                f"No saved theta cycles were found in:\n\n{folder}\n\n"
-                "Detect theta cycles and click Save first."
+            QMessageBox.warning(
+                self, "File not found",
+                f"{csv_path} does not exist."
             )
             return
 
@@ -1455,7 +1458,7 @@ class ThetaCycleDialog(QDialog):
         self._refresh_export_buttons()
         self._refresh_landmark_scheme_label()
 
-        status = f"Loaded {len(cycles)} cycle(s) from {folder}."
+        status = f"Loaded {len(cycles)} cycle(s) from {csv_path.parent}."
         if sidecar is not None:
             status += " Parameters restored."
         self.status_label.setText(status)

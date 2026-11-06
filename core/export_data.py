@@ -457,6 +457,8 @@ def export_channels(
         out_dir = Path(params.output_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         ext = params.target_format
+        
+        base_stem = Path(params.output_path).stem or "filtered"
         for i, ch in enumerate(sorted_channels):
             ch_geometry = {ch: sorted_geometry.get(ch, {})}
             ch_params = ExportParams(
@@ -473,7 +475,7 @@ def export_channels(
                 pad_before_seconds=params.pad_before_seconds,
                 pad_after_seconds=params.pad_after_seconds,
                 target_format=params.target_format,
-                output_path=out_dir / f"filtered_ch{ch}.{ext}",
+                output_path=out_dir / f"{base_stem}_ch{ch}.{ext}",
                 per_channel=True,
                 dtype=params.dtype,
                 channel_geometry=ch_geometry,
@@ -482,7 +484,7 @@ def export_channels(
                 ch_params, engine, params.output_sample_rate,
                 out_len, padded=padded,
             )
-            path = out_dir / f"filtered_ch{ch}.{ext}"
+            path = out_dir / f"{base_stem}_ch{ch}.{ext}"
             writer(path, out[i:i + 1, :], ch_metadata)
             written.append(path)
     else:

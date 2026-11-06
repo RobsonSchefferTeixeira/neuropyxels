@@ -1481,24 +1481,25 @@ class RippleDialog(QDialog):
             QMessageBox.warning(self, "No data", "No data is currently loaded.")
             return
 
-        folder = analysis_folder_for(self.engine)
-        if folder is None:
-            QMessageBox.warning(
-                self, "Cannot load",
-                "No data file is loaded, so there is no folder to load "
-                "the analysis from."
-            )
-            return
+        default_folder = analysis_folder_for(self.engine)
+        start_dir = str(default_folder) if default_folder is not None else ""
 
-        csv_path = folder / "ripples.csv"
+        csv_path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Ripple Detection",
+            start_dir,
+            "Ripple CSV (*.csv);;All files (*)",
+        )
+        if not csv_path_str:
+            return  # user cancelled
+
+        csv_path = Path(csv_path_str)
         if not csv_path.exists():
-            QMessageBox.information(
-                self, "Nothing to load",
-                f"No saved ripples were found in:\n\n{folder}\n\n"
-                "Detect ripples and click Save first."
+            QMessageBox.warning(
+                self, "File not found",
+                f"{csv_path} does not exist."
             )
             return
-
         # Try to read the sidecar; if it exists, its sample offset is
         # authoritative for interpreting the CSV's absolute sample
         # indices. If not, fall back to the dialog's current offset.
@@ -1556,7 +1557,7 @@ class RippleDialog(QDialog):
         self._populate_summary_table()
         self._push_overlay_to_trace_view()
 
-        status = f"Loaded {len(events)} ripple event(s) from {folder}."
+        status = f"Loaded {len(events)} ripple event(s) from {csv_path.parent}."
         if sidecar is not None:
             status += " Parameters and signals restored."
         else:

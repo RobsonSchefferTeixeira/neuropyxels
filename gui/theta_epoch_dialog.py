@@ -7,6 +7,7 @@ results table.
 """
 
 from __future__ import annotations
+from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -995,24 +996,26 @@ class ThetaEpochDialog(QDialog):
             QMessageBox.warning(self, "No data loaded", "Load continuous.dat first.")
             return
 
-        folder = analysis_folder_for(self.engine)
-        if folder is None:
-            QMessageBox.warning(
-                self, "Cannot load",
-                "No data file is loaded, so there is no folder to load "
-                "the analysis from."
-            )
+        default_folder = analysis_folder_for(self.engine)
+        start_dir = str(default_folder) if default_folder is not None else ""
+
+        csv_path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Theta Epochs",
+            start_dir,
+            "Theta-epoch CSV (*.csv);;All files (*)",
+        )
+        if not csv_path_str:
             return
 
-        csv_path = folder / "theta_epochs.csv"
+        csv_path = Path(csv_path_str)
         if not csv_path.exists():
-            QMessageBox.information(
-                self, "Nothing to load",
-                f"No saved theta epochs were found in:\n\n{folder}\n\n"
-                "Detect theta epochs and click Save first."
+            QMessageBox.warning(
+                self, "File not found",
+                f"{csv_path} does not exist."
             )
             return
-
+        
         # Read the sidecar first: if it exists, its sample_offset is
         # authoritative and its params should be restored on the dialog.
         sidecar = None
@@ -1055,7 +1058,7 @@ class ThetaEpochDialog(QDialog):
         self._populate_table()
         self._refresh_export_buttons()
         self.epochsChanged.emit(self.epochs)
-        status = f"Loaded {len(self.epochs)} theta epoch(s) from {folder}."
+        status = f"Loaded {len(self.epochs)} theta epoch(s) from {csv_path.parent}."
         if sidecar is not None:
             status += " Parameters restored."
         self.status_label.setText(status)
