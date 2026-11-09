@@ -507,6 +507,16 @@ class MainWindow(QMainWindow):
                 pass
         tv._channel_buttons = {}
 
+        # Remove any coordinate labels on screen.
+        for ch, lbl in list(tv._channel_coord_labels.items()):
+            try:
+                lbl.setParent(None)
+                lbl.deleteLater()
+            except Exception:
+                pass
+        tv._channel_coord_labels = {}
+
+        
         # Phy raster and recolor.
         tv._raster_unit_ids = []
         tv._raster_unit_colors = {}

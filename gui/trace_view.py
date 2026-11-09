@@ -816,15 +816,12 @@ class TraceViewWidget(QWidget):
         self._global_filter_enabled = False
         self._probe_data: dict | None = None
         self._csd_analyzer: PhaseAmplitudeAnalyzer | None = None
+
+        self._channel_coord_labels: dict[int, "QLabel"] = {}
         self._channel_buttons: dict[int, "QPushButton"] = {}
 
-        # ---- Per-trace scale normalization cache ----
-        # (channel, trace_idx) -> (ref_lo, ref_hi, center, half_range).
-        # See _get_trace_normalization() for the invalidation logic.
         self._trace_normalization_cache: dict[tuple[int, int], tuple[float, float]] = {}
         self._trace_normalization_key = None
-
-
 
         # ---- Display-selection geometry ----
         # Depth/shank/x for the channels the user has SELECTED for
@@ -3708,17 +3705,24 @@ class TraceViewWidget(QWidget):
 
     def _update_channel_buttons(self):
         """Ensure a QPushButton exists for every visible channel and is
-        positioned correctly. Called from paintEvent before drawing."""
-        from PyQt6.QtWidgets import QPushButton
+        positioned correctly. Also maintain a small (x, y) label placed
+        directly BELOW each button, horizontally centered on it, showing
+        the channel's probe coordinates. Called from paintEvent before
+        drawing."""
+        from PyQt6.QtWidgets import QPushButton, QLabel
 
         display_channels = self.get_display_order()
         visible = set(display_channels)
 
-        # Remove buttons for channels no longer visible.
+        # ---- Cleanup: release widgets for channels no longer visible ----
         for ch in list(self._channel_buttons.keys()):
             if ch not in visible:
                 btn = self._channel_buttons.pop(ch)
                 btn.deleteLater()
+        for ch in list(self._channel_coord_labels.keys()):
+            if ch not in visible:
+                lbl = self._channel_coord_labels.pop(ch)
+                lbl.deleteLater()
 
         if not display_channels:
             return
@@ -3740,6 +3744,8 @@ class TraceViewWidget(QWidget):
                 - (idx + 0.5) * channel_height
                 + self._channel_offset * channel_height
             )
+
+            # ---- Channel-number button (unchanged) ----
             btn = self._channel_buttons.get(ch)
             if btn is None:
                 btn = QPushButton(str(ch), self)
@@ -3762,6 +3768,64 @@ class TraceViewWidget(QWidget):
                 self._channel_buttons[ch] = btn
             btn.move(5, int(y_center - button_height / 2))
             btn.setFixedSize(button_width, button_height)
+
+            # ---- Coordinate label below the button, centered on it ----
+            x_um = self.full_probe_xcoords.get(ch)
+            y_um = self.full_probe_depths.get(ch)
+            lbl = self._channel_coord_labels.get(ch)
+
+            if x_um is None or y_um is None:
+                if lbl is not None:
+                    lbl.setVisible(False)
+                continue
+
+            text = f"({int(round(x_um))}, {int(round(y_um))})"
+            if lbl is None:
+                lbl = QLabel(text, self)
+                lbl.setStyleSheet(
+                    "color: #9a9a9a; font-size: 12px;"
+                    "background: transparent;"
+                    "padding: 0px;"
+                )
+                # Purely decorative; never steals clicks from the
+                # channel button or the plot area.
+                lbl.setAttribute(
+                    Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+                )
+                lbl.show()
+                self._channel_coord_labels[ch] = lbl
+            else:
+                if lbl.text() != text:
+                    lbl.setText(text)
+
+            # Hide the label when the row is too short to fit both a
+            # button and a label (font ≈ 10 px at 8 pt). Keeps the
+            # strip readable when many channels are selected.
+            if button_height < 16:
+                lbl.setVisible(False)
+                continue
+
+            lbl.adjustSize()
+            lbl_w = lbl.width()
+            lbl_h = lbl.height()
+
+            # Center horizontally on the button: button spans
+            # [5, 5 + button_width]; its center is 5 + button_width/2.
+            # Label left = center - label_w/2.
+            label_x = 5 + (button_width - lbl_w) // 2
+            # Button bottom edge is y_center - button_height/2 +
+            # button_height = y_center + button_height/2. Label top
+            # = button bottom + 1 px gap.
+            label_y = int(y_center + button_height / 2) + 1
+
+            # If the label would extend below the plot bottom, hide
+            # it — it would otherwise overdraw the time axis.
+            if label_y + lbl_h > plot_bottom - 2:
+                lbl.setVisible(False)
+                continue
+
+            lbl.move(label_x, label_y)
+            lbl.setVisible(True)
 
 
     def compute_focus_neighborhood(self, center_channel: int, n_levels: int) -> list[int]:
