@@ -801,6 +801,12 @@ class TraceViewWidget(QWidget):
         self._dragging_cursor: bool = False
         self._drag_cursor_start_x = 0.0
 
+        # ---- Time ruler ----
+        self._ruler: tuple[float, float] | None = None
+        self._ruler_drag_mode: str | None = None          # 'start', 'end', 'body'
+        self._ruler_drag_origin_time: float | None = None
+        self._ruler_drag_origin_ruler: tuple[float, float] | None = None
+
         self._dragging = False
         self._drag_start_pos = None
         self._drag_start_time = 0.0
@@ -3031,6 +3037,8 @@ class TraceViewWidget(QWidget):
 
             if self.show_depth_scale:
                 self._draw_depth_scale(painter, rect, data)
+
+            self._draw_time_ruler(painter, rect)
         finally:
             painter.end()
 
@@ -3081,7 +3089,158 @@ class TraceViewWidget(QWidget):
             rect.setBottom(rect.bottom() - self.scrollbar.height())
         self._draw_time_cursors(painter, rect)
 
-    
+    def _draw_time_ruler(self, painter: QPainter, rect: QRectF):
+        """Draw the time ruler: a horizontal bar with a duration /
+        frequency label, two dashed vertical alignment lines at the
+        ends, and two round end handles. No-op when there is no ruler
+        or when it lies entirely outside the visible window."""
+        if self._ruler is None:
+            return
+        t_start, t_end = self._ruler
+        if t_end <= t_start:
+            return
+
+        plot_left, plot_right, plot_bottom = self._get_plot_bounds()
+        plot_top = rect.top()
+        if plot_right <= plot_left or plot_bottom <= plot_top:
+            return
+
+        vis_start = self.start_time
+        vis_end = self.start_time + self.window_duration
+        if t_end < vis_start or t_start > vis_end:
+            return
+
+        def _time_to_x(t):
+            return plot_left + (
+                (t - self.start_time) / self.window_duration
+            ) * (plot_right - plot_left)
+
+        x1 = _time_to_x(t_start)
+        x2 = _time_to_x(t_end)
+        # Clamp the DRAWN positions to the plot area so a ruler that
+        # extends off-screen still shows its visible portion. The
+        # STORED (t_start, t_end) values are untouched.
+        draw_x1 = max(plot_left, min(plot_right, x1))
+        draw_x2 = max(plot_left, min(plot_right, x2))
+        if draw_x2 <= draw_x1:
+            return
+
+        # Bar sits in the top third of the plot, out of the way of
+        # typical trace content.
+        bar_y = plot_top + (plot_bottom - plot_top) * 0.30
+        bar_h = 22.0
+
+        # ---- Dashed vertical alignment lines at the ends ----
+        dashed = QPen(QColor(255, 215, 0, 200), 1.0, Qt.PenStyle.DashLine)
+        painter.setPen(dashed)
+        if plot_left <= x1 <= plot_right:
+            painter.drawLine(int(x1), int(plot_top), int(x1), int(plot_bottom))
+        if plot_left <= x2 <= plot_right:
+            painter.drawLine(int(x2), int(plot_top), int(x2), int(plot_bottom))
+
+        # ---- Bar ----
+        bar_rect = QRectF(
+            draw_x1, bar_y, max(1.0, draw_x2 - draw_x1), bar_h,
+        )
+        painter.setBrush(QBrush(QColor(255, 215, 0, 60)))
+        painter.setPen(QPen(QColor(255, 215, 0, 230), 1.5))
+        painter.drawRect(bar_rect)
+
+        # ---- Duration / frequency label ----
+        duration_s = t_end - t_start
+        freq_hz = (1.0 / duration_s) if duration_s > 0 else 0.0
+        if duration_s < 1.0:
+            dur_text = f"{duration_s * 1000:.0f} ms"
+        else:
+            dur_text = f"{duration_s:.2f} s"
+        text = f"{dur_text}  ({freq_hz:.2f} Hz)"
+
+        painter.setPen(QColor("#f0f0f0"))
+        font = QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+        # ---- End handles ----
+        handle_r = 5.0
+        painter.setBrush(QBrush(QColor(255, 215, 0)))
+        painter.setPen(QPen(QColor(20, 20, 20), 1.2))
+        for hx in (draw_x1, draw_x2):
+            painter.drawEllipse(
+                QRectF(
+                    hx - handle_r,
+                    bar_y + bar_h / 2 - handle_r,
+                    2 * handle_r,
+                    2 * handle_r,
+                )
+            )
+
+    def _ruler_hit_at(self, pos) -> str | None:
+        """Return 'start', 'end', 'body', or None for the ruler at the
+        given widget position. Uses the same bar geometry the drawing
+        method uses, so hit-testing always matches what's on screen."""
+        if self._ruler is None:
+            return None
+        t_start, t_end = self._ruler
+        if t_end <= t_start:
+            return None
+
+        plot_left, plot_right, plot_bottom = self._get_plot_bounds()
+        rect = self.rect()
+        plot_top = rect.top()
+
+        def _time_to_x(t):
+            return plot_left + (
+                (t - self.start_time) / self.window_duration
+            ) * (plot_right - plot_left)
+
+        x1 = _time_to_x(t_start)
+        x2 = _time_to_x(t_end)
+
+        bar_y = plot_top + (plot_bottom - plot_top) * 0.30
+        bar_h = 22.0
+
+        hit_x = 10.0
+        hit_y_pad = 8.0
+
+        if not (bar_y - hit_y_pad <= pos.y() <= bar_y + bar_h + hit_y_pad):
+            return None
+
+        if abs(pos.x() - x1) <= hit_x:
+            return "start"
+        if abs(pos.x() - x2) <= hit_x:
+            return "end"
+        if min(x1, x2) <= pos.x() <= max(x1, x2):
+            return "body"
+        return None
+
+    def _place_ruler_at(self, center_time: float):
+        """Create a ruler centered on `center_time`, with initial
+        duration = 10% of the current visible window. Replaces any
+        existing ruler."""
+        width = max(self.window_duration * 0.10, 1e-3)
+        self._ruler = (center_time - width / 2.0, center_time + width / 2.0)
+        self.update()
+
+    def _reset_ruler_width(self):
+        """Reset the current ruler to a centered 10%-of-window width,
+        keeping its midpoint."""
+        if self._ruler is None:
+            return
+        t_start, t_end = self._ruler
+        self._place_ruler_at((t_start + t_end) / 2.0)
+
+    def _remove_ruler(self):
+        """Remove the ruler and clear any in-progress drag state."""
+        self._ruler = None
+        self._ruler_drag_mode = None
+        self._ruler_drag_origin_time = None
+        self._ruler_drag_origin_ruler = None
+        self.unsetCursor()
+        self.update()
+
+
     def _compute_time_ticks(self, rect: QRectF):
         plot_left = rect.left() + LABEL_STRIP_WIDTH
         plot_right = rect.right() - 30
@@ -4020,6 +4179,12 @@ class TraceViewWidget(QWidget):
             self._scroll_up()
         elif event.key() == Qt.Key.Key_Down:
             self._scroll_down()
+            
+        elif event.key() == Qt.Key.Key_Delete and self._ruler is not None:
+            self._remove_ruler()
+            event.accept()
+            return
+        
         super().keyPressEvent(event)
 
     def contextMenuEvent(self, event):
@@ -4027,6 +4192,8 @@ class TraceViewWidget(QWidget):
             return
         plot_left, plot_right, _ = self._get_plot_bounds()
         plot_width = plot_right - plot_left
+
+        # Right-click on a time cursor: its own menu, same as before.
         for i, cursor_fraction in enumerate(self._time_cursors):
             cursor_time = self._cursor_to_time(cursor_fraction)
             x_ratio = (cursor_time - self.start_time) / self.window_duration
@@ -4039,7 +4206,27 @@ class TraceViewWidget(QWidget):
                 remove_action.triggered.connect(lambda: self._remove_cursor(i))
                 menu.exec(event.globalPos())
                 return
+
         menu = QMenu(self)
+
+        # ---- Time ruler ----
+        if self._ruler is None:
+            click_x = event.pos().x()
+            click_time = self.start_time + (
+                (click_x - plot_left) / max(1, plot_width)
+            ) * self.window_duration
+            place_action = menu.addAction("Place time ruler here")
+            place_action.triggered.connect(
+                lambda _checked=False, t=click_time: self._place_ruler_at(t)
+            )
+        else:
+            remove_action = menu.addAction("Remove time ruler")
+            remove_action.triggered.connect(self._remove_ruler)
+            reset_action = menu.addAction("Reset ruler to 10% of window")
+            reset_action.triggered.connect(self._reset_ruler_width)
+
+        menu.addSeparator()
+
         clear_cursors_action = menu.addAction("Clear All Time Cursors")
         clear_cursors_action.triggered.connect(self._clear_time_cursors)
         menu.exec(event.globalPos())
@@ -4057,6 +4244,21 @@ class TraceViewWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            ruler_hit = self._ruler_hit_at(event.position())
+            if ruler_hit is not None and self._ruler is not None:
+                self._ruler_drag_mode = ruler_hit
+                self._ruler_drag_origin_ruler = self._ruler
+
+                plot_left, plot_right, _ = self._get_plot_bounds()
+                plot_width = max(1, plot_right - plot_left)
+                self._ruler_drag_origin_time = self.start_time + (
+                    (event.position().x() - plot_left) / plot_width
+                ) * self.window_duration
+
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                event.accept()
+                return
+            
             # ---- Left label strip ----
             if event.position().x() < self.rect().left() + LABEL_STRIP_WIDTH:
                 # Header button first.
@@ -4122,6 +4324,47 @@ class TraceViewWidget(QWidget):
                 event.accept()
 
     def mouseMoveEvent(self, event):
+
+        # ---- Time ruler drag ----
+        if (
+            self._ruler_drag_mode is not None
+            and self._ruler is not None
+            and self._ruler_drag_origin_ruler is not None
+            and self._ruler_drag_origin_time is not None
+        ):
+            plot_left, plot_right, _ = self._get_plot_bounds()
+            plot_width = max(1, plot_right - plot_left)
+            current_time = self.start_time + (
+                (event.position().x() - plot_left) / plot_width
+            ) * self.window_duration
+
+            t_start, t_end = self._ruler_drag_origin_ruler
+            dt = current_time - self._ruler_drag_origin_time
+            min_gap = max(self.window_duration * 0.001, 1e-9)
+
+            if self._ruler_drag_mode == "body":
+                self._ruler = (t_start + dt, t_end + dt)
+            elif self._ruler_drag_mode == "start":
+                new_start = t_start + dt
+                if t_end - new_start >= min_gap:
+                    self._ruler = (new_start, t_end)
+            elif self._ruler_drag_mode == "end":
+                new_end = t_end + dt
+                if new_end - t_start >= min_gap:
+                    self._ruler = (t_start, new_end)
+
+            self.update()
+            event.accept()
+            return
+        
+        # ---- Hover cursor over the ruler ----
+        if self._ruler_drag_mode is None:
+            ruler_hit = self._ruler_hit_at(event.position())
+            if ruler_hit is not None:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif self._hovered_row_button_channel is None:
+                self.unsetCursor()
+
         # ---- Hover state for the per-row buttons ----
         new_hover: int | None = None
         pos = event.position()
@@ -4173,10 +4416,20 @@ class TraceViewWidget(QWidget):
             event.accept()
 
     def mouseReleaseEvent(self, event):
+
+        if self._ruler_drag_mode is not None:
+            self._ruler_drag_mode = None
+            self._ruler_drag_origin_time = None
+            self._ruler_drag_origin_ruler = None
+            self.unsetCursor()
+            event.accept()
+            return
+        
         if self._dragging_cursor:
             self._dragging_cursor = False
             event.accept()
             return
+        
         if hasattr(self, '_dragging') and self._dragging:
             self._dragging = False
             self._drag_start_pos = None

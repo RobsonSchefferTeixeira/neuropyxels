@@ -573,6 +573,12 @@ class MainWindow(QMainWindow):
         tv._time_cursors = []
         tv._selected_cursor = None
 
+        # Time ruler.
+        tv._ruler = None
+        tv._ruler_drag_mode = None
+        tv._ruler_drag_origin_time = None
+        tv._ruler_drag_origin_ruler = None
+        
         # Caches.
         tv._cached_data = None
         tv._cache_start = None
