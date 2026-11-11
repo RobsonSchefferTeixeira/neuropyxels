@@ -25,11 +25,12 @@ from PyQt6.QtWidgets import (
     QSpinBox, QCheckBox, QPushButton, QComboBox, QMessageBox, QWidget,
     QProgressBar, QSizePolicy,
 )
+from PyQt6.QtGui import QPainter
 
 from core.comodulogram import ComodulogramAnalyzer, ComodulogramParams
 from core.trace_engine import TraceEngine
 from core.colormaps import COLORMAP_NAMES, resolve_name, get_pg_colormap
-
+from scipy.ndimage import zoom as ndimage_zoom
 
 def _pin_button(btn: QPushButton, min_width: int | None = None) -> QPushButton:
     """Keep a button at its natural width when the dialog resizes."""
@@ -133,6 +134,12 @@ class ComodulogramDialog(QDialog):
         self.plot_widget.setLabel("bottom", "Phase frequency", units="Hz")
         self.plot_widget.setLabel("left", "Amplitude frequency", units="Hz")
         self.plot_widget.setMenuEnabled(False)
+
+        self.plot_widget.getPlotItem().getViewBox().disableAutoRange()
+        self.plot_widget.setAntialiasing(True)
+        self.plot_widget.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform, True
+        )
 
         self.image_item = pg.ImageItem()
         self.plot_widget.addItem(self.image_item)
@@ -459,12 +466,76 @@ class ComodulogramDialog(QDialog):
                 if vmax <= vmin:
                     vmax = vmin + 1.0
 
-        # Image is (n_phase, n_amp); ImageItem expects (row, col) with
-        # setRect(x0, y0, w, h) mapping col -> x, row -> y. So the
-        # image array must be (n_amp, n_phase) so that:
-        #   rows (y) = amp frequency
-        #   cols (x) = phase frequency
-        self.image_item.setImage(comod.T, autoLevels=False)
+        # ---- Smooth the coarse MI grid before display ----
+        # The comodulogram is computed on a coarse (n_phase, n_amp)
+        # grid -- typically 10 x 37 for defaults. Rendering that grid
+        # directly gives a pixelated heatmap; the original matplotlib
+        # contourf view interpolates the same coarse grid into smooth
+        # filled contours. We do the equivalent here: up-sample the
+        # coarse matrix with bicubic interpolation so pyqtgraph draws
+        # a continuous field, keeping the fast pyqtgraph interaction
+        # (pan/zoom, hover) instead of embedding a matplotlib canvas.
+        #
+        # The interpolation is DISPLAY-ONLY -- the underlying MI values
+        # are unchanged; only how they are shown between grid points
+        # is smoothed. Any reader who wants per-cell values should
+        # read the status line / export path (not yet implemented).
+        coarse = comod.T  # transpose once for (rows=amp, cols=phase)
+        rows, cols = coarse.shape
+
+        # Upsample factors chosen so the displayed image is at least
+        # ~300 px on each axis at typical dialog sizes. Cap at 16x so
+        # a tiny grid doesn't produce a huge array.
+        up_factor_phase = max(1, min(16, 300 // max(1, cols)))
+        up_factor_amp = max(1, min(16, 400 // max(1, rows)))
+
+        # NaN-safe: ndimage.zoom on NaN-propagating data would smear
+        # the NaNs across the whole image. Interpolate on the finite
+        # values, and mark interpolated cells that span a NaN region
+        # as NaN so they stay transparent.
+        if np.any(~np.isfinite(coarse)):
+            # Replace NaN with nearest-neighbor fill BEFORE zoom so
+            # zoom has clean data; then mask back the originally-NaN
+            # cells and any upsampled cell that fell in a NaN gap.
+            nan_mask = ~np.isfinite(coarse)
+            filled = coarse.copy()
+            if np.any(np.isfinite(coarse)):
+                fill_value = float(np.nanmean(coarse))
+                filled[nan_mask] = fill_value
+            else:
+                filled[:] = 0.0
+            smooth = ndimage_zoom(
+                filled,
+                zoom=(up_factor_amp, up_factor_phase),
+                order=3,   # bicubic
+                mode="nearest",
+            )
+            # Mask: upsample the NaN mask with nearest-neighbour so
+            # the final image has NaN where the coarse cell was NaN.
+            smooth_mask = ndimage_zoom(
+                nan_mask.astype(np.uint8),
+                zoom=(up_factor_amp, up_factor_phase),
+                order=0,   # nearest
+                mode="nearest",
+            ).astype(bool)
+            smooth[smooth_mask] = np.nan
+        else:
+            smooth = ndimage_zoom(
+                coarse,
+                zoom=(up_factor_amp, up_factor_phase),
+                order=3,
+                mode="nearest",
+            )
+
+        # ImageItem with SmoothPixmapTransform gives a second layer of
+        # blur when the display is larger than the array; combined with
+        # the bicubic upsample above, the heatmap reads as a continuous
+        # field rather than a set of cells.
+        self.image_item.setImage(smooth, autoLevels=False)
+        self.image_item.setOpts(
+            autoDownsample=False,
+            smooth=True,
+        )
         self.image_item.setLevels((vmin, vmax))
 
         phase_step = (
@@ -494,6 +565,18 @@ class ComodulogramDialog(QDialog):
 
         self.plot_widget.setXRange(phase_freqs[0], phase_freqs[-1], padding=0)
         self.plot_widget.setYRange(amp_freqs[0], amp_freqs[-1], padding=0)
+
+
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        vb.setAutoVisible(x=False, y=False)
+        vb.disableAutoRange()
+
+        vb.setLimits(
+            xMin=phase_freqs[0] - phase_step / 2.0,
+            xMax=phase_freqs[-1] + phase_step / 2.0,
+            yMin=amp_freqs[0] - amp_step / 2.0,
+            yMax=amp_freqs[-1] + amp_step / 2.0,
+        )
 
         self._update_status_label(results)
 
