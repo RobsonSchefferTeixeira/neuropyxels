@@ -46,6 +46,7 @@ from gui.phy_units_panel import PhyUnitsPanel
 from core.phy_loader import load_phy_folder, PhyLoadError
 from gui.theta_cycle_dialog import ThetaCycleDialog
 from gui.export_panel import ExportDataPanel
+from gui.comodulogram_dialog import ComodulogramDialog
 
 class ColorButton(QPushButton):
 
@@ -308,6 +309,7 @@ class MainWindow(QMainWindow):
         self._open_pac_dialogs: list[PhaseAmplitudeDialog] = []
         self._open_power_dialogs: list[AmplitudePowerDialog] = []
         self._open_ripple_dialogs: list[RippleDialog] = []
+        self._open_comodulogram_dialogs: list[ComodulogramDialog] = []
         self._open_theta_dialogs: list[ThetaEpochDialog] = []
         self._open_psd_dialogs: list[PsdDialog] = []
         self.phy_units_panel: PhyUnitsPanel | None = None
@@ -353,6 +355,7 @@ class MainWindow(QMainWindow):
             "_open_theta_dialogs",
             "_open_psd_dialogs",
             "_open_theta_cycle_dialogs",
+            "_open_comodulogram_dialogs",
         ):
             dlg_list = getattr(self, dlg_list_name, None)
             if dlg_list:
@@ -1073,7 +1076,7 @@ class MainWindow(QMainWindow):
         self.theta_epoch_action.setEnabled(ready)
         self.psd_action.setEnabled(ready)
         self.theta_cycle_action.setEnabled(ready)
-
+        self.comodulogram_action.setEnabled(ready)
 
     def _on_open_theta_cycle(self):
         if self.probe_map is None or not self._current_probe_key:
@@ -1270,6 +1273,10 @@ class MainWindow(QMainWindow):
         self.phase_amplitude_action.triggered.connect(self._on_open_phase_amplitude)
         analysis_menu.addAction(self.phase_amplitude_action)
 
+        self.comodulogram_action = QAction("&Comodulogram", self)
+        self.comodulogram_action.setEnabled(False)
+        self.comodulogram_action.triggered.connect(self._on_open_comodulogram)
+        analysis_menu.addAction(self.comodulogram_action)
 
         self.power_map_action = QAction("Spatial &Power Map", self)
         self.power_map_action.setEnabled(False)
@@ -2467,6 +2474,47 @@ class MainWindow(QMainWindow):
     def _on_pac_dialog_closed(self, dialog: PhaseAmplitudeDialog):
         if dialog in self._open_pac_dialogs:
             self._open_pac_dialogs.remove(dialog)
+
+    def _on_open_comodulogram(self):
+        if self.probe_map is None or not self._current_probe_key:
+            QMessageBox.warning(
+                self, "No probe loaded",
+                "Load a settings.xml file first to provide probe geometry."
+            )
+            return
+        if not self.engine.data_loaded:
+            QMessageBox.warning(
+                self, "No data loaded",
+                "Load a continuous.dat file first."
+            )
+            return
+
+        probe_data = self._probes["probes"][self._current_probe_key]
+        dialog = ComodulogramDialog(probe_data, self.engine, parent=self)
+
+        selected = self.probe_map.get_selected_channels()
+        if selected:
+            dialog.set_channel(selected[0])
+
+        start = self.trace_view.start_time
+        end = min(
+            self.engine.total_duration,
+            start + max(self.trace_view.window_duration, 1.0)
+        )
+        dialog.start_spin.setValue(start)
+        dialog.end_spin.setValue(end)
+
+        self._open_comodulogram_dialogs.append(dialog)
+        dialog.finished.connect(
+            lambda _res, d=dialog: self._on_comodulogram_dialog_closed(d)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_comodulogram_dialog_closed(self, dialog):
+        if dialog in self._open_comodulogram_dialogs:
+            self._open_comodulogram_dialogs.remove(dialog)
 
     def _on_open_power_map(self):
         if self.probe_map is None or not self._current_probe_key:
