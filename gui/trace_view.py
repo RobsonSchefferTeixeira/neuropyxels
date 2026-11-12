@@ -3060,19 +3060,28 @@ class TraceViewWidget(QWidget):
             x_ratio = (cursor_time - self.start_time) / self.window_duration
             x = plot_left + x_ratio * plot_width
 
+ 
             is_selected = (i == self._selected_cursor)
             if is_selected:
-                pen = QPen(QColor("#ff6b6b"), 3, Qt.PenStyle.DashLine)
+                pen = QPen(QColor("#ffd23f"), 3, Qt.PenStyle.SolidLine)
+                pen.setCosmetic(True)
             else:
-                pen = QPen(QColor("#ff6b6b"), 2, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.drawLine(int(x), int(rect.top()), int(x), int(rect.bottom()))
+                pen = QPen(QColor("#59159a"), 2, Qt.PenStyle.DashLine)
+                pen.setCosmetic(True)
 
-            painter.setPen(QPen(QColor("#ff6b6b"), 1))
+
+
+            painter.setPen(pen)
             font = QFont()
             font.setPointSize(8)
             painter.setFont(font)
-            painter.drawText(int(x - 25), int(rect.top() + 5), 50, 15, Qt.AlignmentFlag.AlignCenter, f"{cursor_time:.3f}s")
+            label = f"{cursor_time:.3f}s"
+            label_color = QColor("#ffd23f") if is_selected else QColor("#59159a")
+            painter.setPen(QPen(label_color, 1))
+            painter.drawText(
+                int(x - 25), int(rect.top() + 5), 50, 15,
+                Qt.AlignmentFlag.AlignCenter, label
+            )
 
             painter.setPen(pen)
 
@@ -4190,46 +4199,68 @@ class TraceViewWidget(QWidget):
     def contextMenuEvent(self, event):
         if not self._data_loaded:
             return
-        plot_left, plot_right, _ = self._get_plot_bounds()
-        plot_width = plot_right - plot_left
 
-        # Right-click on a time cursor: its own menu, same as before.
-        for i, cursor_fraction in enumerate(self._time_cursors):
-            cursor_time = self._cursor_to_time(cursor_fraction)
-            x_ratio = (cursor_time - self.start_time) / self.window_duration
-            cursor_x = plot_left + x_ratio * plot_width
-            if abs(event.pos().x() - cursor_x) < 10:
-                self._selected_cursor = i
-                self.update()
-                menu = QMenu(self)
-                remove_action = menu.addAction("Remove Cursor")
-                remove_action.triggered.connect(lambda: self._remove_cursor(i))
-                menu.exec(event.globalPos())
-                return
+        plot_left, plot_right, _ = self._get_plot_bounds()
+        plot_width = max(1, plot_right - plot_left)
+
+        # Compute the time under the right-click, for "add here" items.
+        click_x = event.pos().x()
+        click_ratio = (click_x - plot_left) / plot_width
+        click_time = self.start_time + click_ratio * self.window_duration
 
         menu = QMenu(self)
 
-        # ---- Time ruler ----
-        if self._ruler is None:
-            click_x = event.pos().x()
-            click_time = self.start_time + (
-                (click_x - plot_left) / max(1, plot_width)
-            ) * self.window_duration
-            place_action = menu.addAction("Place time ruler here")
-            place_action.triggered.connect(
-                lambda _checked=False, t=click_time: self._place_ruler_at(t)
-            )
-        else:
-            remove_action = menu.addAction("Remove time ruler")
-            remove_action.triggered.connect(self._remove_ruler)
-            reset_action = menu.addAction("Reset ruler to 10% of window")
-            reset_action.triggered.connect(self._reset_ruler_width)
+        add_cursor_action = menu.addAction("Add time cursor here")
+        add_cursor_action.triggered.connect(
+            lambda _checked=False, t=click_time: self._add_cursor_at(t)
+        )
+
+        add_ruler_action = menu.addAction("Add time ruler here")
+        add_ruler_action.triggered.connect(
+            lambda _checked=False, t=click_time: self._place_ruler_at(t)
+        )
 
         menu.addSeparator()
 
-        clear_cursors_action = menu.addAction("Clear All Time Cursors")
+        # ---- Remove ----
+        has_cursors = len(self._time_cursors) > 0
+        has_selected = (
+            self._selected_cursor is not None
+            and 0 <= self._selected_cursor < len(self._time_cursors)
+        )
+        has_ruler = self._ruler is not None
+
+        remove_selected_action = menu.addAction("Remove selected cursor")
+        remove_selected_action.setEnabled(has_selected)
+        remove_selected_action.triggered.connect(self._remove_selected_cursor)
+
+        clear_cursors_action = menu.addAction("Clear all cursors")
+        clear_cursors_action.setEnabled(has_cursors)
         clear_cursors_action.triggered.connect(self._clear_time_cursors)
+
+        remove_ruler_action = menu.addAction("Remove ruler")
+        remove_ruler_action.setEnabled(has_ruler)
+        remove_ruler_action.triggered.connect(self._remove_ruler)
+
         menu.exec(event.globalPos())
+
+    def _add_cursor_at(self, time: float):
+        """Place a time cursor at `time` and select it."""
+        fraction = self._time_to_cursor_fraction(time)
+        self._time_cursors.append(fraction)
+        self._time_cursors.sort()
+        # Reselect the just-added cursor by finding its sorted index.
+        self._selected_cursor = self._time_cursors.index(fraction)
+        self.update()
+
+    def _remove_selected_cursor(self):
+        """Remove the currently-selected cursor, if any."""
+        i = self._selected_cursor
+        if i is None or not (0 <= i < len(self._time_cursors)):
+            return
+        self._time_cursors.pop(i)
+        self._selected_cursor = None
+        self.update()
 
     def _remove_cursor(self, index: int):
         if 0 <= index < len(self._time_cursors):
@@ -4242,6 +4273,37 @@ class TraceViewWidget(QWidget):
         self._selected_cursor = None
         self.update()
 
+    def add_cursor_at_playhead(self):
+        """Menu-bar entry point: place a time cursor at the center of
+        the currently-visible window and select it."""
+        if not self._data_loaded:
+            return
+        center_time = self.start_time + self.window_duration / 2.0
+        self._add_cursor_at(center_time)
+
+    def add_ruler_at_playhead(self):
+        """Menu-bar entry point: place a time ruler centered at the
+        center of the currently-visible window."""
+        if not self._data_loaded:
+            return
+        center_time = self.start_time + self.window_duration / 2.0
+        self._place_ruler_at(center_time)
+
+    def clear_all_cursors(self):
+        """Menu-bar entry point: clear every time cursor. Delegates to
+        the existing internal method so state is consistent."""
+        self._clear_time_cursors()
+
+    def remove_ruler(self):
+        """Menu-bar entry point: remove the time ruler (if any)."""
+        self._remove_ruler()
+
+    def remove_selected_cursor(self):
+        """Menu-bar entry point: remove the selected cursor (if any).
+        Same behavior as the context-menu item, kept as a public method
+        so MainWindow can wire it without touching private state."""
+        self._remove_selected_cursor()
+        
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             ruler_hit = self._ruler_hit_at(event.position())
@@ -4301,27 +4363,7 @@ class TraceViewWidget(QWidget):
             self._drag_start_offset = self._channel_offset
             event.accept()
 
-        elif event.button() == Qt.MouseButton.RightButton:
-            if self._data_loaded:
-                plot_left, plot_right, _ = self._get_plot_bounds()
-                plot_width = plot_right - plot_left
-                for i, cursor_fraction in enumerate(self._time_cursors):
-                    cursor_time = self._cursor_to_time(cursor_fraction)
-                    x_ratio = (cursor_time - self.start_time) / self.window_duration
-                    cursor_x = plot_left + x_ratio * plot_width
-                    if abs(event.position().x() - cursor_x) < 10:
-                        self._selected_cursor = i
-                        self.update()
-                        event.accept()
-                        return
-                x_ratio = (event.position().x() - plot_left) / max(1, plot_width)
-                cursor_time = self.start_time + x_ratio * self.window_duration
-                cursor_fraction = self._time_to_cursor_fraction(cursor_time)
-                self._time_cursors.append(cursor_fraction)
-                self._time_cursors.sort()
-                self._selected_cursor = len(self._time_cursors) - 1
-                self.update()
-                event.accept()
+
 
     def mouseMoveEvent(self, event):
 

@@ -1315,6 +1315,72 @@ class MainWindow(QMainWindow):
         self.spectrogram_action.toggled.connect(self._on_toggle_spectrogram)
         view_menu.addAction(self.spectrogram_action)
 
+        view_menu.addSeparator()
+
+        markers_menu = view_menu.addMenu("Time Markers")
+
+        add_cursor_here_action = QAction("Add cursor at playhead", self)
+        add_cursor_here_action.setToolTip(
+            "Place a time cursor at the center of the currently-visible "
+            "window. (Right-clicking the plot lets you place a cursor "
+            "at a precise position.)"
+        )
+        add_cursor_here_action.triggered.connect(
+            self._on_add_cursor_at_playhead
+        )
+        markers_menu.addAction(add_cursor_here_action)
+
+        add_ruler_here_action = QAction("Add ruler at playhead", self)
+        add_ruler_here_action.setToolTip(
+            "Place a time ruler centered at the center of the "
+            "currently-visible window. (Right-clicking the plot lets "
+            "you place a ruler at a precise position.)"
+        )
+        add_ruler_here_action.triggered.connect(
+            self._on_add_ruler_at_playhead
+        )
+        markers_menu.addAction(add_ruler_here_action)
+
+        markers_menu.addSeparator()
+
+        remove_cursor_action = QAction("Remove selected cursor", self)
+        remove_cursor_action.triggered.connect(
+            self._on_remove_selected_cursor
+        )
+        markers_menu.addAction(remove_cursor_action)
+
+        clear_cursors_action = QAction("Clear all cursors", self)
+        clear_cursors_action.triggered.connect(self._on_clear_all_cursors)
+        markers_menu.addAction(clear_cursors_action)
+
+        markers_menu.addSeparator()
+
+        remove_ruler_action = QAction("Remove ruler", self)
+        remove_ruler_action.triggered.connect(self._on_remove_ruler)
+        markers_menu.addAction(remove_ruler_action)
+
+        # Refresh enablement whenever the menu opens. The cursor and
+        # ruler state can change from the plot's own interactions
+        # (left-click select, right-click add, etc.), so re-evaluate
+        # enablement at display time rather than tracking it via
+        # signals.
+        def _refresh_marker_actions():
+            if self.trace_view is None:
+                return
+            has_selected = (
+                self.trace_view._selected_cursor is not None
+                and 0 <= self.trace_view._selected_cursor
+                < len(self.trace_view._time_cursors)
+            )
+            has_cursors = len(self.trace_view._time_cursors) > 0
+            has_ruler = self.trace_view._ruler is not None
+
+            remove_cursor_action.setEnabled(has_selected)
+            clear_cursors_action.setEnabled(has_cursors)
+            remove_ruler_action.setEnabled(has_ruler)
+
+        markers_menu.aboutToShow.connect(_refresh_marker_actions)
+        
         display_menu = menubar.addMenu("&Display")
 
         trace_color_action = QAction("Trace Color", self)
@@ -2759,9 +2825,31 @@ class MainWindow(QMainWindow):
         self._update_status(
             f"Loaded Phy folder: {Path(folder_str).name} — {n_units} unit(s)"
         )
-    # ------------------------------------------------------------------
+
     # Misc
-    # ------------------------------------------------------------------
 
     def _update_status(self, message: str):
         self.statusBar().showMessage(message)
+
+
+    # Rulers
+    
+    def _on_add_cursor_at_playhead(self):
+        if self.trace_view is not None:
+            self.trace_view.add_cursor_at_playhead()
+
+    def _on_add_ruler_at_playhead(self):
+        if self.trace_view is not None:
+            self.trace_view.add_ruler_at_playhead()
+
+    def _on_remove_selected_cursor(self):
+        if self.trace_view is not None:
+            self.trace_view.remove_selected_cursor()
+
+    def _on_clear_all_cursors(self):
+        if self.trace_view is not None:
+            self.trace_view.clear_all_cursors()
+
+    def _on_remove_ruler(self):
+        if self.trace_view is not None:
+            self.trace_view.remove_ruler()
