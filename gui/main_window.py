@@ -454,6 +454,9 @@ class MainWindow(QMainWindow):
         tv._probe_data = None
         tv._csd_analyzer = None
 
+        tv._ruler_bar_y_fraction = 0.30
+        tv._ruler_drag_origin_bar_y_fraction = None
+        
         # Color customizations.
         tv.channel_colors = {}
         tv.default_trace_color = QColor("#ffffff")

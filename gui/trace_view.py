@@ -807,6 +807,10 @@ class TraceViewWidget(QWidget):
         self._ruler_drag_origin_time: float | None = None
         self._ruler_drag_origin_ruler: tuple[float, float] | None = None
 
+        self._ruler_bar_y_fraction: float = 0.30
+        self._ruler_drag_origin_bar_y_fraction: float | None = None
+        self._ruler_drag_origin_mouse_y: float | None = None
+        
         self._dragging = False
         self._drag_start_pos = None
         self._drag_start_time = 0.0
@@ -2984,6 +2988,7 @@ class TraceViewWidget(QWidget):
     # Painting
     # ------------------------------------------------------------------
     def paintEvent(self, event):
+        super().paintEvent(event)
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -3039,6 +3044,7 @@ class TraceViewWidget(QWidget):
                 self._draw_depth_scale(painter, rect, data)
 
             self._draw_time_ruler(painter, rect)
+            self._draw_time_cursors_on_top(painter)
         finally:
             painter.end()
 
@@ -3063,23 +3069,28 @@ class TraceViewWidget(QWidget):
  
             is_selected = (i == self._selected_cursor)
             if is_selected:
-                pen = QPen(QColor("#ffd23f"), 3, Qt.PenStyle.SolidLine)
+                pen = QPen(QColor("#ffd23f"), 3, Qt.PenStyle.DashLine)
                 pen.setCosmetic(True)
             else:
-                pen = QPen(QColor("#59159a"), 2, Qt.PenStyle.DashLine)
+                pen = QPen(QColor("#27b452"), 2, Qt.PenStyle.DashLine)
                 pen.setCosmetic(True)
 
-
+            # Vertical line spanning the full plot height. Drawn before
+            # the label so the text sits on top of the line.
+            painter.setPen(pen)
+            plot_top = rect.top()
+            _, _, plot_bottom = self._get_plot_bounds()
+            painter.drawLine(int(x), int(plot_top), int(x), int(plot_bottom))
 
             painter.setPen(pen)
             font = QFont()
             font.setPointSize(8)
             painter.setFont(font)
             label = f"{cursor_time:.3f}s"
-            label_color = QColor("#ffd23f") if is_selected else QColor("#59159a")
+            label_color = QColor("#ffd23f") if is_selected else QColor("#27b452")
             painter.setPen(QPen(label_color, 1))
             painter.drawText(
-                int(x - 25), int(rect.top() + 5), 50, 15,
+                int(x - 50), int(rect.top() + 5), 50, 15,
                 Qt.AlignmentFlag.AlignCenter, label
             )
 
@@ -3136,7 +3147,8 @@ class TraceViewWidget(QWidget):
 
         # Bar sits in the top third of the plot, out of the way of
         # typical trace content.
-        bar_y = plot_top + (plot_bottom - plot_top) * 0.30
+        # bar_y = plot_top + (plot_bottom - plot_top) * 0.30
+        bar_y = plot_top + (plot_bottom - plot_top) * self._ruler_bar_y_fraction
         bar_h = 22.0
 
         # ---- Dashed vertical alignment lines at the ends ----
@@ -3207,7 +3219,8 @@ class TraceViewWidget(QWidget):
         x1 = _time_to_x(t_start)
         x2 = _time_to_x(t_end)
 
-        bar_y = plot_top + (plot_bottom - plot_top) * 0.30
+        # bar_y = plot_top + (plot_bottom - plot_top) * 0.30
+        bar_y = plot_top + (plot_bottom - plot_top) * self._ruler_bar_y_fraction
         bar_h = 22.0
 
         hit_x = 10.0
@@ -3243,12 +3256,13 @@ class TraceViewWidget(QWidget):
     def _remove_ruler(self):
         """Remove the ruler and clear any in-progress drag state."""
         self._ruler = None
+        self._ruler_bar_y_fraction = 0.30
         self._ruler_drag_mode = None
         self._ruler_drag_origin_time = None
         self._ruler_drag_origin_ruler = None
+        self._ruler_drag_origin_bar_y_fraction = None
         self.unsetCursor()
         self.update()
-
 
     def _compute_time_ticks(self, rect: QRectF):
         plot_left = rect.left() + LABEL_STRIP_WIDTH
@@ -4205,6 +4219,7 @@ class TraceViewWidget(QWidget):
 
         # Compute the time under the right-click, for "add here" items.
         click_x = event.pos().x()
+        click_x = max(plot_left, min(plot_right, click_x))
         click_ratio = (click_x - plot_left) / plot_width
         click_time = self.start_time + click_ratio * self.window_duration
 
@@ -4245,11 +4260,15 @@ class TraceViewWidget(QWidget):
         menu.exec(event.globalPos())
 
     def _add_cursor_at(self, time: float):
-        """Place a time cursor at `time` and select it."""
+        if not self._data_loaded:
+            return
+        # Clamp to the recording's absolute range so the cursor is
+        # always drawable.
+        t_min, t_max = self._get_min_start_time(), self._get_max_start_time() + self.window_duration
+        time = max(t_min, min(t_max, time))
         fraction = self._time_to_cursor_fraction(time)
         self._time_cursors.append(fraction)
         self._time_cursors.sort()
-        # Reselect the just-added cursor by finding its sorted index.
         self._selected_cursor = self._time_cursors.index(fraction)
         self.update()
 
@@ -4310,6 +4329,8 @@ class TraceViewWidget(QWidget):
             if ruler_hit is not None and self._ruler is not None:
                 self._ruler_drag_mode = ruler_hit
                 self._ruler_drag_origin_ruler = self._ruler
+                self._ruler_drag_origin_bar_y_fraction = self._ruler_bar_y_fraction
+                self._ruler_drag_origin_mouse_y = event.position().y()
 
                 plot_left, plot_right, _ = self._get_plot_bounds()
                 plot_width = max(1, plot_right - plot_left)
@@ -4317,8 +4338,11 @@ class TraceViewWidget(QWidget):
                     (event.position().x() - plot_left) / plot_width
                 ) * self.window_duration
 
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                event.accept()
+                if ruler_hit == "body":
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+
                 return
             
             # ---- Left label strip ----
@@ -4385,7 +4409,26 @@ class TraceViewWidget(QWidget):
             min_gap = max(self.window_duration * 0.001, 1e-9)
 
             if self._ruler_drag_mode == "body":
+                # Move horizontally (time) as before.
                 self._ruler = (t_start + dt, t_end + dt)
+
+                # Also move vertically if the mouse has moved in y.
+                # The fraction is delta-based on the drag start, so
+                # horizontal-only drags don't nudge the bar up or
+                # down by rounding error.
+                origin_y = self._ruler_drag_origin_bar_y_fraction
+                if origin_y is not None:
+                    plot_top = self.rect().top()
+                    _, _, plot_bottom = self._get_plot_bounds()
+                    plot_height = max(1, plot_bottom - plot_top)
+                    delta_y_fraction = (
+                        event.position().y() - self._ruler_drag_origin_mouse_y
+                    ) / plot_height
+                    new_frac = origin_y + delta_y_fraction
+                    self._ruler_bar_y_fraction = max(
+                        0.02, min(0.95, new_frac)
+                    )
+
             elif self._ruler_drag_mode == "start":
                 new_start = t_start + dt
                 if t_end - new_start >= min_gap:
@@ -4402,7 +4445,9 @@ class TraceViewWidget(QWidget):
         # ---- Hover cursor over the ruler ----
         if self._ruler_drag_mode is None:
             ruler_hit = self._ruler_hit_at(event.position())
-            if ruler_hit is not None:
+            if ruler_hit == "body":
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            elif ruler_hit in ("start", "end"):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             elif self._hovered_row_button_channel is None:
                 self.unsetCursor()
@@ -4463,6 +4508,7 @@ class TraceViewWidget(QWidget):
             self._ruler_drag_mode = None
             self._ruler_drag_origin_time = None
             self._ruler_drag_origin_ruler = None
+            self._ruler_drag_origin_mouse_y = None
             self.unsetCursor()
             event.accept()
             return
