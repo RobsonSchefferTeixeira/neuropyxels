@@ -447,56 +447,77 @@ class ComodulogramDialog(QDialog):
     # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
-
     def _render(self, results: dict):
+        # ---- 1. Unpack results ----
         comod = results["comodulogram"]
         phase_freqs = results["phase_frequencies"]
         amp_freqs = results["amplitude_frequencies"]
 
-        # Display limits: drop NaNs when computing percentiles.
+        # ---- 2. Reset the ImageItem to a clean state ----
+        # ImageItem caches the rect from the previous setRect call. If
+        # the new grid has different dimensions (which happens whenever
+        # any frequency range or step changes), the upsampled array's
+        # dimensions change, and a stale rect applied to new pixel data
+        # produces the "peaks drift and shrink" symptom. Clearing the
+        # image first, then setting the rect, then setting the pixels
+        # guarantees ordering is consistent for the frame that follows.
+        #self.image_item.clear()
+        self.image_item.setOpts(autoDownsample=False, smooth=True)
+
+        # ---- 3. Compute display levels from finite MI values ----
+        # NaN cells (collapsed amplitude bands) must not pollute the
+        # colour scale, so percentiles are computed on finite values only.
         finite = comod[np.isfinite(comod)]
         if finite.size == 0:
             vmin, vmax = 0.0, 1.0
         else:
-            vmin = float(np.nanpercentile(finite, 2))
-            vmax = float(np.nanpercentile(finite, 98))
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-                vmin = float(np.nanmin(finite))
-                vmax = float(np.nanmax(finite))
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
+            vmin = float(finite.min())
+            vmax = float(finite.max())
+            if vmax <= vmin:
+                vmax = vmin + 1e-6
 
-        # ---- Smooth the coarse MI grid before display ----
+
+        # ---- 4. Compute image rect from the CURRENT grid ----
+        phase_step = (
+            phase_freqs[1] - phase_freqs[0]
+            if len(phase_freqs) > 1 else 1.0
+        )
+        amp_step = (
+            amp_freqs[1] - amp_freqs[0]
+            if len(amp_freqs) > 1 else 1.0
+        )
+        x0 = phase_freqs[0] - phase_step / 2.0
+        x1 = phase_freqs[-1] + phase_step / 2.0
+        y0 = amp_freqs[0] - amp_step / 2.0
+        y1 = amp_freqs[-1] + amp_step / 2.0
+
+        # ---- 5. Set the rect BEFORE the pixel data ----
+        self.image_item.setRect(x0, y0, x1 - x0, y1 - y0)
+
+        # ---- 6. Smooth the coarse MI grid for display ----
         # The comodulogram is computed on a coarse (n_phase, n_amp)
         # grid -- typically 10 x 37 for defaults. Rendering that grid
-        # directly gives a pixelated heatmap; the original matplotlib
-        # contourf view interpolates the same coarse grid into smooth
-        # filled contours. We do the equivalent here: up-sample the
-        # coarse matrix with bicubic interpolation so pyqtgraph draws
-        # a continuous field, keeping the fast pyqtgraph interaction
-        # (pan/zoom, hover) instead of embedding a matplotlib canvas.
+        # directly gives a pixelated heatmap; upsampling with bicubic
+        # interpolation gives a matplotlib-contourf-like smooth field
+        # while keeping pyqtgraph's fast pan/zoom interaction.
         #
         # The interpolation is DISPLAY-ONLY -- the underlying MI values
-        # are unchanged; only how they are shown between grid points
-        # is smoothed. Any reader who wants per-cell values should
-        # read the status line / export path (not yet implemented).
-        coarse = comod.T  # transpose once for (rows=amp, cols=phase)
+        # are unchanged; only how they appear between grid points is
+        # smoothed.
+        coarse = comod.T  # (rows=amp, cols=phase)
         rows, cols = coarse.shape
 
-        # Upsample factors chosen so the displayed image is at least
-        # ~300 px on each axis at typical dialog sizes. Cap at 16x so
-        # a tiny grid doesn't produce a huge array.
+        # Upsample so the displayed image is at least ~300 px on each
+        # axis at typical dialog sizes. Cap at 16x so a tiny grid
+        # doesn't produce a huge array.
         up_factor_phase = max(1, min(16, 300 // max(1, cols)))
         up_factor_amp = max(1, min(16, 400 // max(1, rows)))
 
-        # NaN-safe: ndimage.zoom on NaN-propagating data would smear
-        # the NaNs across the whole image. Interpolate on the finite
-        # values, and mark interpolated cells that span a NaN region
-        # as NaN so they stay transparent.
         if np.any(~np.isfinite(coarse)):
-            # Replace NaN with nearest-neighbor fill BEFORE zoom so
-            # zoom has clean data; then mask back the originally-NaN
-            # cells and any upsampled cell that fell in a NaN gap.
+            # NaN-safe: ndimage.zoom on NaN-propagating data would
+            # smear NaNs across the whole image. Fill the NaN cells
+            # with the finite mean, upsample, then mask back the cells
+            # that fell into a NaN region so they stay transparent.
             nan_mask = ~np.isfinite(coarse)
             filled = coarse.copy()
             if np.any(np.isfinite(coarse)):
@@ -510,8 +531,6 @@ class ComodulogramDialog(QDialog):
                 order=3,   # bicubic
                 mode="nearest",
             )
-            # Mask: upsample the NaN mask with nearest-neighbour so
-            # the final image has NaN where the coarse cell was NaN.
             smooth_mask = ndimage_zoom(
                 nan_mask.astype(np.uint8),
                 zoom=(up_factor_amp, up_factor_phase),
@@ -527,33 +546,11 @@ class ComodulogramDialog(QDialog):
                 mode="nearest",
             )
 
-        # ImageItem with SmoothPixmapTransform gives a second layer of
-        # blur when the display is larger than the array; combined with
-        # the bicubic upsample above, the heatmap reads as a continuous
-        # field rather than a set of cells.
+        # ---- 7. Set pixel data + levels (exactly once) ----
         self.image_item.setImage(smooth, autoLevels=False)
-        self.image_item.setOpts(
-            autoDownsample=False,
-            smooth=True,
-        )
         self.image_item.setLevels((vmin, vmax))
 
-        phase_step = (
-            phase_freqs[1] - phase_freqs[0]
-            if len(phase_freqs) > 1 else 1.0
-        )
-        amp_step = (
-            amp_freqs[1] - amp_freqs[0]
-            if len(amp_freqs) > 1 else 1.0
-        )
-
-        x0 = phase_freqs[0] - phase_step / 2.0
-        x1 = phase_freqs[-1] + phase_step / 2.0
-        y0 = amp_freqs[0] - amp_step / 2.0
-        y1 = amp_freqs[-1] + amp_step / 2.0
-
-        self.image_item.setRect(x0, y0, x1 - x0, y1 - y0)
-
+        # ---- 8. Colour map ----
         resolved = resolve_name(
             self.cmap_combo.currentText(),
             reverse=self.reverse_cmap_check.isChecked(),
@@ -563,22 +560,24 @@ class ComodulogramDialog(QDialog):
         except Exception as exc:
             print(f"[comodulogram] colormap {resolved!r} unavailable: {exc}")
 
+        # ---- 9. Pin both axes to the exact phase/amp ranges ----
+        # setXRange/setYRange are provisional on a PlotWidget: any
+        # auto-range trigger (including the ImageItem rebuilding its
+        # bounding rect after setImage) can re-derive one axis from the
+        # other. Disabling auto-range explicitly, then setting the
+        # ranges, then setting limits, guarantees the axis labels match
+        # the data positions.
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        vb.disableAutoRange()
+        vb.setAutoVisible(x=False, y=False)
+
         self.plot_widget.setXRange(phase_freqs[0], phase_freqs[-1], padding=0)
         self.plot_widget.setYRange(amp_freqs[0], amp_freqs[-1], padding=0)
 
 
-        vb = self.plot_widget.getPlotItem().getViewBox()
-        vb.setAutoVisible(x=False, y=False)
-        vb.disableAutoRange()
-
-        vb.setLimits(
-            xMin=phase_freqs[0] - phase_step / 2.0,
-            xMax=phase_freqs[-1] + phase_step / 2.0,
-            yMin=amp_freqs[0] - amp_step / 2.0,
-            yMax=amp_freqs[-1] + amp_step / 2.0,
-        )
-
+        # ---- 10. Status line ----
         self._update_status_label(results)
+
 
     def _update_status_label(self, results: dict):
         depth = "unknown"

@@ -256,6 +256,7 @@ class ComodulogramAnalyzer:
             for pf in phase_lows
         )
 
+
         # ---- Amplitude-band MI (parallel, chunked for progress) ----
         n_bins = int(params.n_bins)
         winsize = 2 * math.pi / n_bins
