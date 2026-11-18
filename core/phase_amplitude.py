@@ -57,7 +57,7 @@ class PhaseAmplitudeParams:
     theta_freq: float = 7.0
     target_sr: float = 1000.0
     use_csd: bool = False
-    csd_spacing: float = 20.0  # µm
+    csd_spacing: float = 45.0  # µm
 
 
 class PhaseAmplitudeAnalyzer:

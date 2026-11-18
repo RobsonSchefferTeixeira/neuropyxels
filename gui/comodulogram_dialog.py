@@ -258,7 +258,7 @@ class ComodulogramDialog(QDialog):
 
         self.csd_spacing_spin = QDoubleSpinBox()
         self.csd_spacing_spin.setRange(1.0, 500.0)
-        self.csd_spacing_spin.setValue(20.0)
+        self.csd_spacing_spin.setValue(45.0)
         pairs.append(("CSD spacing (µm)", self.csd_spacing_spin))
 
         self.cmap_combo = QComboBox()

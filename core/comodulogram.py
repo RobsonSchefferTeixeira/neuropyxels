@@ -72,7 +72,7 @@ class ComodulogramParams:
     n_bins: int = DEFAULT_N_BINS
     target_sr: float = 1000.0
     use_csd: bool = False
-    csd_spacing: float = 20.0
+    csd_spacing: float = 45.0
 
 
 # ----------------------------------------------------------------------

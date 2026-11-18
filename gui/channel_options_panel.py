@@ -44,7 +44,7 @@ class ChannelOptions:
     show_csd: bool = False
     csd_low: float = 0.0
     csd_high: float = 0.0
-    csd_distance: float = 30.0
+    csd_distance: float = 45.0
     csd_gain: float = 1.0
 
     color: QColor | None = None
