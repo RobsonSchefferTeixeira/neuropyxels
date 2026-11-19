@@ -421,6 +421,9 @@ class ProbeMapWidget(QWidget):
         self.plot_widget.setLabel("bottom", "X", units="\u00b5m")
         self.plot_widget.setLabel("left", "Depth", units="\u00b5m")
 
+        self.plot_widget.setToolTip("")
+        self.plot_widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, False)
+
         self.view_box = self.plot_widget.getViewBox()
         self.view_box.setMouseMode(pg.ViewBox.PanMode)
         # Wheel zoom already zooms to cursor by default in pyqtgraph.
